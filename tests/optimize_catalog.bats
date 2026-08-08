@@ -74,7 +74,7 @@ spotlight_orphan_rules_cleanup|opt_prune_spotlight_orphan_rules|Spotlight Orphan
 periodic_maintenance|opt_periodic_maintenance|Periodic Maintenance|Periodic Maintenance|Run macOS daily/weekly/monthly maintenance scripts if stale|true|true
 shared_file_list_repair|opt_shared_file_list_repair|Shared File Lists|Shared File Lists|Repair corrupted Finder favorites and recent documents|true|false
 disk_verify|opt_disk_verify|Disk Health|Disk Health|Verify filesystem integrity|true|false
-login_items_audit|opt_login_items_audit|Login Items|Login Items Audit|Audit login items for broken entries|true|true
+login_items_audit|opt_login_items_audit|Login Items|Login Items Audit|Audit login items for broken entries|true|false
 quarantine_cleanup|opt_quarantine_cleanup|Quarantine Database Cleanup|Quarantine Database Cleanup|Clear Gatekeeper download tracking history|true|false
 launch_agents_cleanup|opt_launch_agents_cleanup|Launch Agents Cleanup|Launch Agents Cleanup|Remove broken LaunchAgents whose binaries no longer exist|true|false
 notification_cleanup|opt_notification_cleanup|Notifications|Notifications|Clean old delivered notifications to reduce database bloat|true|false

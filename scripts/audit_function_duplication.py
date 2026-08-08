@@ -53,6 +53,11 @@ ALLOWED_GROUPS: dict[tuple[str, ...], str] = {
     ("show_history_help", "show_installer_help"): (
         "same help frame, different command text; the frame is the shared part and already is"
     ),
+    ("show_clean_help", "show_optimize_help"): (
+        "same help frame, different command text; both landed at 11 echoes after "
+        "clean --json (M1-T2) and optimize --list/--json (M1-T3) each added one line, "
+        "which is what makes the string-blind hash collide, not shared behaviour"
+    ),
 }
 
 FUNC_START = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\(\)\s*\{\s*$")

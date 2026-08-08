@@ -86,7 +86,7 @@ _optimize_catalog_register disk_verify opt_disk_verify \
     "Verify filesystem integrity" true false
 _optimize_catalog_register login_items_audit opt_login_items_audit \
     "Login Items" "Login Items Audit" \
-    "Audit login items for broken entries" true true
+    "Audit login items for broken entries" true false
 _optimize_catalog_register quarantine_cleanup opt_quarantine_cleanup \
     "Quarantine Database Cleanup" "Quarantine Database Cleanup" \
     "Clear Gatekeeper download tracking history" true false
