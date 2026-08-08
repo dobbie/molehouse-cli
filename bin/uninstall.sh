@@ -45,7 +45,14 @@ files_cleaned=0
 total_size_cleaned=0
 
 readonly MOLE_UNINSTALL_META_CACHE_DIR="$HOME/.cache/mole"
-readonly MOLE_UNINSTALL_META_CACHE_FILE="$MOLE_UNINSTALL_META_CACHE_DIR/uninstall_app_metadata_v1"
+# v2 (M1-T4 / F-036): the cache row gained a trailing `version` column.
+# Bumped rather than adding a `cached_version == ""` needs_refresh trigger,
+# which would force a permanent refresh loop for apps whose plist genuinely
+# has no readable CFBundleShortVersionString. Bumping instead makes every
+# machine's pre-change cache a clean miss once, on this deploy, rather than
+# leaving `version` silently dependent on cache warmth (F-036;
+# .claude/skills/bugs archetype 8, model commit 7a996aa5).
+readonly MOLE_UNINSTALL_META_CACHE_FILE="$MOLE_UNINSTALL_META_CACHE_DIR/uninstall_app_metadata_v2"
 readonly MOLE_UNINSTALL_META_CACHE_LOCK="${MOLE_UNINSTALL_META_CACHE_FILE}.lock"
 readonly MOLE_UNINSTALL_META_REFRESH_TTL=604800 # 7 days
 readonly MOLE_UNINSTALL_EPOCH_FLOOR=978307200
