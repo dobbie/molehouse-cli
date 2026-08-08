@@ -34,6 +34,8 @@ show_optimize_help() {
     echo "  --dry-run         Preview optimization without making changes"
     echo "  --whitelist       Manage protected items"
     echo "  --debug           Show detailed operation logs"
+    echo "  --list            List the task catalog as JSON (requires --json, runs nothing)"
+    echo "  --json            Emit a structured JSON result instead of terminal output"
     echo "  -h, --help        Show this help message"
 }
 

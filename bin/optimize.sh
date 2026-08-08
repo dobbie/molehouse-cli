@@ -19,6 +19,7 @@ source "$SCRIPT_DIR/lib/optimize/diagnostics.sh"
 source "$SCRIPT_DIR/lib/optimize/maintenance.sh"
 source "$SCRIPT_DIR/lib/optimize/catalog.sh"
 source "$SCRIPT_DIR/lib/optimize/tasks.sh"
+source "$SCRIPT_DIR/lib/optimize/json_emit.sh"
 source "$SCRIPT_DIR/lib/check/health_json.sh"
 source "$SCRIPT_DIR/lib/manage/whitelist.sh"
 
@@ -189,11 +190,108 @@ handle_interrupt() {
     exit 130
 }
 
+# VERSION= stays in the `mole` router (mole/CLAUDE.md); read it the same way
+# bin/clean.sh's --json path does, so both emitters degrade the same way
+# (mole_version is diagnostic-only per CONTRACT.md §1.5 — never gate on it).
+_optimize_mole_version() {
+    local version
+    version=$(sed -n 's/^VERSION="\(.*\)"$/\1/p' "$SCRIPT_DIR/mole" 2> /dev/null | head -1)
+    [[ -n "$version" ]] || version="unknown"
+    printf '%s\n' "$version"
+}
+
+# `mo optimize [--dry-run] --json`: run the real preview/apply pass with its
+# human-readable stdout diverted, so stdout carries only the JSON document
+# (CONTRACT.md §1.3), then emit it. This calls the exact same
+# generate_health_json / load_whitelist / ensure_sudo_session /
+# execute_optimization sequence the interactive path uses — no second scan
+# implementation — it only discards what they print and serialises what they
+# already computed (lib/optimize/outcomes.sh's ledger).
+#
+# Prints the envelope to the real stdout and returns the process exit code
+# per CONTRACT.md §1.6: 0 when the run produced usable output (even with
+# per-task failures — scan_status "partial"), 1 when it could not (missing
+# `bc`, failed health-data collection, or a catalog/ledger size mismatch —
+# scan_status "failed", data absent). Mirrors bin/clean.sh's
+# clean_json_emit_preview call site.
+run_optimize_json() {
+    local mole_version
+    mole_version=$(_optimize_mole_version)
+
+    local mode="preview"
+    [[ "${MOLE_DRY_RUN:-0}" == "1" ]] || mode="apply"
+
+    log_operation_session_start "optimize"
+    trap 'cleanup_all "$?"' EXIT
+    trap handle_interrupt INT TERM
+
+    local start_rc=0
+    local health_json=""
+
+    exec 4>&1 1> /dev/null
+
+    if ! command -v bc > /dev/null 2>&1; then
+        start_rc=1
+    fi
+
+    if [[ $start_rc -eq 0 ]] && ! health_json=$(generate_health_json 2> /dev/null); then
+        start_rc=1
+    fi
+
+    if [[ $start_rc -eq 0 ]] && ! json_validate "$health_json"; then
+        start_rc=1
+    fi
+
+    local outcome_mismatch=0
+    if [[ $start_rc -eq 0 ]]; then
+        load_whitelist "optimize"
+
+        export MOLE_OPTIMIZE_SUDO_AVAILABLE="false"
+        if [[ "${MOLE_DRY_RUN:-0}" == "1" ]]; then
+            MOLE_OPTIMIZE_SUDO_AVAILABLE="true"
+        elif ensure_sudo_session "System optimization requires admin access"; then
+            MOLE_OPTIMIZE_SUDO_AVAILABLE="true"
+        fi
+
+        export FIRST_ACTION=true
+        optimize_outcomes_reset
+        local index action
+        for ((index = 0; index < ${#MOLE_OPTIMIZE_ACTIONS[@]}; index++)); do
+            action=${MOLE_OPTIMIZE_ACTIONS[$index]}
+            execute_optimization "$action"
+        done
+
+        if [[ "$(optimize_outcome_total)" -ne ${#MOLE_OPTIMIZE_ACTIONS[@]} ]]; then
+            outcome_mismatch=1
+        fi
+    fi
+
+    exec 1>&4 4>&-
+
+    local final_rc=0
+    if [[ $start_rc -ne 0 || $outcome_mismatch -eq 1 ]]; then
+        optimize_json_emit_error "$mole_version" "$mode"
+        final_rc=1
+    else
+        optimize_json_emit_result "$mole_version" "$mode"
+        final_rc=0
+    fi
+
+    # Silence stdout again before the EXIT trap's cleanup_all runs: nothing
+    # after this point may reach the terminal, or it would trail the JSON
+    # document and break CONTRACT.md §1.3 ("stdout carries the JSON document
+    # and nothing else").
+    exec 1> /dev/null
+    exit "$final_rc"
+}
+
 main() {
     # Set current command for operation logging
     export MOLE_CURRENT_COMMAND="optimize"
 
     local health_json
+    local JSON_OUTPUT=false
+    local LIST_ONLY=false
     for arg in "$@"; do
         case "$arg" in
             "--help" | "-h")
@@ -206,6 +304,12 @@ main() {
             "--dry-run")
                 export MOLE_DRY_RUN=1
                 ;;
+            "--json")
+                JSON_OUTPUT=true
+                ;;
+            "--list")
+                LIST_ONLY=true
+                ;;
             "--whitelist")
                 manage_whitelist "optimize"
                 exit 0
@@ -217,6 +321,28 @@ main() {
                 ;;
         esac
     done
+
+    # `--list --json`: read-only catalog metadata (CONTRACT.md §8.3/§8.4).
+    # Runs no task and touches no session/trap/logging state — it only
+    # reads the catalog arrays lib/optimize/catalog.sh already populated at
+    # source time.
+    if [[ "$LIST_ONLY" == "true" ]]; then
+        if [[ "$JSON_OUTPUT" != "true" ]]; then
+            echo "mo optimize --list requires --json." >&2
+            echo "Run 'mo optimize --help' for usage." >&2
+            exit 2
+        fi
+        optimize_json_emit_list "$(_optimize_mole_version)"
+        exit 0
+    fi
+
+    if [[ "$JSON_OUTPUT" == "true" ]]; then
+        # Does not return: run_optimize_json always exits directly (see its
+        # header comment for why — the EXIT trap's cleanup_all must run
+        # after stdout is silenced again, not after the ordinary `main`
+        # return path below).
+        run_optimize_json
+    fi
 
     log_operation_session_start "optimize"
 

@@ -17,6 +17,13 @@ MOLE_OPTIMIZE_HEALTH_NAMES=()
 MOLE_OPTIMIZE_WHITELIST_NAMES=()
 MOLE_OPTIMIZE_DESCRIPTIONS=()
 MOLE_OPTIMIZE_SAFE_VALUES=()
+# Evidence-based, not name-based: true only when the handler (or a helper it
+# calls directly) contains a real `sudo`/privileged-`launchctl` invocation
+# that runs in a normal (non-dry-run, sudo-available) pass. See Molehouse
+# CONTRACT.md §8.4 and docs/handoff-M1-T3.md Gap 2 for the source audit this
+# column was populated from; the per-task evidence is in that hand-off's
+# report, not restated here.
+MOLE_OPTIMIZE_REQUIRES_SUDO=()
 
 _optimize_catalog_register() {
     local index=${#MOLE_OPTIMIZE_ACTIONS[@]}
@@ -26,71 +33,72 @@ _optimize_catalog_register() {
     MOLE_OPTIMIZE_WHITELIST_NAMES[index]="$4"
     MOLE_OPTIMIZE_DESCRIPTIONS[index]="$5"
     MOLE_OPTIMIZE_SAFE_VALUES[index]="$6"
+    MOLE_OPTIMIZE_REQUIRES_SUDO[index]="$7"
 }
 
 _optimize_catalog_register system_maintenance opt_system_maintenance \
     "DNS & Spotlight Check" "DNS & Spotlight Check" \
-    "Refresh DNS cache & verify Spotlight status" true
+    "Refresh DNS cache & verify Spotlight status" true true
 _optimize_catalog_register cache_refresh opt_cache_refresh \
     "Finder Cache Refresh" "Finder Cache Refresh" \
-    "Refresh QuickLook thumbnails & icon services cache" true
+    "Refresh QuickLook thumbnails & icon services cache" true false
 _optimize_catalog_register saved_state_cleanup opt_saved_state_cleanup \
     "App State Cleanup" "App State Cleanup" \
-    "Remove old saved application states (30+ days)" true
+    "Remove old saved application states (30+ days)" true false
 _optimize_catalog_register fix_broken_configs opt_fix_broken_configs \
     "Broken Config Repair" "Broken Config Repair" \
-    "Fix corrupted preferences files" true
+    "Fix corrupted preferences files" true false
 _optimize_catalog_register network_optimization opt_network_optimization \
     "Network Cache Refresh" "Network Cache Refresh" \
-    "Optimize DNS cache & restart mDNSResponder" true
+    "Optimize DNS cache & restart mDNSResponder" true true
 _optimize_catalog_register sqlite_vacuum opt_sqlite_vacuum \
     "Database Optimization" "Database Optimization" \
-    "Compress SQLite databases for Mail, Safari & Messages (skips if apps are running)" true
+    "Compress SQLite databases for Mail, Safari & Messages (skips if apps are running)" true false
 _optimize_catalog_register launch_services_rebuild opt_launch_services_rebuild \
     "LaunchServices Repair" "LaunchServices Repair" \
-    'Repair "Open with" menu & file associations' true
+    'Repair "Open with" menu & file associations' true false
 _optimize_catalog_register prevent_network_dsstore opt_prevent_network_dsstore \
     "Prevent Finder .DS_Store" "Prevent Finder .DS_Store" \
-    "Set a persistent Finder preference to stop writing .DS_Store on SMB/AFP/NFS and USB volumes" true
+    "Set a persistent Finder preference to stop writing .DS_Store on SMB/AFP/NFS and USB volumes" true false
 _optimize_catalog_register legacy_overrides_audit opt_legacy_overrides_audit \
     "Legacy Overrides" "Legacy Overrides" \
-    "Remove hidden App Nap and disk-image verification overrides left by old tweak tools" true
+    "Remove hidden App Nap and disk-image verification overrides left by old tweak tools" true false
 _optimize_catalog_register network_stack_optimize opt_network_stack_optimize \
     "Network Stack Refresh" "Network Stack Refresh" \
-    "Flush routing table and ARP cache to resolve network issues" true
+    "Flush routing table and ARP cache to resolve network issues" true true
 _optimize_catalog_register disk_permissions_repair opt_disk_permissions_repair \
     "Permission Repair" "Permission Repair" \
-    "Fix user directory permission issues" true
+    "Fix user directory permission issues" true true
 _optimize_catalog_register spotlight_index_optimize opt_spotlight_index_optimize \
     "Spotlight Optimization" "Spotlight Optimization" \
-    "Rebuild index if search is slow (smart detection)" true
+    "Rebuild index if search is slow (smart detection)" true true
 _optimize_catalog_register spotlight_orphan_rules_cleanup opt_prune_spotlight_orphan_rules \
     "Spotlight Orphan Rules" "Spotlight Orphan Rules" \
-    "Remove Spotlight search-rule entries for apps that are no longer installed" true
+    "Remove Spotlight search-rule entries for apps that are no longer installed" true false
 _optimize_catalog_register periodic_maintenance opt_periodic_maintenance \
     "Periodic Maintenance" "Periodic Maintenance" \
-    "Run macOS daily/weekly/monthly maintenance scripts if stale" true
+    "Run macOS daily/weekly/monthly maintenance scripts if stale" true true
 _optimize_catalog_register shared_file_list_repair opt_shared_file_list_repair \
     "Shared File Lists" "Shared File Lists" \
-    "Repair corrupted Finder favorites and recent documents" true
+    "Repair corrupted Finder favorites and recent documents" true false
 _optimize_catalog_register disk_verify opt_disk_verify \
     "Disk Health" "Disk Health" \
-    "Verify filesystem integrity" true
+    "Verify filesystem integrity" true false
 _optimize_catalog_register login_items_audit opt_login_items_audit \
     "Login Items" "Login Items Audit" \
-    "Audit login items for broken entries" true
+    "Audit login items for broken entries" true true
 _optimize_catalog_register quarantine_cleanup opt_quarantine_cleanup \
     "Quarantine Database Cleanup" "Quarantine Database Cleanup" \
-    "Clear Gatekeeper download tracking history" true
+    "Clear Gatekeeper download tracking history" true false
 _optimize_catalog_register launch_agents_cleanup opt_launch_agents_cleanup \
     "Launch Agents Cleanup" "Launch Agents Cleanup" \
-    "Remove broken LaunchAgents whose binaries no longer exist" true
+    "Remove broken LaunchAgents whose binaries no longer exist" true false
 _optimize_catalog_register notification_cleanup opt_notification_cleanup \
     "Notifications" "Notifications" \
-    "Clean old delivered notifications to reduce database bloat" true
+    "Clean old delivered notifications to reduce database bloat" true false
 _optimize_catalog_register coreduet_cleanup opt_coreduet_cleanup \
     "Usage Data" "Usage Data" \
-    "Clean old usage tracking data" true
+    "Clean old usage tracking data" true false
 
 optimize_catalog_index_for() {
     local requested_action="$1"
@@ -116,6 +124,12 @@ optimize_catalog_health_name_for() {
     printf '%s\n' "${MOLE_OPTIMIZE_HEALTH_NAMES[$index]}"
 }
 
+optimize_catalog_requires_sudo_for() {
+    local index
+    index=$(optimize_catalog_index_for "$1") || return 1
+    printf '%s\n' "${MOLE_OPTIMIZE_REQUIRES_SUDO[$index]}"
+}
+
 optimize_catalog_validate() {
     local count=${#MOLE_OPTIMIZE_ACTIONS[@]}
     if [[ $count -eq 0 ]]; then
@@ -126,7 +140,8 @@ optimize_catalog_validate() {
         ${#MOLE_OPTIMIZE_HEALTH_NAMES[@]} -ne $count ||
         ${#MOLE_OPTIMIZE_WHITELIST_NAMES[@]} -ne $count ||
         ${#MOLE_OPTIMIZE_DESCRIPTIONS[@]} -ne $count ||
-        ${#MOLE_OPTIMIZE_SAFE_VALUES[@]} -ne $count ]]; then
+        ${#MOLE_OPTIMIZE_SAFE_VALUES[@]} -ne $count ||
+        ${#MOLE_OPTIMIZE_REQUIRES_SUDO[@]} -ne $count ]]; then
         echo "Optimize task catalog fields are misaligned" >&2
         return 1
     fi
@@ -151,6 +166,10 @@ optimize_catalog_validate() {
             echo "Optimize task is not safe for automatic execution: $action" >&2
             return 1
         fi
+        if [[ "${MOLE_OPTIMIZE_REQUIRES_SUDO[$index]}" != "true" && "${MOLE_OPTIMIZE_REQUIRES_SUDO[$index]}" != "false" ]]; then
+            echo "Optimize task requires_sudo is not a boolean: $action" >&2
+            return 1
+        fi
         if [[ "$seen_actions" == *"|$action|"* ]]; then
             echo "Duplicate optimize task action: $action" >&2
             return 1
@@ -171,4 +190,5 @@ readonly -a MOLE_OPTIMIZE_HEALTH_NAMES
 readonly -a MOLE_OPTIMIZE_WHITELIST_NAMES
 readonly -a MOLE_OPTIMIZE_DESCRIPTIONS
 readonly -a MOLE_OPTIMIZE_SAFE_VALUES
+readonly -a MOLE_OPTIMIZE_REQUIRES_SUDO
 unset -f _optimize_catalog_register

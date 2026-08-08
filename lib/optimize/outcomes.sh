@@ -32,8 +32,10 @@ readonly -a MOLE_OPTIMIZE_OUTCOME_VALUES=(
 
 declare -a MOLE_OPTIMIZE_RESULT_ACTIONS=()
 declare -a MOLE_OPTIMIZE_RESULT_OUTCOMES=()
+declare -a MOLE_OPTIMIZE_RESULT_DETAILS=()
 MOLE_OPTIMIZE_TASK_ACTIVE=0
 MOLE_OPTIMIZE_TASK_OUTCOME=""
+MOLE_OPTIMIZE_TASK_DETAIL=""
 
 _optimize_outcome_is_valid() {
     local candidate
@@ -46,8 +48,10 @@ _optimize_outcome_is_valid() {
 optimize_outcomes_reset() {
     MOLE_OPTIMIZE_RESULT_ACTIONS=()
     MOLE_OPTIMIZE_RESULT_OUTCOMES=()
+    MOLE_OPTIMIZE_RESULT_DETAILS=()
     MOLE_OPTIMIZE_TASK_ACTIVE=0
     MOLE_OPTIMIZE_TASK_OUTCOME=""
+    MOLE_OPTIMIZE_TASK_DETAIL=""
 }
 
 optimize_task_start() {
@@ -57,10 +61,16 @@ optimize_task_start() {
     fi
     MOLE_OPTIMIZE_TASK_ACTIVE=1
     MOLE_OPTIMIZE_TASK_OUTCOME=""
+    MOLE_OPTIMIZE_TASK_DETAIL=""
 }
 
+# Args: outcome, detail (optional). `detail` is the display text a handler
+# already printed to stdout (e.g. "DNS cache flushed", "Failed to scan old
+# saved states") — see Molehouse/CONTRACT.md §8.5 `TaskResult.detail`. Never
+# fabricate a detail string that was not already shown to the user.
 optimize_task_result() {
     local outcome="$1"
+    local detail="${2:-}"
 
     if ! _optimize_outcome_is_valid "$outcome"; then
         echo "Invalid optimize task outcome: $outcome" >&2
@@ -75,14 +85,18 @@ optimize_task_result() {
         return 1
     fi
     MOLE_OPTIMIZE_TASK_OUTCOME="$outcome"
+    MOLE_OPTIMIZE_TASK_DETAIL="$detail"
 }
 
 # Resolve one task-level outcome from sub-operation counts. Any failed eligible
 # operation makes the task failed, even when another sub-operation succeeded.
+# Args: applied, failed, skipped (optional), detail (optional) — see
+# optimize_task_result for what `detail` must be.
 optimize_task_result_from_counts() {
     local applied="$1"
     local failed="$2"
     local skipped="${3:-0}"
+    local detail="${4:-}"
     local count
 
     for count in "$applied" "$failed" "$skipped"; do
@@ -93,13 +107,13 @@ optimize_task_result_from_counts() {
     done
 
     if [[ "$failed" -gt 0 ]]; then
-        optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_FAILED"
+        optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_FAILED" "$detail"
     elif [[ "$applied" -gt 0 ]]; then
-        optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_APPLIED"
+        optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_APPLIED" "$detail"
     elif [[ "$skipped" -gt 0 ]]; then
-        optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_SKIPPED"
+        optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_SKIPPED" "$detail"
     else
-        optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_UNCHANGED"
+        optimize_task_result "$MOLE_OPTIMIZE_OUTCOME_UNCHANGED" "$detail"
     fi
 }
 
@@ -131,8 +145,10 @@ optimize_task_finish() {
 
     MOLE_OPTIMIZE_RESULT_ACTIONS+=("$action")
     MOLE_OPTIMIZE_RESULT_OUTCOMES+=("$MOLE_OPTIMIZE_TASK_OUTCOME")
+    MOLE_OPTIMIZE_RESULT_DETAILS+=("$MOLE_OPTIMIZE_TASK_DETAIL")
     MOLE_OPTIMIZE_TASK_ACTIVE=0
     MOLE_OPTIMIZE_TASK_OUTCOME=""
+    MOLE_OPTIMIZE_TASK_DETAIL=""
 }
 
 optimize_outcome_count() {
