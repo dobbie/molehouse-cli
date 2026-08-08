@@ -16,6 +16,15 @@ export LANG=C
 # Load shared helpers.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../lib/core/common.sh"
+# history_json_escape / history_json_string back the --list --json envelope
+# (CONTRACT.md §6) instead of a fourth JSON escaper — see
+# lib/clean/json_emit.sh's identical note and mole/CLAUDE.md "Judge
+# duplication by body, not name." Sourced here, before lib/uninstall/batch.sh
+# below: that file reassigns the global $SCRIPT_DIR to the repo root (it is
+# sourced, not subshelled, so the reassignment is not scoped away), so any
+# "$SCRIPT_DIR/../..." source after it resolves one directory too high.
+# shellcheck source=lib/core/history.sh
+source "$SCRIPT_DIR/../lib/core/history.sh"
 
 # Clean temp files on exit.
 trap cleanup_temp_files EXIT INT TERM
@@ -26,6 +35,10 @@ source "$SCRIPT_DIR/../lib/uninstall/batch.sh"
 # State
 selected_apps=()
 declare -a apps_data=()
+# Index-aligned with apps_data: "real_used_epoch|app_mtime|version" per app.
+# See load_applications's header comment for why this is a separate array
+# rather than a widened apps_data.
+declare -a apps_meta_data=()
 declare -a selection_state=()
 total_items=0
 files_cleaned=0
@@ -292,7 +305,14 @@ start_uninstall_metadata_refresh() {
                 size_kb=$(get_path_size_kb "$app_path")
                 [[ "$size_kb" =~ ^[0-9]+$ ]] || size_kb=0
 
-                printf "%s|%s|%s|%s|%s|%s|%s\n" "$app_path" "${app_mtime:-0}" "$size_kb" "${last_used_epoch:-0}" "$now_epoch" "$bundle_id" "$display_name" > "$worker_output"
+                # This refresh cycle replaces the whole cache row (see the
+                # merge below), so version must be re-read here too — a
+                # worker that skipped it would silently drop `version` back
+                # to absent on every 7-day refresh.
+                local version
+                version=$(uninstall_read_bundle_version "$app_path")
+
+                printf "%s|%s|%s|%s|%s|%s|%s|%s\n" "$app_path" "${app_mtime:-0}" "$size_kb" "${last_used_epoch:-0}" "$now_epoch" "$bundle_id" "$display_name" "$version" > "$worker_output"
             ) < /dev/null &
             worker_pids+=($!)
 
@@ -448,6 +468,25 @@ uninstall_resolve_bundle_id() {
     fi
 
     printf '%s\n' "unknown"
+}
+
+# Read CFBundleShortVersionString from Info.plist. Same shape as
+# uninstall_resolve_bundle_id: a plutil read of a file already on disk, no
+# mdls/du timeout budget needed. Prints nothing (not even a newline) when
+# unreadable — CONTRACT.md §6.4 marks `version` C, absent when unreadable.
+uninstall_read_bundle_version() {
+    local app_path="$1"
+    local plist="$app_path/Contents/Info.plist"
+    local version=""
+
+    if [[ -f "$plist" ]]; then
+        version=$(plutil -extract CFBundleShortVersionString raw "$plist" 2> /dev/null || echo "")
+    fi
+    version="${version//|/-}"
+    version="${version//[$'\t\r\n']/}"
+    [[ "$version" != "(null)" ]] || version=""
+
+    printf '%s' "$version"
 }
 
 uninstall_app_is_background_only() {
@@ -641,13 +680,14 @@ _scan_partition_cache() {
         local cached_bundle_id="$3"
         local cached_display_name="$4"
         local cached_size_kb="$5"
+        local cached_version="${6:-}"
 
         [[ -n "$cached_bundle_id" && -n "$cached_display_name" ]] || return 1
         [[ "$cached_size_kb" =~ ^[0-9]+$ && "$cached_size_kb" -gt 0 ]] || return 1
 
         cached_bundle_id=$(uninstall_resolve_eligible_bundle_id "$cached_app_path" "$cached_bundle_id") || return 1
 
-        printf "%s|%s|%s|%s|%s\n" "$cached_app_path" "$cached_display_name" "$cached_bundle_id" "$cached_app_mtime" "$cached_size_kb" >> "$scan_raw_file"
+        printf "%s|%s|%s|%s|%s|%s\n" "$cached_app_path" "$cached_display_name" "$cached_bundle_id" "$cached_app_mtime" "$cached_size_kb" "$cached_version" >> "$scan_raw_file"
         return 0
     }
 
@@ -658,6 +698,7 @@ _scan_partition_cache() {
                 cache_size[$1] = $3
                 cache_bundle[$1] = $6
                 cache_display[$1] = $7
+                cache_version[$1] = $8
                 next
             }
             {
@@ -665,16 +706,16 @@ _scan_partition_cache() {
                 app_mtime = $3
                 if (cache_mtime[path] == app_mtime && cache_display[path] != "" && cache_size[path] ~ /^[0-9]+$/ && cache_size[path] > 0) {
                     cached_bundle = cache_bundle[path] == "" ? "unknown" : cache_bundle[path]
-                    print path "|" app_mtime "|" cached_bundle "|" cache_display[path] "|" cache_size[path] >> cached_out
+                    print path "|" app_mtime "|" cached_bundle "|" cache_display[path] "|" cache_size[path] "|" cache_version[path] >> cached_out
                 } else {
                     print path "|" $2 "|" app_mtime "|" cache_bundle[path] "|" cache_display[path] >> uncached_out
                 }
             }
         ' "$cache_source" "$discovered_file"
 
-        local cached_app_path cached_app_mtime cached_bundle_id cached_display_name cached_size_kb
-        while IFS='|' read -r cached_app_path cached_app_mtime cached_bundle_id cached_display_name cached_size_kb; do
-            use_cached_scan_metadata "$cached_app_path" "$cached_app_mtime" "$cached_bundle_id" "$cached_display_name" "$cached_size_kb" || true
+        local cached_app_path cached_app_mtime cached_bundle_id cached_display_name cached_size_kb cached_version
+        while IFS='|' read -r cached_app_path cached_app_mtime cached_bundle_id cached_display_name cached_size_kb cached_version; do
+            use_cached_scan_metadata "$cached_app_path" "$cached_app_mtime" "$cached_bundle_id" "$cached_display_name" "$cached_size_kb" "$cached_version" || true
         done < "$cached_rows_file"
 
         local uncached_app_path uncached_app_name uncached_app_mtime uncached_bundle_id uncached_display_name
@@ -738,7 +779,13 @@ _scan_resolve_uncached() {
             [[ "$quick_size_kb" =~ ^[0-9]+$ ]] || quick_size_kb=0
         fi
 
-        echo "${app_path}|${display_name}|${bundle_id}|${app_mtime}|${quick_size_kb}" >> "$output_file"
+        # Read in this worker, not in a serial emitter loop: a plist read per
+        # app must not land on the critical path of a command with a latency
+        # budget (F-035 / docs/handoff-M1-T4.md).
+        local version
+        version=$(uninstall_read_bundle_version "$app_path")
+
+        echo "${app_path}|${display_name}|${bundle_id}|${app_mtime}|${quick_size_kb}|${version}" >> "$output_file"
     }
 
     update_scan_status "Scanning applications..." "0" "$total_apps"
@@ -864,14 +911,15 @@ _scan_finalize_index() {
             cache_updated[$1] = $5
             cache_bundle[$1] = $6
             cache_display[$1] = $7
+            cache_version[$1] = $8
             next
         }
         {
-            print $0 "|" cache_mtime[$1] "|" cache_size[$1] "|" cache_epoch[$1] "|" cache_updated[$1] "|" cache_bundle[$1] "|" cache_display[$1]
+            print $0 "|" cache_mtime[$1] "|" cache_size[$1] "|" cache_epoch[$1] "|" cache_updated[$1] "|" cache_bundle[$1] "|" cache_display[$1] "|" cache_version[$1]
         }
     ' "$cache_source" "$scan_raw_file" > "$merged_file"
     if [[ ! -s "$merged_file" && -s "$scan_raw_file" ]]; then
-        awk '{print $0 "||||||"}' "$scan_raw_file" > "$merged_file"
+        awk '{print $0 "|||||||"}' "$scan_raw_file" > "$merged_file"
     fi
 
     local current_epoch
@@ -942,33 +990,48 @@ _scan_finalize_index() {
                 display_name = $2
                 bundle_id = $3
                 app_mtime = $4
-                if (NF >= 11) {
+                if (NF >= 13) {
                     inline_size_kb = $5
-                    cached_mtime = $6
-                    cached_size_kb = $7
-                    cached_epoch = $8
-                    cached_updated_epoch = $9
-                    cached_bundle_id = $10
-                    cached_display_name = $11
+                    inline_version = $6
+                    cached_mtime = $7
+                    cached_size_kb = $8
+                    cached_epoch = $9
+                    cached_updated_epoch = $10
+                    cached_bundle_id = $11
+                    cached_display_name = $12
+                    cached_version = $13
                 } else {
                     inline_size_kb = 0
+                    inline_version = ""
                     cached_mtime = $5
                     cached_size_kb = $6
                     cached_epoch = $7
                     cached_updated_epoch = $8
                     cached_bundle_id = $9
                     cached_display_name = $10
+                    cached_version = (NF >= 11) ? $11 : ""
                 }
 
                 cache_match = (cached_mtime != "" && app_mtime != "" && cached_mtime == app_mtime)
 
-                final_epoch = (isnum(cached_epoch) && cached_epoch > 0) ? cached_epoch : 0
-                if (isnum(final_epoch) && final_epoch < floor) {
-                    final_epoch = 0
+                # real_used_epoch is the true "macOS has a use record" fact --
+                # cached_epoch, floor-filtered, before the mtime fallback
+                # below is ever applied. final_epoch keeps its historic
+                # meaning (real epoch OR mtime fallback) because it drives
+                # the terminal table relative_time() call and the sort key;
+                # the JSON emitter reads real_used_epoch separately so it
+                # never relabels a modification time as a last-used date
+                # (F-035).
+                real_used_epoch = (isnum(cached_epoch) && cached_epoch > 0) ? cached_epoch : 0
+                if (isnum(real_used_epoch) && real_used_epoch < floor) {
+                    real_used_epoch = 0
                 }
+                final_epoch = real_used_epoch
                 if ((!isnum(final_epoch) || final_epoch <= 0) && isnum(app_mtime) && app_mtime > floor) {
                     final_epoch = app_mtime
                 }
+
+                final_version = (inline_version != "") ? inline_version : cached_version
 
                 final_size_kb = (isnum(cached_size_kb) && cached_size_kb > 0) ? cached_size_kb : 0
                 if ((!isnum(final_size_kb) || final_size_kb <= 0) && isnum(inline_size_kb) && inline_size_kb > 0) {
@@ -997,8 +1060,13 @@ _scan_finalize_index() {
                 }
 
                 persist_updated_epoch = (isnum(cached_updated_epoch) && cached_updated_epoch > 0) ? cached_updated_epoch : 0
-                print app_path "|" app_mtime "|" final_size_kb "|" final_epoch "|" persist_updated_epoch "|" bundle_id "|" display_name >> snapshot_out
-                print final_epoch "|" app_path "|" display_name "|" bundle_id "|" final_size "|" final_last_used "|" final_size_kb >> apps_out
+                print app_path "|" app_mtime "|" final_size_kb "|" final_epoch "|" persist_updated_epoch "|" bundle_id "|" display_name "|" final_version >> snapshot_out
+                # apps_out gains real_used_epoch, app_mtime and final_version as
+                # trailing fields for the JSON emitter (CONTRACT.md §6.4). This
+                # is a private intermediate format, not the public contract, so
+                # widening it is safe (F-035 / docs/handoff-M1-T4.md); the first
+                # 7 fields are unchanged and still drive the terminal table.
+                print final_epoch "|" app_path "|" display_name "|" bundle_id "|" final_size "|" final_last_used "|" final_size_kb "|" real_used_epoch "|" app_mtime "|" final_version >> apps_out
             }
         ' "$merged_file"
 
@@ -1196,12 +1264,23 @@ load_applications() {
     fi
 
     apps_data=()
+    apps_meta_data=()
     selection_state=()
 
-    while IFS='|' read -r epoch app_path app_name bundle_id size last_used size_kb; do
+    # apps_out (bin/uninstall.sh's _scan_finalize_index) widened to 10
+    # fields for M1-T4 (CONTRACT.md §6): real_used_epoch, app_mtime and
+    # version trail the original 7. apps_data keeps its original 7-field
+    # shape unchanged — every other consumer in this file, lib/ui/app_selector.sh
+    # and lib/uninstall/batch.sh destructures it positionally, and widening it
+    # would silently corrupt their trailing field via read's overflow-into-
+    # last-var behavior. The 3 new fields go into the parallel apps_meta_data
+    # array instead, index-aligned with apps_data, read only by
+    # uninstall_list_apps.
+    while IFS='|' read -r epoch app_path app_name bundle_id size last_used size_kb real_used_epoch app_mtime version; do
         [[ ! -e "$app_path" ]] && continue
 
         apps_data+=("$epoch|$app_path|$app_name|$bundle_id|$size|$last_used|${size_kb:-0}")
+        apps_meta_data+=("${real_used_epoch:-}|${app_mtime:-}|${version:-}")
         selection_state+=(false)
     done < "$apps_file"
 
@@ -1385,80 +1464,198 @@ match_apps_by_name() {
     done
 }
 
-# Escape a value for embedding in a single-line JSON string. Only handles
-# the chars that would break a one-line value: backslash, quote, and C0
-# whitespace. Bundle IDs / display names never contain control bytes worth
-# preserving in this output.
-uninstall_list_json_escape() {
-    local s="$1"
-    s="${s//\\/\\\\}"
-    s="${s//\"/\\\"}"
-    s="${s//$'\t'/ }"
-    s="${s//$'\r'/ }"
-    s="${s//$'\n'/ }"
-    printf '%s' "$s"
+# VERSION= stays in the `mole` router; read it the same way bin/clean.sh's
+# and bin/optimize.sh's --json paths do, so all three emitters degrade the
+# same way (mole_version is diagnostic-only per CONTRACT.md §1.5 — never
+# gate behaviour on it).
+uninstall_list_mole_version() {
+    local version
+    version=$(sed -n 's/^VERSION="\(.*\)"$/\1/p' "$SCRIPT_DIR/../mole" 2> /dev/null | head -1)
+    [[ -n "$version" ]] || version="unknown"
+    printf '%s' "$version"
+}
+
+# Epoch -> RFC 3339 UTC, or nothing when the epoch is not a real value.
+# Honours MOLE_UNINSTALL_EPOCH_FLOOR the same way the scan awk does — see
+# F-035 / docs/handoff-M1-T4.md.
+uninstall_list_epoch_to_rfc3339() {
+    local epoch="${1:-}"
+    [[ "$epoch" =~ ^[0-9]+$ && "$epoch" -ge "$MOLE_UNINSTALL_EPOCH_FLOOR" ]] || return 1
+    date -u -r "$epoch" '+%Y-%m-%dT%H:%M:%SZ' 2> /dev/null
+}
+
+# CONTRACT.md §1.5 envelope header, through "scan_status". Callers append
+# the rest (warnings/error/data) and the closing brace.
+uninstall_list_envelope_open() {
+    local mole_version="$1"
+    local scan_status="$2"
+    local generated_at
+    generated_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    printf '{"schema_version":1,"mole_version":'
+    history_json_string "$mole_version"
+    printf ',"command":"uninstall","mode":"list","generated_at":'
+    history_json_string "$generated_at"
+    printf ',"scan_status":'
+    history_json_string "$scan_status"
+}
+
+# §6.8: scan_status "failed", data absent, exit is the caller's job (1 per
+# §1.6). Used when the scan itself could not complete — never for a scan
+# that completed with zero apps (that is data.apps: [], not a failure).
+uninstall_list_emit_failed() {
+    local mole_version="$1"
+    local code="$2"
+    local message="$3"
+    uninstall_list_envelope_open "$mole_version" "failed"
+    printf ',"warnings":[],"error":{"code":'
+    history_json_string "$code"
+    printf ',"message":'
+    history_json_string "$message"
+    printf '},"data":null}\n'
+}
+
+# §6.3/§6.4 envelope: `mode: "list"`, `data.apps` (always an array). Reads
+# apps_data (unchanged 7-field shape) and the index-aligned apps_meta_data
+# (real_used_epoch|app_mtime|version — see load_applications) that
+# load_applications populated. size_bytes/size_known and last_used/
+# installed_at follow F-035's decision: last_used comes from
+# real_used_epoch only (a real macOS use record), never from app_mtime, so
+# an app macOS has no use record for reports no last_used at all rather
+# than silently relabelling its modification time.
+uninstall_list_emit_json() {
+    local mole_version="$1"
+    uninstall_list_envelope_open "$mole_version" "complete"
+    printf ',"warnings":[],"error":null,"data":{"apps":['
+
+    local total=${#apps_data[@]}
+    local i first=1
+    for ((i = 0; i < total; i++)); do
+        local app_data="${apps_data[$i]}"
+        local meta="${apps_meta_data[i]:-||}"
+        local app_path app_name bundle_id size size_kb
+        local real_used_epoch app_mtime_epoch version
+        IFS='|' read -r _ app_path app_name bundle_id size _ size_kb <<< "$app_data"
+        IFS='|' read -r real_used_epoch app_mtime_epoch version <<< "$meta"
+
+        local cask=""
+        if is_homebrew_available; then
+            cask=$(get_brew_cask_name "$app_path" 2> /dev/null || true)
+        fi
+        local uninstall_name="${cask:-$app_name}"
+        local source_label="App"
+        [[ -n "$cask" ]] && source_label="Homebrew"
+        local size_display
+        size_display=$(uninstall_normalize_size_display "$size")
+
+        [[ "$size_kb" =~ ^[0-9]+$ ]] || size_kb=0
+        # §1.1: size_known false + size_bytes absent, never size_bytes: 0.
+        # human_size() in the scan awk returns "--" for kb <= 0 — F-022's
+        # sentinel at its source — so kb > 0 is the same test this emitter
+        # must use to agree with it.
+        local size_known="false" size_bytes=""
+        if [[ "$size_kb" -gt 0 ]]; then
+            size_known="true"
+            size_bytes=$((size_kb * 1024))
+        fi
+
+        local last_used=""
+        last_used=$(uninstall_list_epoch_to_rfc3339 "$real_used_epoch") || last_used=""
+
+        local installed_at="" installed_at_source=""
+        if installed_at=$(uninstall_list_epoch_to_rfc3339 "$app_mtime_epoch"); then
+            installed_at_source="bundle_mtime"
+        else
+            installed_at=""
+        fi
+
+        [[ "$first" == "1" ]] || printf ','
+        first=0
+
+        printf '{"name":'
+        history_json_string "$app_name"
+        printf ',"bundle_id":'
+        history_json_string "$bundle_id"
+        printf ',"source":'
+        history_json_string "$source_label"
+        printf ',"uninstall_name":'
+        history_json_string "$uninstall_name"
+        printf ',"path":'
+        history_json_string "$app_path"
+        printf ',"size":'
+        history_json_string "$size_display"
+        printf ',"size_known":%s' "$size_known"
+        [[ -z "$size_bytes" ]] || printf ',"size_bytes":%s' "$size_bytes"
+        if [[ -n "$version" ]]; then
+            printf ',"version":'
+            history_json_string "$version"
+        fi
+        if [[ -n "$last_used" ]]; then
+            printf ',"last_used":'
+            history_json_string "$last_used"
+        fi
+        if [[ -n "$installed_at" ]]; then
+            printf ',"installed_at":'
+            history_json_string "$installed_at"
+            printf ',"installed_at_source":'
+            history_json_string "$installed_at_source"
+        fi
+        printf '}'
+    done
+
+    printf ']}}\n'
 }
 
 # Read-only listing: surface each installed app's display name, bundle id,
 # the exact name `mo uninstall` accepts, and human-readable size. Reuses the
 # existing scanner so the output stays in lockstep with what the destructive
-# path sees.
+# path sees. Args: json_flag ("1" when --json was passed explicitly).
 uninstall_list_apps() {
+    local json_flag="${1:-0}"
+    local mole_version
+    mole_version=$(uninstall_list_mole_version)
+
+    # §6.1: --json is explicit; the TTY auto-switch stays for schema_version
+    # 1 backward compatibility (Molehouse itself must always pass --json
+    # explicitly and never rely on this).
+    local format="text"
+    if [[ "$json_flag" == "1" || ! -t 1 ]]; then
+        format="json"
+    fi
+
     local apps_file=""
     if ! apps_file=$(scan_applications); then
+        if [[ "$format" == "json" ]]; then
+            uninstall_list_emit_failed "$mole_version" "scan_failed" "could not complete the application scan"
+            return 1
+        fi
         uninstall_abort "could not complete the application scan"
         return 1
     fi
     if [[ ! -f "$apps_file" ]]; then
+        if [[ "$format" == "json" ]]; then
+            uninstall_list_emit_failed "$mole_version" "scan_failed" "application scan produced no list"
+            return 1
+        fi
         uninstall_abort "application scan produced no list"
         return 1
     fi
     if ! load_applications "$apps_file"; then
         rm -f "$apps_file"
+        # A scan that completed and legitimately found nothing is §6.8's
+        # `no_apps` case: not an error. data.apps: [], exit 0. Text mode is
+        # not governed by the contract, so it keeps its pre-existing abort
+        # behaviour unchanged.
+        if [[ "$format" == "json" ]]; then
+            uninstall_list_emit_json "$mole_version"
+            return 0
+        fi
         uninstall_abort "no applications available for uninstallation"
         return 1
     fi
     rm -f "$apps_file"
 
-    # Auto-switch to JSON when stdout is piped, matching `mo status`.
-    local format="text"
-    if [[ ! -t 1 ]]; then
-        format="json"
-    fi
-
     if [[ "$format" == "json" ]]; then
-        printf '['
-        local first=1
-        local app_data
-        for app_data in "${apps_data[@]+"${apps_data[@]}"}"; do
-            IFS='|' read -r _ app_path app_name bundle_id size _ _ <<< "$app_data"
-            local cask=""
-            if is_homebrew_available; then
-                cask=$(get_brew_cask_name "$app_path" 2> /dev/null || true)
-            fi
-            local uninstall_name="${cask:-$app_name}"
-            local source_label="App"
-            [[ -n "$cask" ]] && source_label="Homebrew"
-            local size_display
-            size_display=$(uninstall_normalize_size_display "$size")
-            if [[ $first -eq 1 ]]; then
-                first=0
-                printf '\n'
-            else
-                printf ',\n'
-            fi
-            printf '  {"name": "%s", "bundle_id": "%s", "source": "%s", "uninstall_name": "%s", "path": "%s", "size": "%s"}' \
-                "$(uninstall_list_json_escape "$app_name")" \
-                "$(uninstall_list_json_escape "$bundle_id")" \
-                "$source_label" \
-                "$(uninstall_list_json_escape "$uninstall_name")" \
-                "$(uninstall_list_json_escape "$app_path")" \
-                "$(uninstall_list_json_escape "$size_display")"
-        done
-        if [[ $first -eq 0 ]]; then
-            printf '\n'
-        fi
-        printf ']\n'
+        uninstall_list_emit_json "$mole_version"
         return 0
     fi
 
@@ -1527,6 +1724,7 @@ main() {
     # Parse flags and collect app name arguments
     local -a app_name_args=()
     local list_mode=0
+    local list_json=0
     for arg in "$@"; do
         case "$arg" in
             "--help" | "-h")
@@ -1544,6 +1742,9 @@ main() {
                 ;;
             "--list")
                 list_mode=1
+                ;;
+            "--json")
+                list_json=1
                 ;;
             "--whitelist")
                 echo "Unknown uninstall option: $arg"
@@ -1565,7 +1766,7 @@ main() {
     # --list short-circuits before any destructive code. Read-only path:
     # scan, resolve uninstall names, print table or JSON, exit 0.
     if [[ $list_mode -eq 1 ]]; then
-        uninstall_list_apps
+        uninstall_list_apps "$list_json"
         return $?
     fi
 

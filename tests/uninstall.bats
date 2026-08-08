@@ -3557,23 +3557,34 @@ INNER
 }
 
 # ---------------------------------------------------------------------------
-# --list: read-only inventory of installable app names (PR #755 scope)
+# --list: read-only inventory of installable app names (PR #755 scope),
+# extended to the CONTRACT.md §6 envelope + size_bytes/size_known/version/
+# last_used/installed_at/installed_at_source fields (M1-T4).
+#
+# apps_cache fixtures below use the widened apps_out shape load_applications
+# reads: epoch|app_path|app_name|bundle_id|size|last_used|size_kb|
+# real_used_epoch|app_mtime|version. The load_applications stub in each
+# heredoc mirrors bin/uninstall.sh's real one: apps_data keeps the original
+# 7-field shape, and the 3 new fields go into the index-aligned
+# apps_meta_data array (real_used_epoch|app_mtime|version) — see
+# docs/handoff-M1-T4.md and load_applications's header comment.
 # ---------------------------------------------------------------------------
 
 @test "uninstall --list prints table with NAME, BUNDLE ID, UNINSTALL NAME, SIZE" {
     local apps_cache
     apps_cache="$(mktemp "${BATS_TEST_TMPDIR:-$BATS_RUN_TMPDIR:-$HOME}/tmp-list-text.XXXXXX")"
-    # Format matches load_applications: epoch|app_path|app_name|bundle_id|size|last_used|size_kb
     cat > "$apps_cache" << 'CACHE'
-1700000000|/Applications/Slack.app|Slack|com.tinyspeck.slackmacgap|180MB|Today|184320
-1700000000|/Applications/Zoom.app|Zoom|us.zoom.xos|140MB|Yesterday|143360
+1700000000|/Applications/Slack.app|Slack|com.tinyspeck.slackmacgap|180MB|Today|184320|1700000000|1690000000|4.36.0
+1700000000|/Applications/Zoom.app|Zoom|us.zoom.xos|140MB|Yesterday|143360||1680000000|
 CACHE
 
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 \
         APPS_CACHE_FILE="$apps_cache" /bin/bash --noprofile --norc << 'INNER'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/core/history.sh"
 
+MOLE_UNINSTALL_EPOCH_FLOOR=978307200
 log_operation_session_start() { :; }
 show_uninstall_help() { :; }
 hide_cursor() { :; }
@@ -3582,8 +3593,10 @@ clear_screen() { :; }
 scan_applications() { printf '%s\n' "$APPS_CACHE_FILE"; }
 load_applications() {
     apps_data=()
-    while IFS='|' read -r epoch app_path app_name bundle_id size last_used size_kb; do
+    apps_meta_data=()
+    while IFS='|' read -r epoch app_path app_name bundle_id size last_used size_kb real_used_epoch app_mtime version; do
         apps_data+=("$epoch|$app_path|$app_name|$bundle_id|$size|$last_used|${size_kb:-0}")
+        apps_meta_data+=("${real_used_epoch:-}|${app_mtime:-}|${version:-}")
     done < "$1"
 }
 # Stub Homebrew so test stays hermetic and brew detection never fires.
@@ -3593,7 +3606,8 @@ get_brew_cask_name() { return 1; }
 # and our sed slice only pulls list-related helpers + main().
 uninstall_normalize_size_display() { local s="${1:-}"; [[ -z "$s" || "$s" == "0" || "$s" == "Unknown" ]] && echo "N/A" || echo "$s"; }
 
-eval "$(sed -n '/^uninstall_list_json_escape()/,/main "\$@"/p' "$PROJECT_ROOT/bin/uninstall.sh" | sed '$d')"
+eval "$(sed -n '/^uninstall_list_mole_version()/,/main "\$@"/p' "$PROJECT_ROOT/bin/uninstall.sh" | sed '$d')"
+SCRIPT_DIR="$PROJECT_ROOT/bin"
 # Force text mode by simulating a TTY for stdout via /dev/tty redirect not
 # available in bats; instead pipe through a wrapper that fakes -t 1. Simplest:
 # call the function directly so [[ -t 1 ]] uses bash's stdout (the bats pipe).
@@ -3603,26 +3617,29 @@ INNER
 
     rm -f "$apps_cache"
     [ "$status" -eq 0 ]
-    # Bats pipes stdout, so output is JSON. Assert both apps and uninstall_name.
-    [[ "$output" == *'"name": "Slack"'* ]] || return 1
-    [[ "$output" == *'"name": "Zoom"'* ]] || return 1
-    [[ "$output" == *'"uninstall_name": "Slack"'* ]] || return 1
-    [[ "$output" == *'"bundle_id": "com.tinyspeck.slackmacgap"'* ]] || return 1
-    [[ "$output" == *'"source": "App"'* ]]
+    # Bats pipes stdout, so output is the §6 JSON envelope.
+    [[ "$output" == *'"mode":"list"'* ]] || return 1
+    [[ "$output" == *'"name":"Slack"'* ]] || return 1
+    [[ "$output" == *'"name":"Zoom"'* ]] || return 1
+    [[ "$output" == *'"uninstall_name":"Slack"'* ]] || return 1
+    [[ "$output" == *'"bundle_id":"com.tinyspeck.slackmacgap"'* ]] || return 1
+    [[ "$output" == *'"source":"App"'* ]]
 }
 
-@test "uninstall --list emits JSON array when stdout is piped" {
+@test "uninstall --list --json emits a §1.5 envelope with data.apps on a TTY" {
     local apps_cache
     apps_cache="$(mktemp "${BATS_TEST_TMPDIR:-$BATS_RUN_TMPDIR:-$HOME}/tmp-list-json.XXXXXX")"
     cat > "$apps_cache" << 'CACHE'
-1700000000|/Applications/Slack.app|Slack|com.tinyspeck.slackmacgap|180MB|Today|184320
+1700000000|/Applications/Slack.app|Slack|com.tinyspeck.slackmacgap|180MB|Today|184320|1700000000|1690000000|4.36.0
 CACHE
 
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 \
         APPS_CACHE_FILE="$apps_cache" /bin/bash --noprofile --norc << 'INNER'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/core/history.sh"
 
+MOLE_UNINSTALL_EPOCH_FLOOR=978307200
 log_operation_session_start() { :; }
 show_uninstall_help() { :; }
 hide_cursor() { :; }
@@ -3631,32 +3648,203 @@ clear_screen() { :; }
 scan_applications() { printf '%s\n' "$APPS_CACHE_FILE"; }
 load_applications() {
     apps_data=()
-    while IFS='|' read -r epoch app_path app_name bundle_id size last_used size_kb; do
+    apps_meta_data=()
+    while IFS='|' read -r epoch app_path app_name bundle_id size last_used size_kb real_used_epoch app_mtime version; do
         apps_data+=("$epoch|$app_path|$app_name|$bundle_id|$size|$last_used|${size_kb:-0}")
+        apps_meta_data+=("${real_used_epoch:-}|${app_mtime:-}|${version:-}")
     done < "$1"
 }
 is_homebrew_available() { return 1; }
 get_brew_cask_name() { return 1; }
-# Stubbed because the production helper lives earlier in bin/uninstall.sh
-# and our sed slice only pulls list-related helpers + main().
 uninstall_normalize_size_display() { local s="${1:-}"; [[ -z "$s" || "$s" == "0" || "$s" == "Unknown" ]] && echo "N/A" || echo "$s"; }
 
-eval "$(sed -n '/^uninstall_list_json_escape()/,/main "\$@"/p' "$PROJECT_ROOT/bin/uninstall.sh" | sed '$d')"
-main --list
+eval "$(sed -n '/^uninstall_list_mole_version()/,/main "\$@"/p' "$PROJECT_ROOT/bin/uninstall.sh" | sed '$d')"
+SCRIPT_DIR="$PROJECT_ROOT/bin"
+# --list --json must emit JSON even when main's own stdout is a real bats
+# pipe (already non-TTY) *and* even if it were a TTY — exercise the flag
+# explicitly rather than relying on the legacy auto-switch.
+main --list --json
 INNER
 
     rm -f "$apps_cache"
     [ "$status" -eq 0 ]
-    # Output should start with '[' and end with ']' to be a valid JSON array.
-    [[ "${output:0:1}" == "[" ]] || return 1
-    [[ "${output: -1}" == "]" ]] || return 1
-    # Round-trip via python to confirm it parses as JSON.
     if command -v python3 > /dev/null; then
-        printf '%s\n' "$output" | python3 -c 'import sys, json; d=json.load(sys.stdin); assert isinstance(d, list) and len(d)==1 and d[0]["name"]=="Slack"'
+        printf '%s\n' "$output" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+assert d["schema_version"] == 1
+assert d["command"] == "uninstall"
+assert d["mode"] == "list"
+assert d["scan_status"] == "complete"
+assert d["warnings"] == []
+assert d["error"] is None
+apps = d["data"]["apps"]
+assert len(apps) == 1
+assert apps[0]["name"] == "Slack"
+assert apps[0]["version"] == "4.36.0"
+'
     fi
 }
 
-@test "uninstall --list with empty scan returns empty JSON array" {
+@test "uninstall --list --json: size_known false carries no size_bytes" {
+    local apps_cache
+    apps_cache="$(mktemp "${BATS_TEST_TMPDIR:-$BATS_RUN_TMPDIR:-$HOME}/tmp-list-sizeunknown.XXXXXX")"
+    # size_kb is 0 (F-022's "--" sentinel path in the real awk's human_size()).
+    cat > "$apps_cache" << 'CACHE'
+1700000000|/Applications/Broken.app|Broken|com.example.broken|--|Unknown|0||1690000000|
+CACHE
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 \
+        APPS_CACHE_FILE="$apps_cache" /bin/bash --noprofile --norc << 'INNER'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/core/history.sh"
+
+MOLE_UNINSTALL_EPOCH_FLOOR=978307200
+log_operation_session_start() { :; }
+show_uninstall_help() { :; }
+hide_cursor() { :; }
+show_cursor() { :; }
+clear_screen() { :; }
+scan_applications() { printf '%s\n' "$APPS_CACHE_FILE"; }
+load_applications() {
+    apps_data=()
+    apps_meta_data=()
+    while IFS='|' read -r epoch app_path app_name bundle_id size last_used size_kb real_used_epoch app_mtime version; do
+        apps_data+=("$epoch|$app_path|$app_name|$bundle_id|$size|$last_used|${size_kb:-0}")
+        apps_meta_data+=("${real_used_epoch:-}|${app_mtime:-}|${version:-}")
+    done < "$1"
+}
+is_homebrew_available() { return 1; }
+get_brew_cask_name() { return 1; }
+uninstall_normalize_size_display() { local s="${1:-}"; [[ -z "$s" || "$s" == "0" || "$s" == "Unknown" ]] && echo "N/A" || echo "$s"; }
+
+eval "$(sed -n '/^uninstall_list_mole_version()/,/main "\$@"/p' "$PROJECT_ROOT/bin/uninstall.sh" | sed '$d')"
+SCRIPT_DIR="$PROJECT_ROOT/bin"
+main --list --json
+INNER
+
+    rm -f "$apps_cache"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *'"size_known":false'* ]] || return 1
+    [[ "$output" != *'"size_bytes"'* ]] || return 1
+}
+
+@test "uninstall --list --json: last_used only for a real use record, never from installed_at" {
+    local apps_cache
+    apps_cache="$(mktemp "${BATS_TEST_TMPDIR:-$BATS_RUN_TMPDIR:-$HOME}/tmp-list-lastused.XXXXXX")"
+    # WithRecord has a real cached_epoch (real_used_epoch=1700000000).
+    # NoRecord has none: real_used_epoch is empty, only app_mtime (1680000000)
+    # is set. F-035's core assertion: NoRecord must not surface last_used at
+    # all, and its installed_at must stay the mtime value, never leak into
+    # last_used.
+    cat > "$apps_cache" << 'CACHE'
+1700000000|/Applications/WithRecord.app|WithRecord|com.example.with|10MB|Today|10240|1700000000|1690000000|1.0
+1680000000|/Applications/NoRecord.app|NoRecord|com.example.without|10MB|Unknown|10240||1680000000|1.0
+CACHE
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 \
+        APPS_CACHE_FILE="$apps_cache" /bin/bash --noprofile --norc << 'INNER'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/core/history.sh"
+
+MOLE_UNINSTALL_EPOCH_FLOOR=978307200
+log_operation_session_start() { :; }
+show_uninstall_help() { :; }
+hide_cursor() { :; }
+show_cursor() { :; }
+clear_screen() { :; }
+scan_applications() { printf '%s\n' "$APPS_CACHE_FILE"; }
+load_applications() {
+    apps_data=()
+    apps_meta_data=()
+    while IFS='|' read -r epoch app_path app_name bundle_id size last_used size_kb real_used_epoch app_mtime version; do
+        apps_data+=("$epoch|$app_path|$app_name|$bundle_id|$size|$last_used|${size_kb:-0}")
+        apps_meta_data+=("${real_used_epoch:-}|${app_mtime:-}|${version:-}")
+    done < "$1"
+}
+is_homebrew_available() { return 1; }
+get_brew_cask_name() { return 1; }
+uninstall_normalize_size_display() { local s="${1:-}"; [[ -z "$s" || "$s" == "0" || "$s" == "Unknown" ]] && echo "N/A" || echo "$s"; }
+
+eval "$(sed -n '/^uninstall_list_mole_version()/,/main "\$@"/p' "$PROJECT_ROOT/bin/uninstall.sh" | sed '$d')"
+SCRIPT_DIR="$PROJECT_ROOT/bin"
+main --list --json
+INNER
+
+    rm -f "$apps_cache"
+    [ "$status" -eq 0 ]
+    if command -v python3 > /dev/null; then
+        printf '%s\n' "$output" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+apps = {a["name"]: a for a in d["data"]["apps"]}
+assert "last_used" in apps["WithRecord"], "expected last_used for a real use record"
+assert apps["WithRecord"]["last_used"] == "2023-11-14T22:13:20Z"
+assert "last_used" not in apps["NoRecord"], "must not fabricate last_used from installed_at"
+assert apps["NoRecord"]["installed_at"] == "2023-03-28T10:40:00Z"
+assert apps["NoRecord"]["installed_at_source"] == "bundle_mtime"
+'
+    fi
+}
+
+@test "uninstall --list --json: installed_at is always paired with installed_at_source" {
+    local apps_cache
+    apps_cache="$(mktemp "${BATS_TEST_TMPDIR:-$BATS_RUN_TMPDIR:-$HOME}/tmp-list-installedat.XXXXXX")"
+    # NoMtime has no usable app_mtime (below MOLE_UNINSTALL_EPOCH_FLOOR), so
+    # installed_at must be entirely absent, not present with an empty source.
+    cat > "$apps_cache" << 'CACHE'
+1700000000|/Applications/HasMtime.app|HasMtime|com.example.has|10MB|Today|10240||1690000000|1.0
+0|/Applications/NoMtime.app|NoMtime|com.example.none|10MB|Unknown|10240|||1.0
+CACHE
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 \
+        APPS_CACHE_FILE="$apps_cache" /bin/bash --noprofile --norc << 'INNER'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/core/history.sh"
+
+MOLE_UNINSTALL_EPOCH_FLOOR=978307200
+log_operation_session_start() { :; }
+show_uninstall_help() { :; }
+hide_cursor() { :; }
+show_cursor() { :; }
+clear_screen() { :; }
+scan_applications() { printf '%s\n' "$APPS_CACHE_FILE"; }
+load_applications() {
+    apps_data=()
+    apps_meta_data=()
+    while IFS='|' read -r epoch app_path app_name bundle_id size last_used size_kb real_used_epoch app_mtime version; do
+        apps_data+=("$epoch|$app_path|$app_name|$bundle_id|$size|$last_used|${size_kb:-0}")
+        apps_meta_data+=("${real_used_epoch:-}|${app_mtime:-}|${version:-}")
+    done < "$1"
+}
+is_homebrew_available() { return 1; }
+get_brew_cask_name() { return 1; }
+uninstall_normalize_size_display() { local s="${1:-}"; [[ -z "$s" || "$s" == "0" || "$s" == "Unknown" ]] && echo "N/A" || echo "$s"; }
+
+eval "$(sed -n '/^uninstall_list_mole_version()/,/main "\$@"/p' "$PROJECT_ROOT/bin/uninstall.sh" | sed '$d')"
+SCRIPT_DIR="$PROJECT_ROOT/bin"
+main --list --json
+INNER
+
+    rm -f "$apps_cache"
+    [ "$status" -eq 0 ]
+    if command -v python3 > /dev/null; then
+        printf '%s\n' "$output" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+for app in d["data"]["apps"]:
+    assert ("installed_at" in app) == ("installed_at_source" in app), app
+apps = {a["name"]: a for a in d["data"]["apps"]}
+assert "installed_at" in apps["HasMtime"]
+assert "installed_at" not in apps["NoMtime"]
+'
+    fi
+}
+
+@test "uninstall --list with empty scan returns an empty data.apps array" {
     local apps_cache
     apps_cache="$(mktemp "${BATS_TEST_TMPDIR:-$BATS_RUN_TMPDIR:-$HOME}/tmp-list-empty.XXXXXX")"
     # Non-empty file so load_applications doesn't bail early on size check.
@@ -3666,7 +3854,9 @@ INNER
         APPS_CACHE_FILE="$apps_cache" /bin/bash --noprofile --norc << 'INNER'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/core/history.sh"
 
+MOLE_UNINSTALL_EPOCH_FLOOR=978307200
 log_operation_session_start() { :; }
 show_uninstall_help() { :; }
 hide_cursor() { :; }
@@ -3675,6 +3865,7 @@ clear_screen() { :; }
 scan_applications() { printf '%s\n' "$APPS_CACHE_FILE"; }
 load_applications() {
     apps_data=()
+    apps_meta_data=()
     return 0
 }
 is_homebrew_available() { return 1; }
@@ -3683,27 +3874,30 @@ get_brew_cask_name() { return 1; }
 # and our sed slice only pulls list-related helpers + main().
 uninstall_normalize_size_display() { local s="${1:-}"; [[ -z "$s" || "$s" == "0" || "$s" == "Unknown" ]] && echo "N/A" || echo "$s"; }
 
-eval "$(sed -n '/^uninstall_list_json_escape()/,/main "\$@"/p' "$PROJECT_ROOT/bin/uninstall.sh" | sed '$d')"
+eval "$(sed -n '/^uninstall_list_mole_version()/,/main "\$@"/p' "$PROJECT_ROOT/bin/uninstall.sh" | sed '$d')"
+SCRIPT_DIR="$PROJECT_ROOT/bin"
 main --list
 INNER
 
     rm -f "$apps_cache"
     [ "$status" -eq 0 ]
-    [[ "$output" == "[]" ]]
+    [[ "$output" == *'"data":{"apps":[]}'* ]] || return 1
 }
 
 @test "uninstall --list flags brew-managed apps with cask uninstall_name" {
     local apps_cache
     apps_cache="$(mktemp "${BATS_TEST_TMPDIR:-$BATS_RUN_TMPDIR:-$HOME}/tmp-list-brew.XXXXXX")"
     cat > "$apps_cache" << 'CACHE'
-1700000000|/Applications/Visual Studio Code.app|Visual Studio Code|com.microsoft.VSCode|420MB|Today|430080
+1700000000|/Applications/Visual Studio Code.app|Visual Studio Code|com.microsoft.VSCode|420MB|Today|430080|1700000000|1690000000|1.85.0
 CACHE
 
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 \
         APPS_CACHE_FILE="$apps_cache" /bin/bash --noprofile --norc << 'INNER'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/core/history.sh"
 
+MOLE_UNINSTALL_EPOCH_FLOOR=978307200
 log_operation_session_start() { :; }
 show_uninstall_help() { :; }
 hide_cursor() { :; }
@@ -3712,8 +3906,10 @@ clear_screen() { :; }
 scan_applications() { printf '%s\n' "$APPS_CACHE_FILE"; }
 load_applications() {
     apps_data=()
-    while IFS='|' read -r epoch app_path app_name bundle_id size last_used size_kb; do
+    apps_meta_data=()
+    while IFS='|' read -r epoch app_path app_name bundle_id size last_used size_kb real_used_epoch app_mtime version; do
         apps_data+=("$epoch|$app_path|$app_name|$bundle_id|$size|$last_used|${size_kb:-0}")
+        apps_meta_data+=("${real_used_epoch:-}|${app_mtime:-}|${version:-}")
     done < "$1"
 }
 # Force brew-managed result.
@@ -3721,14 +3917,15 @@ is_homebrew_available() { return 0; }
 get_brew_cask_name() { printf '%s' "visual-studio-code"; return 0; }
 uninstall_normalize_size_display() { local s="${1:-}"; [[ -z "$s" || "$s" == "0" || "$s" == "Unknown" ]] && echo "N/A" || echo "$s"; }
 
-eval "$(sed -n '/^uninstall_list_json_escape()/,/main "\$@"/p' "$PROJECT_ROOT/bin/uninstall.sh" | sed '$d')"
+eval "$(sed -n '/^uninstall_list_mole_version()/,/main "\$@"/p' "$PROJECT_ROOT/bin/uninstall.sh" | sed '$d')"
+SCRIPT_DIR="$PROJECT_ROOT/bin"
 main --list
 INNER
 
     rm -f "$apps_cache"
     [ "$status" -eq 0 ]
-    [[ "$output" == *'"uninstall_name": "visual-studio-code"'* ]] || return 1
-    [[ "$output" == *'"source": "Homebrew"'* ]]
+    [[ "$output" == *'"uninstall_name":"visual-studio-code"'* ]] || return 1
+    [[ "$output" == *'"source":"Homebrew"'* ]]
 }
 
 # Regression tests for #940: warn about background jobs that survive uninstall.
