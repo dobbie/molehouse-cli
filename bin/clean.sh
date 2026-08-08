@@ -20,9 +20,14 @@ source "$SCRIPT_DIR/../lib/clean/app_caches.sh"
 source "$SCRIPT_DIR/../lib/clean/hints.sh"
 source "$SCRIPT_DIR/../lib/clean/system.sh"
 source "$SCRIPT_DIR/../lib/clean/user.sh"
+source "$SCRIPT_DIR/../lib/clean/json_emit.sh"
 
 SYSTEM_CLEAN=false
 DRY_RUN=false
+JSON_OUTPUT=false
+# Sections that actually ran, in scan order (start_section hook below).
+# Only populated in --json mode; unused otherwise.
+declare -a JSON_SECTION_NAMES=()
 if [[ "${MOLE_DRY_RUN:-0}" == "1" ]]; then
     DRY_RUN=true
 fi
@@ -630,6 +635,9 @@ start_section() {
     TRACK_SECTION=1
     SECTION_ACTIVITY=0
     CURRENT_SECTION="$1"
+    if [[ "$JSON_OUTPUT" == "true" ]]; then
+        JSON_SECTION_NAMES+=("$1")
+    fi
     if [[ "${IDLE_SECTION_PENDING:-0}" == "1" ]]; then
         # Overwrite the previous idle section's header line in place (the
         # pending flag is only ever set on an interactive ANSI terminal).
@@ -2061,6 +2069,9 @@ main() {
                 DRY_RUN=true
                 export MOLE_DRY_RUN=1
                 ;;
+            "--json")
+                JSON_OUTPUT=true
+                ;;
             "--external")
                 shift
                 if [[ $# -eq 0 ]]; then
@@ -2093,12 +2104,55 @@ main() {
         shift
     done
 
-    start_cleanup
+    if [[ "$JSON_OUTPUT" == "true" && "$DRY_RUN" != "true" ]]; then
+        echo "mo clean --json requires --dry-run (preview only)." >&2
+        echo "Run 'mo clean --help' for usage." >&2
+        exit 2
+    fi
+
+    if [[ "$JSON_OUTPUT" != "true" ]]; then
+        start_cleanup
+        hide_cursor
+        local cleanup_rc=0
+        perform_cleanup || cleanup_rc=$?
+        show_cursor
+        exit "$cleanup_rc"
+    fi
+
+    # --json: run the normal scan with its human-readable stdout diverted, so
+    # stdout carries only the JSON document (CONTRACT.md §1.3). start_cleanup
+    # and perform_cleanup are otherwise untouched — this is a serialisation of
+    # what they already compute, not a second scan implementation.
+    local mole_version
+    mole_version=$(sed -n 's/^VERSION="\(.*\)"$/\1/p' "$SCRIPT_DIR/../mole" 2> /dev/null | head -1)
+    [[ -n "$mole_version" ]] || mole_version="unknown"
+
+    local start_rc=0
+    exec 4>&1 1> /dev/null
+    start_cleanup || start_rc=$?
     hide_cursor
     local cleanup_rc=0
-    perform_cleanup || cleanup_rc=$?
+    if [[ $start_rc -eq 0 ]]; then
+        perform_cleanup || cleanup_rc=$?
+    else
+        cleanup_rc=$start_rc
+    fi
     show_cursor
-    exit "$cleanup_rc"
+    exec 1>&4 4>&-
+
+    clean_json_emit_preview "$cleanup_rc" "$start_rc" "$mole_version"
+
+    # A nonzero cleanup_rc here is an internal step cancellation (e.g. a
+    # per-section timeout, exit 124), never a raw signal: SIGINT/SIGTERM are
+    # caught by the traps above, which exit 130/143 immediately and never
+    # reach this line. Per CONTRACT.md §1.6/§5.6, that case is exit 0 with
+    # scan_status "partial" (already set by clean_json_emit_preview above) —
+    # "the process finished", not "the command broke". Exit 1 is reserved for
+    # start_rc failures, where no usable preview was produced at all.
+    if [[ $start_rc -ne 0 ]]; then
+        exit 1
+    fi
+    exit 0
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
