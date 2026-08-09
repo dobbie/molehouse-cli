@@ -196,7 +196,10 @@ EOF
 
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"|$app_path|SizedApp|com.example.SizedApp|4KB|"* ]] || return 1
-	[[ "$output" == *"|4" ]]
+	# final_size_kb=4, followed by real_used_epoch=0 (no use record on a
+	# fresh scan); apps_out also trails app_mtime and final_version
+	# (F-035 / F-038), which this does not pin since they are dynamic.
+	[[ "$output" == *"|4|0|"* ]]
 }
 
 @test "scan_applications falls back to bounded du when the quick mdls size probe misses" {
@@ -229,7 +232,8 @@ EOF
 
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"|$app_path|DuApp|com.example.DuApp|2.1MB|"* ]] || return 1
-	[[ "$output" == *"|2048" ]]
+	# final_size_kb=2048, followed by real_used_epoch=0 (F-035 / F-038).
+	[[ "$output" == *"|2048|0|"* ]]
 }
 
 @test "scan_applications keeps the fast path when cold rows exceed the du fallback cap" {
@@ -262,7 +266,8 @@ EOF
 
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"|$app_path|CapApp|com.example.CapApp|--|"* ]] || return 1
-	[[ "$output" == *"|0" ]]
+	# final_size_kb=0, followed by real_used_epoch=0 (F-035 / F-038).
+	[[ "$output" == *"|0|0|"* ]]
 }
 
 @test "scan_applications includes Artpaper's two-segment bundle id (#861)" {

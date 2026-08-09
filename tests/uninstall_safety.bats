@@ -652,6 +652,11 @@ EOF
 }
 
 @test "uninstall --list surfaces a failed scan instead of a bare exit (#1339)" {
+	# bats' `run` captures stdout through a pipe, so this exercises the
+	# non-TTY path. Since M1-T4 (F-039, decided) a scan failure there
+	# surfaces the §6.8 JSON error envelope rather than the old human-text
+	# abort message: a non-TTY caller is almost always a script, and it
+	# should get structured failure data even without --json.
 	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/bin/uninstall.sh"
@@ -662,7 +667,9 @@ uninstall_list_apps
 EOF
 
 	[ "$status" -eq 1 ]
-	[[ "$output" == *"Uninstall aborted: could not complete the application scan"* ]]
+	[[ "$output" == *'"scan_status":"failed"'* ]]
+	[[ "$output" == *'"error":{"code":"scan_failed","message":"could not complete the application scan"}'* ]]
+	[[ "$output" == *'"data":null'* ]]
 }
 
 @test "a receipt scan that outlives its budget degrades to indeterminate, not a dead run" {
