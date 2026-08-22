@@ -1,0 +1,49 @@
+{
+  "title": "mole analyze --json <path> (CONTRACT.md §4)",
+  "description": "Flat by design (§1.5). `total_size` is G -- it carries no omitempty (§4.3) -- while `total_files` and `large_files` are C and vanish on an empty or tidy directory. That pair is F-017 and is the reason this schema exists.",
+  "type": "object",
+  "required": ["schema_version", "scan_status", "warnings", "path", "overview", "entries", "total_size"],
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "scan_status": { "type": "string", "enum": ["complete", "partial"] },
+    "warnings": { "type": "array", "items": { "$ref": "warning.schema.json" } },
+    "path": { "type": "string" },
+    "overview": { "type": "boolean" },
+    "entries": {
+      "type": "array",
+      "description": "G, and never null: built with make(..., 0, n), so [] at minimum.",
+      "items": {
+        "type": "object",
+        "required": ["name", "path", "size", "is_dir"],
+        "properties": {
+          "name": { "type": "string" },
+          "path": { "type": "string" },
+          "size": { "type": "integer" },
+          "is_dir": { "type": "boolean" },
+          "insight": { "type": ["boolean", "null"] },
+          "cleanable": { "type": ["boolean", "null"] },
+          "last_access": {
+            "type": ["string", "null"],
+            "description": "C: omitempty, and absent for directories -- the single most likely keyNotFound in the app (§4.7).",
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+          }
+        }
+      }
+    },
+    "large_files": {
+      "type": ["array", "null"],
+      "description": "C: omitempty. Absent below the 1 MiB threshold and always absent in overview mode (§4.4).",
+      "items": {
+        "type": "object",
+        "required": ["name", "path", "size"],
+        "properties": {
+          "name": { "type": "string" },
+          "path": { "type": "string" },
+          "size": { "type": "integer" }
+        }
+      }
+    },
+    "total_size": { "type": "integer" },
+    "total_files": { "type": ["integer", "null"] }
+  }
+}

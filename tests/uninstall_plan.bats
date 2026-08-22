@@ -908,3 +908,183 @@ PY
     }
     [[ ! -d "$MOLE_TEST_TRASH_DIR" ]] || [ -z "$(ls -A "$MOLE_TEST_TRASH_DIR")" ]
 }
+
+# --- §7.7 delete_mode (F-041) ---------------------------------------------
+
+# Build the plan for the fixture app under permanent semantics, into $1.
+make_permanent_plan() {
+    env HOME="$HOME" MOLE_TEST_TRASH_DIR="$MOLE_TEST_TRASH_DIR" \
+        MOLE_TEST_NO_AUTH=1 MOLE_DELETE_LOG="$MOLE_DELETE_LOG" TERM=dumb \
+        /bin/bash --noprofile --norc "$RUNNER" --plan Fixture --permanent --json > "$1"
+}
+
+@test "uninstall --plan records delete_mode, trash by default and permanent with --permanent" {
+    make_fixture_app
+    make_plan "$SANDBOX/trash.json"
+    make_permanent_plan "$SANDBOX/permanent.json"
+
+    python3 - "$SANDBOX/trash.json" "$SANDBOX/permanent.json" << 'PY'
+import json, sys
+t = json.load(open(sys.argv[1]))["data"]
+p = json.load(open(sys.argv[2]))["data"]
+assert t["delete_mode"] == "trash", t["delete_mode"]
+assert p["delete_mode"] == "permanent", p["delete_mode"]
+PY
+}
+
+@test "uninstall --plan --permanent still deletes nothing" {
+    make_fixture_app
+    local before after
+    before=$(find "$HOME" -not -path "*/Library/Logs*" | LC_ALL=C sort)
+    make_permanent_plan "$SANDBOX/permanent.json"
+    after=$(find "$HOME" -not -path "*/Library/Logs*" | LC_ALL=C sort)
+    [ "$before" = "$after" ] || {
+        diff <(printf '%s\n' "$before") <(printf '%s\n' "$after")
+        return 1
+    }
+    [[ ! -d "$MOLE_TEST_TRASH_DIR" ]] || [[ -z "$(ls -A "$MOLE_TEST_TRASH_DIR")" ]]
+}
+
+@test "§7.7 plan_digest is unchanged by the delete mode" {
+    make_fixture_app
+    make_plan "$SANDBOX/trash.json"
+    make_permanent_plan "$SANDBOX/permanent.json"
+
+    # The digest is content identity; the mode is an interpretation of that
+    # content. Keeping them separate is what lets apply say "you planned for
+    # Trash and asked for permanent" instead of "this plan is stale".
+    python3 - "$SANDBOX/trash.json" "$SANDBOX/permanent.json" << 'PY'
+import json, sys
+t = json.load(open(sys.argv[1]))
+p = json.load(open(sys.argv[2]))
+assert t["data"]["plan_digest"] == p["data"]["plan_digest"], (
+    t["data"]["plan_digest"],
+    p["data"]["plan_digest"],
+)
+# Positive control: the two documents really are different documents.
+assert t["data"]["delete_mode"] != p["data"]["delete_mode"]
+PY
+}
+
+@test "§7.7 requires_sudo differs between the two modes for a foreign-owned path" {
+    make_fixture_app
+    # No fixture can create a root-owned file without sudo, and this test never
+    # uses sudo. Stub the ownership probe for one path instead: this is the
+    # branch of uninstall_path_requires_sudo that a Trash rename does not care
+    # about and a permanent removal does.
+    cat > "$SANDBOX/hook.sh" << 'HOOK'
+get_file_owner() {
+    case "$1" in
+        */com.example.fixture.plist) printf 'root\n' ;;
+        *) printf '%s\n' "$(whoami)" ;;
+    esac
+}
+HOOK
+    export MOLE_TEST_HOOK="$SANDBOX/hook.sh"
+    make_plan "$SANDBOX/trash.json"
+    make_permanent_plan "$SANDBOX/permanent.json"
+    unset MOLE_TEST_HOOK
+
+    python3 - "$SANDBOX/trash.json" "$SANDBOX/permanent.json" << 'PY'
+import json, sys
+t = json.load(open(sys.argv[1]))["data"]
+p = json.load(open(sys.argv[2]))["data"]
+tv = {e["path"]: e["requires_sudo"] for e in t["entries"]}
+pv = {e["path"]: e["requires_sudo"] for e in p["entries"]}
+differ = [path for path in tv if tv[path] != pv[path]]
+assert len(differ) == 1, (tv, pv)
+assert differ[0].endswith("com.example.fixture.plist"), differ
+assert tv[differ[0]] is False and pv[differ[0]] is True
+# §7.3's aggregation follows the entries, so the plan-level verdict flips too.
+assert t["requires_sudo"] is False and p["requires_sudo"] is True
+PY
+}
+
+@test "§7.7 apply refuses a trash plan under --permanent with exit 2 and deletes nothing" {
+    make_fixture_app
+    make_plan "$SANDBOX/plan.json"
+    add_selection "$SANDBOX/plan.json" "$SANDBOX/sel.json"
+
+    local before after
+    before=$(find "$HOME" -not -path "*/Library/Logs*" | LC_ALL=C sort)
+    run_mole_stdin "$SANDBOX/sel.json" --apply-plan --permanent --json
+    [ "$status" -eq 2 ] || {
+        echo "$output"
+        return 1
+    }
+    printf '%s\n' "$output" > "$SANDBOX/refusal.json"
+    python3 - "$SANDBOX/refusal.json" << 'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["scan_status"] == "failed", d
+assert d["error"]["code"] == "plan_mode_mismatch", d["error"]
+assert d["data"] is None, d
+PY
+    # Nothing was deleted: on disk, not merely in the exit code.
+    after=$(find "$HOME" -not -path "*/Library/Logs*" | LC_ALL=C sort)
+    [ "$before" = "$after" ] || {
+        diff <(printf '%s\n' "$before") <(printf '%s\n' "$after")
+        return 1
+    }
+    [[ ! -d "$MOLE_TEST_TRASH_DIR" ]] || [[ -z "$(ls -A "$MOLE_TEST_TRASH_DIR")" ]]
+}
+
+@test "§7.7 apply refuses a permanent plan run without --permanent, and never as plan_stale" {
+    make_fixture_app
+    make_permanent_plan "$SANDBOX/plan.json"
+    add_selection "$SANDBOX/plan.json" "$SANDBOX/sel.json"
+
+    run_mole_stdin "$SANDBOX/sel.json" --apply-plan --json
+    [ "$status" -eq 2 ] || {
+        echo "$output"
+        return 1
+    }
+    # The digest matches — this is a mode fault, and reporting it as a stale
+    # plan would send the GUI off to re-plan a plan that is perfectly current.
+    [[ "$output" == *'"plan_mode_mismatch"'* ]] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" != *"plan_stale"* ]]
+    [[ ! -d "$MOLE_TEST_TRASH_DIR" ]] || [[ -z "$(ls -A "$MOLE_TEST_TRASH_DIR")" ]]
+}
+
+@test "§7.7 apply refuses a plan that records no delete_mode at all" {
+    make_fixture_app
+    make_plan "$SANDBOX/plan.json"
+    add_selection "$SANDBOX/plan.json" "$SANDBOX/sel.json"
+    python3 - "$SANDBOX/sel.json" << 'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["data"].pop("delete_mode")
+json.dump(d, open(sys.argv[1], "w"))
+PY
+
+    run_mole_stdin "$SANDBOX/sel.json" --apply-plan --json
+    [ "$status" -eq 2 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *'"plan_mode_mismatch"'* ]] || {
+        echo "$output"
+        return 1
+    }
+    [[ ! -d "$MOLE_TEST_TRASH_DIR" ]] || [[ -z "$(ls -A "$MOLE_TEST_TRASH_DIR")" ]]
+}
+
+@test "§7.7 matching modes still apply: a permanent plan under --permanent removes" {
+    make_fixture_app
+    make_permanent_plan "$SANDBOX/plan.json"
+    add_selection "$SANDBOX/plan.json" "$SANDBOX/sel.json" \
+        "$HOME/Library/Caches/com.example.fixture"
+
+    run_mole_stdin "$SANDBOX/sel.json" --apply-plan --permanent --json
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *'"mode":"permanent"'* ]] || return 1
+    [[ "$output" == *'"outcome":"removed"'* ]] || return 1
+    [[ ! -e "$HOME/Library/Caches/com.example.fixture" ]] || return 1
+    [[ ! -d "$MOLE_TEST_TRASH_DIR" ]] || [ -z "$(ls -A "$MOLE_TEST_TRASH_DIR")" ]
+}

@@ -1,0 +1,35 @@
+{
+  "title": "CONTRACT.md §1.5 envelope",
+  "description": "Shared by clean, optimize and the three uninstall JSON payloads. Composed with the per-command half through allOf. `error` and `data` are C: `error` is non-null only when scan_status is \"failed\", and `data` is absent (or null) in exactly that case.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "mole_version",
+    "command",
+    "mode",
+    "generated_at",
+    "scan_status",
+    "warnings"
+  ],
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "mole_version": { "type": "string" },
+    "command": { "type": "string" },
+    "mode": { "type": "string", "enum": ["preview", "apply", "list", "plan"] },
+    "generated_at": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "scan_status": { "type": "string", "enum": ["complete", "partial", "failed"] },
+    "warnings": { "type": "array", "items": { "$ref": "warning.schema.json" } },
+    "error": {
+      "type": ["object", "null"],
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "type": "string", "pattern": "^[a-z0-9_]+$" },
+        "message": { "type": "string" }
+      }
+    },
+    "data": { "type": ["object", "null"] }
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "title": "one frame of mole status --watch (CONTRACT.md §3)",
+  "description": "§3.2: each frame is byte-for-byte the same schema as §2 -- verified there by comparing key sets. This file exists so a watch frame is guarded by name rather than by a reader remembering the equivalence, and it is a $ref rather than a copy so the two can never drift. Frame 0 is a deliberate fast partial frame (§3.3): its null collectors are legitimate, which is exactly why every array in §2 is C.",
+  "$ref": "status.schema.json"
+}

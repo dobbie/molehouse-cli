@@ -1,0 +1,56 @@
+{
+  "title": "mole uninstall --list --json (CONTRACT.md §6.4)",
+  "allOf": [
+    { "$ref": "envelope.schema.json" },
+    {
+      "type": "object",
+      "properties": {
+        "command": { "const": "uninstall" },
+        "mode": { "const": "list" },
+        "data": {
+          "type": "object",
+          "required": ["apps"],
+          "properties": {
+            "apps": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["name", "bundle_id", "source", "uninstall_name", "path", "size", "size_known"],
+                "properties": {
+                  "name": { "type": "string" },
+                  "bundle_id": {
+                    "type": "string",
+                    "description": "May be the literal \"unknown\" -- an open-ended sentinel, not a valid ID (§6.4)."
+                  },
+                  "source": { "type": "string" },
+                  "uninstall_name": { "type": "string" },
+                  "path": { "type": "string", "pattern": "^/" },
+                  "size": {
+                    "type": "string",
+                    "description": "DEPRECATED display string, kept until schema_version 2 (§6.5). Guaranteed present; Molehouse must never read it."
+                  },
+                  "size_bytes": { "type": ["integer", "null"], "minimum": 0 },
+                  "size_known": { "type": "boolean" },
+                  "version": { "type": ["string", "null"] },
+                  "last_used": {
+                    "type": ["string", "null"],
+                    "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+                  },
+                  "installed_at": {
+                    "type": ["string", "null"],
+                    "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+                  },
+                  "installed_at_source": {
+                    "type": ["string", "null"],
+                    "enum": ["pkg_receipt", "brew_receipt", "bundle_birthtime", "bundle_mtime", null],
+                    "description": "§6.6 requires this whenever installed_at is present."
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "entries": [
+    {
+      "is_dir": false,
+      "last_access": "2026-01-02T03:04:05Z",
+      "name": "big.bin",
+      "path": "{ROOT}/large/big.bin",
+      "size": 1638400
+    },
+    {
+      "is_dir": false,
+      "last_access": "2026-01-02T03:04:05Z",
+      "name": "small.txt",
+      "path": "{ROOT}/large/small.txt",
+      "size": 5
+    },
+    {
+      "is_dir": true,
+      "name": "sub",
+      "path": "{ROOT}/large/sub",
+      "size": 1
+    }
+  ],
+  "large_files": [
+    {
+      "name": "big.bin",
+      "path": "{ROOT}/large/big.bin",
+      "size": 1638400
+    }
+  ],
+  "overview": false,
+  "path": "{ROOT}/large",
+  "total_files": 3,
+  "total_size": 1638406
+}

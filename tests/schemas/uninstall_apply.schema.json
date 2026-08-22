@@ -1,0 +1,52 @@
+{
+  "title": "mole uninstall --apply-plan --json (CONTRACT.md §7.5)",
+  "allOf": [
+    { "$ref": "envelope.schema.json" },
+    {
+      "type": "object",
+      "properties": {
+        "command": { "const": "uninstall" },
+        "mode": { "const": "apply" },
+        "data": {
+          "type": "object",
+          "required": ["app", "plan_digest", "mode", "freed_bytes", "results"],
+          "properties": {
+            "app": {
+              "type": "object",
+              "required": ["name", "bundle_id", "path", "uninstall_name"],
+              "properties": {
+                "name": { "type": "string" },
+                "bundle_id": { "type": "string" },
+                "path": { "type": "string", "pattern": "^/" },
+                "uninstall_name": { "type": "string" },
+                "version": { "type": ["string", "null"] }
+              }
+            },
+            "plan_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "mode": { "type": "string", "enum": ["trash", "permanent"] },
+            "freed_bytes": { "type": "integer", "minimum": 0 },
+            "results": {
+              "type": "array",
+              "description": "One record for EVERY entry in the submitted plan, not only the selected ones (§7.5).",
+              "items": {
+                "type": "object",
+                "required": ["id", "path", "outcome"],
+                "properties": {
+                  "id": { "type": "string", "pattern": "^[0-9a-f]{16}$" },
+                  "path": { "type": "string", "pattern": "^/" },
+                  "outcome": {
+                    "type": "string",
+                    "enum": ["trashed", "removed", "not_selected", "missing", "refused_protected", "failed"],
+                    "description": "CLOSED enum (§7.5): extending it is a version bump."
+                  },
+                  "size_bytes": { "type": ["integer", "null"], "minimum": 0 },
+                  "message": { "type": ["string", "null"] }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

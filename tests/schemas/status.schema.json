@@ -1,0 +1,311 @@
+{
+  "title": "mole status --json (CONTRACT.md §2)",
+  "description": "Flat by design (§1.5): status keeps its existing shape and gains only schema_version, scan_status and warnings. Every array is C -- a Go nil slice marshals to null, and which collectors are nil depends on timing, not on the machine (§2.3). Objects stay open (additionalProperties defaults to true) because §1.7 lets a new field appear without a version bump; a renamed field is still caught, as the old name goes missing from `required`.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "scan_status",
+    "warnings",
+    "collected_at",
+    "host",
+    "platform",
+    "uptime",
+    "uptime_seconds",
+    "procs",
+    "hardware",
+    "health_score",
+    "health_score_msg",
+    "cpu",
+    "memory",
+    "trash_size",
+    "trash_approx",
+    "disk_io",
+    "network_history",
+    "proxy",
+    "thermal",
+    "process_watch"
+  ],
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "scan_status": { "type": "string", "enum": ["complete", "partial"] },
+    "warnings": { "type": "array", "items": { "$ref": "warning.schema.json" } },
+    "collected_at": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    },
+    "host": { "type": "string" },
+    "platform": { "type": "string" },
+    "uptime": { "type": "string" },
+    "uptime_seconds": { "type": "integer" },
+    "procs": { "type": "integer" },
+    "hardware": {
+      "type": "object",
+      "required": [
+        "model",
+        "cpu_model",
+        "total_ram",
+        "disk_size",
+        "os_version",
+        "refresh_rate"
+      ],
+      "properties": {
+        "model": { "type": "string" },
+        "cpu_model": { "type": "string" },
+        "total_ram": { "type": "string" },
+        "disk_size": { "type": "string" },
+        "os_version": { "type": "string" },
+        "refresh_rate": {
+          "type": "string",
+          "description": "Observed empty (§2.3): an empty string is a valid \"unknown\" here."
+        }
+      }
+    },
+    "health_score": { "type": "integer", "minimum": 0, "maximum": 100 },
+    "health_score_msg": { "type": "string" },
+    "cpu": {
+      "type": "object",
+      "required": [
+        "usage",
+        "per_core",
+        "per_core_estimated",
+        "load1",
+        "load5",
+        "load15",
+        "core_count",
+        "logical_cpu",
+        "p_core_count",
+        "e_core_count"
+      ],
+      "properties": {
+        "usage": { "type": "number" },
+        "per_core": { "type": "array", "items": { "type": "number" } },
+        "per_core_estimated": { "type": "boolean" },
+        "load1": { "type": "number" },
+        "load5": { "type": "number" },
+        "load15": { "type": "number" },
+        "core_count": { "type": "integer" },
+        "logical_cpu": { "type": "integer" },
+        "p_core_count": { "type": "integer" },
+        "e_core_count": { "type": "integer" }
+      }
+    },
+    "gpu": {
+      "type": ["array", "null"],
+      "items": {
+        "type": "object",
+        "required": ["name", "usage", "memory_used", "memory_total", "core_count", "note"],
+        "properties": {
+          "name": { "type": "string" },
+          "usage": {
+            "type": "number",
+            "description": "-1 is the sentinel for \"not available\" (§2.3), so no minimum here."
+          },
+          "memory_used": { "type": "number" },
+          "memory_total": { "type": "number" },
+          "core_count": { "type": "integer" },
+          "note": { "type": "string" }
+        }
+      }
+    },
+    "memory": {
+      "type": "object",
+      "required": [
+        "used",
+        "total",
+        "available",
+        "swap_used",
+        "swap_total",
+        "cached",
+        "used_percent",
+        "pressure"
+      ],
+      "properties": {
+        "used": { "type": "integer" },
+        "total": { "type": "integer" },
+        "available": { "type": "integer" },
+        "swap_used": { "type": "integer" },
+        "swap_total": { "type": "integer" },
+        "cached": { "type": "integer" },
+        "used_percent": { "type": "number" },
+        "pressure": { "type": "string" }
+      }
+    },
+    "disks": {
+      "type": ["array", "null"],
+      "items": {
+        "type": "object",
+        "required": [
+          "mount",
+          "device",
+          "fstype",
+          "smart_status",
+          "used",
+          "total",
+          "used_percent",
+          "external"
+        ],
+        "properties": {
+          "mount": { "type": "string" },
+          "device": { "type": "string" },
+          "fstype": { "type": "string" },
+          "smart_status": { "type": "string" },
+          "used": { "type": "integer" },
+          "total": { "type": "integer" },
+          "used_percent": { "type": "number" },
+          "external": { "type": "boolean" },
+          "purgeable": { "type": ["integer", "null"] }
+        }
+      }
+    },
+    "trash_size": { "type": "integer" },
+    "trash_approx": { "type": "boolean" },
+    "disk_io": {
+      "type": "object",
+      "description": "§2.3 marks the object G but documents no members, so §0's rule applies: an unmarked field is C until the contract is corrected. Typed here, not required.",
+      "properties": {
+        "read_rate": { "type": "number" },
+        "write_rate": { "type": "number" }
+      }
+    },
+    "network": {
+      "type": ["array", "null"],
+      "items": {
+        "type": "object",
+        "required": ["name", "ip", "rx_rate_mbs", "tx_rate_mbs"],
+        "properties": {
+          "name": { "type": "string" },
+          "ip": { "type": "string" },
+          "rx_rate_mbs": {
+            "type": "number",
+            "description": "MB/s, the one documented exception to §1.1: a rate, not a size."
+          },
+          "tx_rate_mbs": { "type": "number" }
+        }
+      }
+    },
+    "network_history": {
+      "type": "object",
+      "properties": {
+        "rx_history": { "type": ["array", "null"], "items": { "type": "number" } },
+        "tx_history": { "type": ["array", "null"], "items": { "type": "number" } }
+      }
+    },
+    "proxy": {
+      "type": "object",
+      "required": ["enabled", "type", "host"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "type": { "type": "string" },
+        "host": { "type": "string" }
+      }
+    },
+    "batteries": {
+      "type": ["array", "null"],
+      "items": {
+        "type": "object",
+        "required": ["percent", "status", "time_left", "health", "cycle_count", "capacity"],
+        "properties": {
+          "percent": { "type": "number" },
+          "status": { "type": "string" },
+          "time_left": { "type": "string" },
+          "health": { "type": "string" },
+          "cycle_count": { "type": "integer" },
+          "capacity": { "type": "integer" }
+        }
+      }
+    },
+    "thermal": {
+      "type": "object",
+      "required": [
+        "cpu_temp",
+        "gpu_temp",
+        "battery_temp",
+        "fan_speed",
+        "fan_count",
+        "system_power",
+        "adapter_power",
+        "battery_power"
+      ],
+      "properties": {
+        "cpu_temp": { "type": "number" },
+        "gpu_temp": { "type": "number" },
+        "battery_temp": { "type": "number" },
+        "fan_speed": { "type": "integer" },
+        "fan_count": { "type": "integer" },
+        "system_power": { "type": "number" },
+        "adapter_power": { "type": "number" },
+        "battery_power": { "type": "number" }
+      }
+    },
+    "sensors": {
+      "type": ["array", "null"],
+      "items": {
+        "type": "object",
+        "required": ["label", "unit", "note", "value"],
+        "properties": {
+          "label": { "type": "string" },
+          "unit": { "type": "string" },
+          "note": { "type": "string" },
+          "value": { "type": "number" }
+        }
+      }
+    },
+    "bluetooth": {
+      "type": ["array", "null"],
+      "items": {
+        "type": "object",
+        "required": ["name", "connected", "battery"],
+        "properties": {
+          "name": { "type": "string" },
+          "connected": { "type": "boolean" },
+          "battery": { "type": "string" }
+        }
+      }
+    },
+    "top_processes": {
+      "type": ["array", "null"],
+      "items": {
+        "type": "object",
+        "required": ["pid", "ppid", "name", "command", "cpu", "memory"],
+        "properties": {
+          "pid": { "type": "integer" },
+          "ppid": { "type": "integer" },
+          "name": { "type": "string" },
+          "command": { "type": "string" },
+          "cpu": { "type": "number" },
+          "memory": { "type": "number" },
+          "memory_bytes": { "type": ["integer", "null"] }
+        }
+      }
+    },
+    "process_watch": {
+      "type": "object",
+      "required": ["enabled", "cpu_threshold", "window"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "cpu_threshold": { "type": "number" },
+        "window": { "type": "string" }
+      }
+    },
+    "process_alerts": {
+      "type": ["array", "null"],
+      "items": {
+        "type": "object",
+        "required": ["pid", "name", "cpu", "threshold", "window", "triggered_at", "status"],
+        "properties": {
+          "pid": { "type": "integer" },
+          "name": { "type": "string" },
+          "command": { "type": ["string", "null"] },
+          "cpu": { "type": "number" },
+          "threshold": { "type": "number" },
+          "window": { "type": "string" },
+          "triggered_at": {
+            "type": "string",
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+          },
+          "status": { "type": "string" }
+        }
+      }
+    }
+  }
+}

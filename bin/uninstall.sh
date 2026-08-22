@@ -2079,6 +2079,18 @@ uninstall_plan_emit_warnings() {
     printf ']'
 }
 
+# CONTRACT.md §7.7: the delete mode this run assumes, normalised to the two
+# values the contract allows. `uninstall_path_requires_sudo` treats anything
+# that is not literally `trash` as permanent semantics, so this normalisation
+# is the same rule the predicate applies, not a second opinion about it.
+uninstall_plan_delete_mode() {
+    [[ "${MOLE_DELETE_MODE:-trash}" == "trash" ]] && {
+        printf 'trash\n'
+        return 0
+    }
+    printf 'permanent\n'
+}
+
 # §7.3 plan payload.
 uninstall_plan_emit_json() {
     local mole_version="$1"
@@ -2116,7 +2128,9 @@ uninstall_plan_emit_json() {
         printf ',"version":'
         history_json_string "$PLAN_APP_VERSION"
     fi
-    printf '},"plan_digest":'
+    printf '},"delete_mode":'
+    history_json_string "$(uninstall_plan_delete_mode)"
+    printf ',"plan_digest":'
     history_json_string "$digest"
     printf ',"total_bytes":%s,"total_items":%s,"unmeasured_items":%s,"requires_sudo":%s,"entries":[' \
         "$total_bytes" "$total_items" "$unmeasured_items" "$plan_requires_sudo"
@@ -2409,11 +2423,9 @@ uninstall_apply_emit_json() {
 uninstall_apply_command() {
     local mole_version
     mole_version=$(uninstall_list_mole_version)
-    local result_mode="permanent" success_outcome="removed"
-    if [[ "${MOLE_DELETE_MODE:-trash}" == "trash" ]]; then
-        result_mode="trash"
-        success_outcome="trashed"
-    fi
+    local result_mode success_outcome="removed"
+    result_mode=$(uninstall_plan_delete_mode)
+    [[ "$result_mode" != "trash" ]] || success_outcome="trashed"
 
     # --dry-run has no meaning here and is unsafe if accepted: mole_delete
     # returns success without deleting under MOLE_DRY_RUN, so every approved
@@ -2494,6 +2506,30 @@ uninstall_apply_command() {
             rm -rf "$work_dir" 2> /dev/null || true # SAFE: tracked scratch dir this function created
             return 2
         fi
+    fi
+
+    # §7.7: the plan records which delete-mode semantics its `requires_sudo`
+    # verdicts were computed under. A plan built for one mode and applied under
+    # the other is not interpretable, and the refusal must name that cause
+    # rather than fall through to a generic privilege error (F-041). Checked
+    # here, before re-discovery: nothing has been deleted at this point and
+    # nothing after this point can run.
+    #
+    # `delete_mode` is deliberately NOT part of `plan_digest` (§7.7), so a
+    # mismatch can never surface as `plan_stale`.
+    local submitted_mode
+    submitted_mode=$(uninstall_apply_scalar "$plan_file" "data.delete_mode") || submitted_mode=""
+    if [[ -z "$submitted_mode" ]]; then
+        uninstall_apply_refuse "$mole_version" "plan_mode_mismatch" \
+            "the plan does not record data.delete_mode; nothing was deleted"
+        rm -rf "$work_dir" 2> /dev/null || true # SAFE: tracked scratch dir this function created
+        return 2
+    fi
+    if [[ "$submitted_mode" != "$result_mode" ]]; then
+        uninstall_apply_refuse "$mole_version" "plan_mode_mismatch" \
+            "the plan was built for delete mode '$submitted_mode' but this run is '$result_mode'; nothing was deleted"
+        rm -rf "$work_dir" 2> /dev/null || true # SAFE: tracked scratch dir this function created
+        return 2
     fi
 
     local parse_rc=0

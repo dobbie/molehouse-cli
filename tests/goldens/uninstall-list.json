@@ -1,0 +1,39 @@
+{
+  "command": "uninstall",
+  "data": {
+    "apps": [
+      {
+        "bundle_id": "com.tinyspeck.slackmacgap",
+        "installed_at": "2023-07-22T04:26:40Z",
+        "installed_at_source": "bundle_mtime",
+        "last_used": "2023-11-14T22:13:20Z",
+        "name": "Slack",
+        "path": "/Applications/Slack.app",
+        "size": "180MB",
+        "size_bytes": 188743680,
+        "size_known": true,
+        "source": "App",
+        "uninstall_name": "Slack",
+        "version": "4.36.0"
+      },
+      {
+        "bundle_id": "com.example.broken",
+        "installed_at": "2023-07-22T04:26:40Z",
+        "installed_at_source": "bundle_mtime",
+        "name": "Broken",
+        "path": "/Applications/Broken.app",
+        "size": "--",
+        "size_known": false,
+        "source": "App",
+        "uninstall_name": "Broken"
+      }
+    ]
+  },
+  "error": null,
+  "generated_at": "{GENERATED_AT}",
+  "mode": "list",
+  "mole_version": "{MOLE_VERSION}",
+  "scan_status": "complete",
+  "schema_version": 1,
+  "warnings": []
+}

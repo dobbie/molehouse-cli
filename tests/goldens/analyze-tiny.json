@@ -1,0 +1,15 @@
+{
+  "entries": [
+    {
+      "is_dir": false,
+      "last_access": "2026-01-02T03:04:05Z",
+      "name": "a.txt",
+      "path": "{ROOT}/tiny/a.txt",
+      "size": 5
+    }
+  ],
+  "overview": false,
+  "path": "{ROOT}/tiny",
+  "total_files": 1,
+  "total_size": 5
+}

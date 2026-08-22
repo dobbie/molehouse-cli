@@ -1,0 +1,148 @@
+{
+  "command": "optimize",
+  "data": {
+    "counts": {
+      "applied": 0,
+      "attention": 0,
+      "failed": 0,
+      "skipped": 21,
+      "unavailable": 0,
+      "unchanged": 0
+    },
+    "tasks": [
+      {
+        "detail": "Skipped (whitelisted): DNS & Spotlight Check",
+        "id": "system_maintenance",
+        "label": "DNS & Spotlight Check",
+        "outcome": "skipped"
+      },
+      {
+        "detail": "Skipped (whitelisted): Finder Cache Refresh",
+        "id": "cache_refresh",
+        "label": "Finder Cache Refresh",
+        "outcome": "skipped"
+      },
+      {
+        "detail": "Skipped (whitelisted): App State Cleanup",
+        "id": "saved_state_cleanup",
+        "label": "App State Cleanup",
+        "outcome": "skipped"
+      },
+      {
+        "detail": "Skipped (whitelisted): Broken Config Repair",
+        "id": "fix_broken_configs",
+        "label": "Broken Config Repair",
+        "outcome": "skipped"
+      },
+      {
+        "detail": "Skipped (whitelisted): Network Cache Refresh",
+        "id": "network_optimization",
+        "label": "Network Cache Refresh",
+        "outcome": "skipped"
+      },
+      {
+        "detail": "Skipped (whitelisted): Database Optimization",
+        "id": "sqlite_vacuum",
+        "label": "Database Optimization",
+        "outcome": "skipped"
+      },
+      {
+        "detail": "Skipped (whitelisted): LaunchServices Repair",
+        "id": "launch_services_rebuild",
+        "label": "LaunchServices Repair",
+        "outcome": "skipped"
+      },
+      {
+        "detail": "Skipped (whitelisted): Prevent Finder .DS_Store",
+        "id": "prevent_network_dsstore",
+        "label": "Prevent Finder .DS_Store",
+        "outcome": "skipped"
+      },
+      {
+        "detail": "Skipped (whitelisted): Legacy Overrides",
+        "id": "legacy_overrides_audit",
+        "label": "Legacy Overrides",
+        "outcome": "skipped"
+      },
+      {
+        "detail": "Skipped (whitelisted): Network Stack Refresh",
+        "id": "network_stack_optimize",
+        "label": "Network Stack Refresh",
+        "outcome": "skipped"
+      },
+      {
+        "detail": "Skipped (whitelisted): Permission Repair",
+        "id": "disk_permissions_repair",
+        "label": "Permission Repair",
+        "outcome": "skipped"
+      },
+      {
+        "detail": "Skipped (whitelisted): Spotlight Optimization",
+        "id": "spotlight_index_optimize",
+        "label": "Spotlight Optimization",
+        "outcome": "skipped"
+      },
+      {
+        "detail": "Skipped (whitelisted): Spotlight Orphan Rules",
+        "id": "spotlight_orphan_rules_cleanup",
+        "label": "Spotlight Orphan Rules",
+        "outcome": "skipped"
+      },
+      {
+        "detail": "Skipped (whitelisted): Periodic Maintenance",
+        "id": "periodic_maintenance",
+        "label": "Periodic Maintenance",
+        "outcome": "skipped"
+      },
+      {
+        "detail": "Skipped (whitelisted): Shared File Lists",
+        "id": "shared_file_list_repair",
+        "label": "Shared File Lists",
+        "outcome": "skipped"
+      },
+      {
+        "detail": "Skipped (whitelisted): Disk Health",
+        "id": "disk_verify",
+        "label": "Disk Health",
+        "outcome": "skipped"
+      },
+      {
+        "detail": "Skipped (whitelisted): Login Items",
+        "id": "login_items_audit",
+        "label": "Login Items",
+        "outcome": "skipped"
+      },
+      {
+        "detail": "Skipped (whitelisted): Quarantine Database Cleanup",
+        "id": "quarantine_cleanup",
+        "label": "Quarantine Database Cleanup",
+        "outcome": "skipped"
+      },
+      {
+        "detail": "Skipped (whitelisted): Launch Agents Cleanup",
+        "id": "launch_agents_cleanup",
+        "label": "Launch Agents Cleanup",
+        "outcome": "skipped"
+      },
+      {
+        "detail": "Skipped (whitelisted): Notifications",
+        "id": "notification_cleanup",
+        "label": "Notifications",
+        "outcome": "skipped"
+      },
+      {
+        "detail": "Skipped (whitelisted): Usage Data",
+        "id": "coreduet_cleanup",
+        "label": "Usage Data",
+        "outcome": "skipped"
+      }
+    ]
+  },
+  "error": null,
+  "generated_at": "{GENERATED_AT}",
+  "mode": "preview",
+  "mole_version": "{MOLE_VERSION}",
+  "scan_status": "complete",
+  "schema_version": 1,
+  "warnings": []
+}

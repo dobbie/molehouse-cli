@@ -1,0 +1,11 @@
+{
+  "title": "warnings[] entry",
+  "description": "CONTRACT.md §1.4. `code` is the contract; `message` is display-only and Molehouse must never parse it. `scope` is C -- a warning about the whole run has none.",
+  "type": "object",
+  "required": ["code", "message"],
+  "properties": {
+    "code": { "type": "string", "pattern": "^[a-z0-9_]+$" },
+    "scope": { "type": ["string", "null"] },
+    "message": { "type": "string" }
+  }
+}

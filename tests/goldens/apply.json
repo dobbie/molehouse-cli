@@ -1,0 +1,46 @@
+{
+  "command": "uninstall",
+  "data": {
+    "app": {
+      "bundle_id": "com.example.fixture",
+      "name": "Fixture",
+      "path": "{ROOT}/Applications/Fixture.app",
+      "uninstall_name": "Fixture",
+      "version": "1.2.3"
+    },
+    "freed_bytes": 4101,
+    "mode": "trash",
+    "plan_digest": "{DIGEST}",
+    "results": [
+      {
+        "id": "0409e7ef830fe10f",
+        "outcome": "not_selected",
+        "path": "{ROOT}/Applications/Fixture.app"
+      },
+      {
+        "id": "e91fcde45d36aa72",
+        "outcome": "not_selected",
+        "path": "{ROOT}/Library/Application Support/Fixture"
+      },
+      {
+        "id": "84dcd20850da82f1",
+        "outcome": "trashed",
+        "path": "{ROOT}/Library/Caches/com.example.fixture",
+        "size_bytes": 4096
+      },
+      {
+        "id": "3b05dffa77e08edf",
+        "outcome": "trashed",
+        "path": "{ROOT}/Library/Preferences/com.example.fixture.plist",
+        "size_bytes": 5
+      }
+    ]
+  },
+  "error": null,
+  "generated_at": "{GENERATED_AT}",
+  "mode": "apply",
+  "mole_version": "{MOLE_VERSION}",
+  "scan_status": "complete",
+  "schema_version": 1,
+  "warnings": []
+}

@@ -1,0 +1,87 @@
+{
+  "title": "mole clean --dry-run --json (CONTRACT.md §5.4)",
+  "allOf": [
+    { "$ref": "envelope.schema.json" },
+    {
+      "type": "object",
+      "properties": {
+        "command": { "const": "clean" },
+        "mode": { "const": "preview" },
+        "data": {
+          "type": "object",
+          "required": [
+            "total_bytes",
+            "total_items",
+            "category_count",
+            "unmeasured_items",
+            "sudo_available",
+            "categories",
+            "deferred"
+          ],
+          "properties": {
+            "total_bytes": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Sums size_known entries only; a lower bound when unmeasured_items > 0."
+            },
+            "total_items": { "type": "integer", "minimum": 0 },
+            "category_count": { "type": "integer", "minimum": 0 },
+            "unmeasured_items": { "type": "integer", "minimum": 0 },
+            "sudo_available": { "type": "boolean" },
+            "categories": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["id", "label", "total_bytes", "item_count", "status", "entries"],
+                "properties": {
+                  "id": { "type": "string", "pattern": "^[a-z0-9_]+$" },
+                  "label": { "type": "string" },
+                  "total_bytes": { "type": "integer", "minimum": 0 },
+                  "item_count": { "type": "integer", "minimum": 0 },
+                  "status": {
+                    "type": "string",
+                    "enum": ["scanned", "nothing_to_clean", "skipped", "failed"]
+                  },
+                  "entries": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": ["path", "label", "size_known", "requires_sudo"],
+                      "properties": {
+                        "path": { "type": "string", "pattern": "^/" },
+                        "label": { "type": "string" },
+                        "size_bytes": {
+                          "type": ["integer", "null"],
+                          "minimum": 0,
+                          "description": "C: absent or null when size_known is false (§1.1). Never a display string, never 0 standing in for unknown."
+                        },
+                        "size_known": { "type": "boolean" },
+                        "item_count": { "type": ["integer", "null"], "minimum": 0 },
+                        "requires_sudo": { "type": "boolean" }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "deferred": {
+              "type": "array",
+              "description": "Work clean deliberately does not do. Never counted toward the total.",
+              "items": {
+                "type": "object",
+                "required": ["id", "label", "suggested_command"],
+                "properties": {
+                  "id": { "type": "string", "pattern": "^[a-z0-9_]+$" },
+                  "label": { "type": "string" },
+                  "size_bytes": { "type": ["integer", "null"], "minimum": 0 },
+                  "item_count": { "type": ["integer", "null"], "minimum": 0 },
+                  "suggested_command": { "type": "string" }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,71 @@
+{
+  "command": "uninstall",
+  "data": {
+    "app": {
+      "bundle_id": "com.example.fixture",
+      "name": "Fixture",
+      "path": "{ROOT}/Applications/Fixture.app",
+      "uninstall_name": "Fixture",
+      "version": "1.2.3"
+    },
+    "delete_mode": "permanent",
+    "entries": [
+      {
+        "category": "bundle",
+        "id": "0409e7ef830fe10f",
+        "is_dir": true,
+        "label": "Application bundle",
+        "path": "{ROOT}/Applications/Fixture.app",
+        "protected": false,
+        "requires_sudo": false,
+        "size_bytes": 4096,
+        "size_known": true
+      },
+      {
+        "category": "application_support",
+        "id": "e91fcde45d36aa72",
+        "is_dir": true,
+        "label": "Application Support",
+        "path": "{ROOT}/Library/Application Support/Fixture",
+        "protected": false,
+        "requires_sudo": false,
+        "size_bytes": 4096,
+        "size_known": true
+      },
+      {
+        "category": "caches",
+        "id": "84dcd20850da82f1",
+        "is_dir": true,
+        "label": "Caches",
+        "path": "{ROOT}/Library/Caches/com.example.fixture",
+        "protected": false,
+        "requires_sudo": false,
+        "size_bytes": 4096,
+        "size_known": true
+      },
+      {
+        "category": "preferences",
+        "id": "3b05dffa77e08edf",
+        "is_dir": false,
+        "label": "Preferences",
+        "path": "{ROOT}/Library/Preferences/com.example.fixture.plist",
+        "protected": false,
+        "requires_sudo": false,
+        "size_bytes": 5,
+        "size_known": true
+      }
+    ],
+    "plan_digest": "{DIGEST}",
+    "requires_sudo": false,
+    "total_bytes": 12293,
+    "total_items": 4,
+    "unmeasured_items": 0
+  },
+  "error": null,
+  "generated_at": "{GENERATED_AT}",
+  "mode": "plan",
+  "mole_version": "{MOLE_VERSION}",
+  "scan_status": "complete",
+  "schema_version": 1,
+  "warnings": []
+}

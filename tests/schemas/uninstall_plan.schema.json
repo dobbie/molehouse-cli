@@ -1,0 +1,79 @@
+{
+  "title": "mole uninstall --plan --json (CONTRACT.md §7.3)",
+  "allOf": [
+    { "$ref": "envelope.schema.json" },
+    {
+      "type": "object",
+      "properties": {
+        "command": { "const": "uninstall" },
+        "mode": { "const": "plan" },
+        "data": {
+          "type": "object",
+          "required": [
+            "app",
+            "delete_mode",
+            "plan_digest",
+            "total_bytes",
+            "total_items",
+            "unmeasured_items",
+            "requires_sudo",
+            "entries"
+          ],
+          "properties": {
+            "app": {
+              "type": "object",
+              "required": ["name", "bundle_id", "path", "uninstall_name"],
+              "properties": {
+                "name": { "type": "string" },
+                "bundle_id": { "type": "string" },
+                "path": { "type": "string", "pattern": "^/" },
+                "uninstall_name": { "type": "string" },
+                "version": { "type": ["string", "null"] }
+              }
+            },
+            "delete_mode": {
+              "type": "string",
+              "enum": ["trash", "permanent"],
+              "description": "§7.7: which semantics every requires_sudo verdict in this plan assumes. G, always present, and deliberately NOT part of plan_digest."
+            },
+            "plan_digest": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$",
+              "description": "§7.2 canonical sha256, lowercase hex."
+            },
+            "total_bytes": { "type": "integer", "minimum": 0 },
+            "total_items": { "type": "integer", "minimum": 0 },
+            "unmeasured_items": { "type": "integer", "minimum": 0 },
+            "requires_sudo": { "type": "boolean" },
+            "entries": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["id", "path", "label", "category", "size_known", "is_dir", "requires_sudo", "protected"],
+                "properties": {
+                  "id": { "type": "string", "pattern": "^[0-9a-f]{16}$" },
+                  "path": { "type": "string", "pattern": "^/" },
+                  "label": { "type": "string" },
+                  "category": {
+                    "type": "string",
+                    "description": "Open-ended enum (§7.3): a new subtree may appear without a version bump, so the value is not pinned to the documented ten."
+                  },
+                  "size_bytes": { "type": ["integer", "null"], "minimum": 0 },
+                  "size_known": { "type": "boolean" },
+                  "is_dir": { "type": "boolean" },
+                  "requires_sudo": { "type": "boolean" },
+                  "protected": { "type": "boolean" }
+                }
+              }
+            },
+            "selected": {
+              "type": "array",
+              "description": "§7.4: added by the caller before --apply-plan reads the document back. Absent from a freshly emitted plan.",
+              "items": { "type": "string", "pattern": "^[0-9a-f]{16}$" }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

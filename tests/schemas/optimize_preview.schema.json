@@ -1,0 +1,53 @@
+{
+  "title": "mole optimize --dry-run --json (CONTRACT.md §8.5)",
+  "description": "Preview and apply share one data shape; `mode` separates them. In preview, counts.applied means \"would apply\".",
+  "allOf": [
+    { "$ref": "envelope.schema.json" },
+    {
+      "type": "object",
+      "properties": {
+        "command": { "const": "optimize" },
+        "mode": { "enum": ["preview", "apply"] },
+        "data": {
+          "type": "object",
+          "required": ["counts", "tasks"],
+          "properties": {
+            "counts": {
+              "type": "object",
+              "description": "Every key always present, 0 when none (§8.5) -- so the UI never has to tell \"none\" from \"not reported\".",
+              "required": ["applied", "unchanged", "skipped", "unavailable", "attention", "failed"],
+              "properties": {
+                "applied": { "type": "integer", "minimum": 0 },
+                "unchanged": { "type": "integer", "minimum": 0 },
+                "skipped": { "type": "integer", "minimum": 0 },
+                "unavailable": { "type": "integer", "minimum": 0 },
+                "attention": { "type": "integer", "minimum": 0 },
+                "failed": { "type": "integer", "minimum": 0 }
+              }
+            },
+            "tasks": {
+              "type": "array",
+              "minItems": 1,
+              "description": "One record per catalog task, in catalog order.",
+              "items": {
+                "type": "object",
+                "required": ["id", "label", "outcome"],
+                "properties": {
+                  "id": { "type": "string", "pattern": "^[a-z0-9_]+$" },
+                  "label": { "type": "string" },
+                  "outcome": {
+                    "type": "string",
+                    "enum": ["applied", "unchanged", "skipped", "unavailable", "attention", "failed"]
+                  },
+                  "detail": { "type": ["string", "null"] },
+                  "freed_bytes": { "type": ["integer", "null"], "minimum": 0 },
+                  "duration_ms": { "type": ["integer", "null"], "minimum": 0 }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}
