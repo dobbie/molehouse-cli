@@ -519,7 +519,10 @@ PY
 
 @test "uninstall --apply-plan --permanent removes instead of trashing" {
     make_fixture_app
-    make_plan "$SANDBOX/plan.json"
+    # The plan is built under permanent semantics too: since §7.7 a plan
+    # records the mode its verdicts assume, and applying a trash plan with
+    # --permanent is refused as plan_mode_mismatch rather than executed.
+    make_permanent_plan "$SANDBOX/plan.json"
     add_selection "$SANDBOX/plan.json" "$SANDBOX/sel.json" \
         "$HOME/Library/Caches/com.example.fixture"
 
@@ -1070,21 +1073,4 @@ PY
         return 1
     }
     [[ ! -d "$MOLE_TEST_TRASH_DIR" ]] || [[ -z "$(ls -A "$MOLE_TEST_TRASH_DIR")" ]]
-}
-
-@test "§7.7 matching modes still apply: a permanent plan under --permanent removes" {
-    make_fixture_app
-    make_permanent_plan "$SANDBOX/plan.json"
-    add_selection "$SANDBOX/plan.json" "$SANDBOX/sel.json" \
-        "$HOME/Library/Caches/com.example.fixture"
-
-    run_mole_stdin "$SANDBOX/sel.json" --apply-plan --permanent --json
-    [ "$status" -eq 0 ] || {
-        echo "$output"
-        return 1
-    }
-    [[ "$output" == *'"mode":"permanent"'* ]] || return 1
-    [[ "$output" == *'"outcome":"removed"'* ]] || return 1
-    [[ ! -e "$HOME/Library/Caches/com.example.fixture" ]] || return 1
-    [[ ! -d "$MOLE_TEST_TRASH_DIR" ]] || [ -z "$(ls -A "$MOLE_TEST_TRASH_DIR")" ]
 }
