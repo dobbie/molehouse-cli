@@ -1281,8 +1281,9 @@ load_applications() {
     # and lib/uninstall/batch.sh destructures it positionally, and widening it
     # would silently corrupt their trailing field via read's overflow-into-
     # last-var behavior. The 3 new fields go into the parallel apps_meta_data
-    # array instead, index-aligned with apps_data, read only by
-    # uninstall_list_apps.
+    # array instead, index-aligned with apps_data. Readers: uninstall_list_apps
+    # (CONTRACT.md §6) and uninstall_plan_resolve_app (§7.3's app.version).
+    # Widening apps_meta_data means checking both.
     while IFS='|' read -r epoch app_path app_name bundle_id size last_used size_kb real_used_epoch app_mtime version; do
         [[ ! -e "$app_path" ]] && continue
 
@@ -1719,6 +1720,972 @@ uninstall_list_apps() {
     return 0
 }
 
+# ===========================================================================
+# CONTRACT.md §7 — `uninstall --plan` / `uninstall --apply-plan`
+#
+# Non-interactive per-file uninstall preview, and the apply half that reads
+# that preview back and deletes only what the caller approved.
+#
+# The one invariant everything below exists to protect: the set of paths the
+# user approved is the set of paths that get deleted. `--apply-plan` re-runs
+# discovery, recomputes `plan_digest` over the CURRENT discovery, and refuses
+# the whole operation (exit 4) when it disagrees with the submitted plan. It
+# never searches for what to delete: it deletes the submitted plan's own path
+# strings, filtered by `selected`, each re-validated at the deletion boundary.
+# That is what makes "12 approved, 40 deleted" structurally impossible rather
+# than merely unlikely.
+#
+# Records move between the stages one entry per line, fields separated by US
+# (0x1f):
+#   plan record       path US size_bytes US size_known US is_dir US protected
+#                     US requires_sudo US category
+#   submitted record  id US path US size_bytes US size_known US protected
+#
+# A path containing a control character can never appear in a record.
+# `validate_path_for_deletion` refuses control characters outright, so such a
+# path is not deletable in the first place, and `find_app_files` returns a
+# newline-separated list that could not carry one intact anyway. Plan build
+# drops those paths with a `path_unrepresentable` warning rather than
+# silently mis-splitting a record.
+# ===========================================================================
+
+# `sha256(path)` truncated to 16 hex chars (§7.3). shasum -a 256 is already a
+# dependency of lib/clean/user.sh and bin/installer.sh — no new one here.
+uninstall_plan_entry_id() {
+    printf '%s' "$1" | shasum -a 256 | cut -c1-16
+}
+
+# §7.3 `category`, from the path string alone. Kept pure and table-shaped so
+# M1-T6 can fixture it against a table of inputs. Group Containers is tested
+# before Containers on purpose: the two subtrees are siblings and the narrower
+# label has to win.
+uninstall_plan_classify_category() {
+    local path="$1"
+    local app_path="${2:-}"
+
+    if [[ -n "$app_path" && "$path" == "$app_path" ]]; then
+        printf 'bundle'
+        return 0
+    fi
+
+    case "$path" in
+        */Group\ Containers/*) printf 'group_containers' ;;
+        */Containers/*) printf 'containers' ;;
+        */Caches/*) printf 'caches' ;;
+        */Preferences/*) printf 'preferences' ;;
+        */Application\ Support/*) printf 'application_support' ;;
+        */Saved\ Application\ State/*) printf 'saved_state' ;;
+        */LaunchAgents/* | */LaunchDaemons/*) printf 'launch_agents' ;;
+        */Logs/*) printf 'logs' ;;
+        *) printf 'other' ;;
+    esac
+}
+
+# §7.3 `label` — display text, derived from the category so the two can never
+# describe different things.
+uninstall_plan_category_label() {
+    case "$1" in
+        bundle) printf 'Application bundle' ;;
+        caches) printf 'Caches' ;;
+        preferences) printf 'Preferences' ;;
+        application_support) printf 'Application Support' ;;
+        containers) printf 'Container' ;;
+        group_containers) printf 'Group Container' ;;
+        launch_agents) printf 'Launch Agent' ;;
+        logs) printf 'Logs' ;;
+        saved_state) printf 'Saved Application State' ;;
+        *) printf 'Other' ;;
+    esac
+}
+
+# Measure a path in bytes, or fail (return 1) when it cannot be measured.
+#
+# §1.1 / F-022: "0 bytes" and "could not measure" must never share a
+# representation, so the failure is reported through the exit status and the
+# caller emits `size_known: false` with no `size_bytes` key at all.
+#
+# Deliberately NOT get_path_size_kb: that helper prefers `mdls` for .app
+# bundles and returns a bare "0" both for an empty path and for a failed
+# probe, which collapses exactly the two facts §1.1 separates. These numbers
+# are digest inputs, so they must be reproducible from the filesystem alone
+# between the plan call and the apply call; an mdls probe that answers on one
+# run and times out into the du fallback on the next would present as a stale
+# plan when nothing on disk had changed. Every external command here is
+# bounded (.claude/skills/bugs archetype 4).
+uninstall_plan_measure_bytes() {
+    local path="$1"
+    local raw="" rc=0
+
+    if [[ -L "$path" || -f "$path" ]]; then
+        raw=$(run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" \
+            "$STAT_BSD" -f%z "$path" 2> /dev/null) || rc=$?
+        [[ $rc -eq 0 && "$raw" =~ ^[0-9]+$ ]] || return 1
+        printf '%s' "$raw"
+        return 0
+    fi
+
+    if [[ -d "$path" ]]; then
+        raw=$(run_with_timeout "$MOLE_TIMEOUT_DISK_VERIFY_SEC" \
+            du -skP "$path" 2> /dev/null | awk 'NR==1 {print $1; exit}') || rc=$?
+        [[ $rc -eq 0 && "$raw" =~ ^[0-9]+$ ]] || return 1
+        printf '%s' "$((raw * 1024))"
+        return 0
+    fi
+
+    return 1
+}
+
+# §7.2's canonical serialisation, hashed:
+#
+#   bundle_id NUL app_path NUL
+#   then, for every entry sorted by path under LC_ALL=C:
+#       path NUL size_bytes NUL size_known NUL
+#
+# size_bytes is the decimal byte count, or the empty string when size_known is
+# false. size_known is the literal `true` or `false`. §7.2 does not spell
+# either of those out; both are pinned here and reported in
+# docs/handoff-M1-T5.md's answer so Molehouse implements the same bytes.
+#
+# $3 is a plan-record file already in canonical (LC_ALL=C sorted) order, which
+# is why reordering the same entries cannot change the digest.
+uninstall_plan_digest() {
+    local bundle_id="$1"
+    local app_path="$2"
+    local records_file="$3"
+
+    {
+        printf '%s\0%s\0' "$bundle_id" "$app_path"
+        local line path size_bytes size_known
+        while IFS= read -r line; do
+            [[ -n "$line" ]] || continue
+            IFS=$'\x1f' read -r path size_bytes size_known _ <<< "$line"
+            printf '%s\0%s\0%s\0' "$path" "$size_bytes" "$size_known"
+        done < "$records_file"
+    } | shasum -a 256 | awk '{print $1; exit}'
+}
+
+# Build the canonical plan-record file for one app.
+#
+# Args: bundle_id app_name app_path out_records_file out_warnings_file
+# Returns 0 when discovery completed, 1 when it did not (the caller decides
+# whether that is a `partial` plan or a refused apply), or the timeout /
+# interrupt status when discovery was cancelled.
+#
+# The app bundle itself is an entry: find_app_files never discovers it (the
+# caller supplies app_path separately), and a plan that omitted it would
+# preview an uninstall that leaves the application behind.
+uninstall_plan_build_records() {
+    local bundle_id="$1"
+    local app_name="$2"
+    local app_path="$3"
+    local out_file="$4"
+    local warn_file="$5"
+    local us=$'\x1f'
+
+    : > "$out_file"
+
+    local discovered="" discovery_rc=0
+    discovered=$(find_app_files "$bundle_id" "$app_name" "$app_path" 2> /dev/null) || discovery_rc=$?
+    if [[ $discovery_rc -eq 124 || $discovery_rc -ge 128 ]]; then
+        return "$discovery_rc"
+    fi
+
+    local raw_file unsorted_file
+    raw_file=$(create_temp_file) || return 1
+    unsorted_file=$(create_temp_file) || return 1
+
+    {
+        printf '%s\n' "$app_path"
+        [[ -z "$discovered" ]] || printf '%s\n' "$discovered"
+    } | awk 'NF && !seen[$0]++' > "$raw_file"
+
+    local path size_bytes size_known is_dir protected requires_sudo category
+    while IFS= read -r path; do
+        [[ -n "$path" ]] || continue
+        [[ -e "$path" || -L "$path" ]] || continue
+
+        if [[ "$path" =~ [[:cntrl:]] ]]; then
+            printf 'path_unrepresentable\n' >> "$warn_file"
+            continue
+        fi
+
+        size_known="false"
+        if size_bytes=$(uninstall_plan_measure_bytes "$path"); then
+            size_known="true"
+        else
+            size_bytes=""
+        fi
+
+        is_dir="false"
+        [[ -d "$path" && ! -L "$path" ]] && is_dir="true"
+
+        # §7.3: `protected` has to be known at PLAN time so the UI can render
+        # the row disabled and unselectable rather than discovering the
+        # refusal as a failure at apply time. Validation runs again per entry
+        # at the deletion boundary regardless (§7.2) — this is a preview of
+        # that verdict, never a substitute for it.
+        protected="false"
+        if [[ "${MO_DEBUG:-0}" == "1" ]]; then
+            validate_path_for_deletion "$path" || protected="true"
+        else
+            validate_path_for_deletion "$path" 2> /dev/null || protected="true"
+        fi
+
+        requires_sudo="false"
+        uninstall_path_requires_sudo "$path" && requires_sudo="true"
+
+        category=$(uninstall_plan_classify_category "$path" "$app_path")
+
+        printf '%s%s%s%s%s%s%s%s%s%s%s%s%s\n' \
+            "$path" "$us" "$size_bytes" "$us" "$size_known" "$us" \
+            "$is_dir" "$us" "$protected" "$us" "$requires_sudo" "$us" \
+            "$category" >> "$unsorted_file"
+    done < "$raw_file"
+
+    LC_ALL=C sort "$unsorted_file" > "$out_file"
+    rm -f "$raw_file" "$unsorted_file" 2> /dev/null || true # SAFE: exact tracked temp files created above
+
+    [[ $discovery_rc -eq 0 ]] || return 1
+    return 0
+}
+
+# True when any record carries size_known == false, so the caller can mark the
+# plan `partial` (§1.4: a total that excludes unmeasured entries is a lower
+# bound and must say so).
+uninstall_plan_has_unmeasured() {
+    local records_file="$1"
+    local line size_known
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        IFS=$'\x1f' read -r _ _ size_known _ <<< "$line"
+        [[ "$size_known" == "true" ]] || return 0
+    done < "$records_file"
+    return 1
+}
+
+# Exactly-one lookup for `--plan <uninstall_name>` (§7.2 step 1).
+#
+# Deliberately NOT match_apps_by_name: that matcher is case-insensitive
+# substring matching across several words and can return more than one app,
+# which is right for an interactive picker and wrong for a scriptable command
+# whose whole contract is "this one app". `uninstall_name` is the exact token
+# `--list` already reports (§6.4), so an exact string comparison is the
+# correct lookup, and zero-or-many is a usage error rather than a best guess.
+#
+# Sets PLAN_APP_NAME / PLAN_APP_PATH / PLAN_APP_BUNDLE_ID /
+# PLAN_APP_UNINSTALL_NAME / PLAN_APP_VERSION on success.
+# Returns 0 on exactly one match, 2 on none, 3 on more than one.
+uninstall_plan_resolve_app() {
+    local wanted="$1"
+    local total=${#apps_data[@]}
+    local i match_count=0 match_index=-1
+
+    for ((i = 0; i < total; i++)); do
+        local app_path app_name
+        IFS='|' read -r _ app_path app_name _ _ _ _ <<< "${apps_data[$i]}"
+        local cask=""
+        if is_homebrew_available; then
+            cask=$(get_brew_cask_name "$app_path" 2> /dev/null || true)
+        fi
+        if [[ "${cask:-$app_name}" == "$wanted" ]]; then
+            match_count=$((match_count + 1))
+            match_index=$i
+        fi
+    done
+
+    [[ $match_count -eq 0 ]] && return 2
+    [[ $match_count -gt 1 ]] && return 3
+
+    local app_path app_name bundle_id
+    IFS='|' read -r _ app_path app_name bundle_id _ _ _ <<< "${apps_data[$match_index]}"
+    local cask=""
+    if is_homebrew_available; then
+        cask=$(get_brew_cask_name "$app_path" 2> /dev/null || true)
+    fi
+    local version=""
+    IFS='|' read -r _ _ version <<< "${apps_meta_data[$match_index]:-||}"
+
+    PLAN_APP_NAME="$app_name"
+    PLAN_APP_PATH="$app_path"
+    PLAN_APP_BUNDLE_ID="$bundle_id"
+    PLAN_APP_UNINSTALL_NAME="${cask:-$app_name}"
+    PLAN_APP_VERSION="$version"
+    return 0
+}
+
+# §1.5 envelope header for the plan/apply modes. The sibling
+# uninstall_list_envelope_open is pinned to `mode: "list"`; this one takes the
+# mode because plan and apply share it.
+uninstall_plan_envelope_open() {
+    local mole_version="$1"
+    local mode="$2"
+    local scan_status="$3"
+    local generated_at
+    generated_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    printf '{"schema_version":1,"mole_version":'
+    history_json_string "$mole_version"
+    printf ',"command":"uninstall","mode":'
+    history_json_string "$mode"
+    printf ',"generated_at":'
+    history_json_string "$generated_at"
+    printf ',"scan_status":'
+    history_json_string "$scan_status"
+}
+
+# §1.4 `failed` envelope: data absent, error present. The exit code is the
+# caller's job (§1.6).
+uninstall_plan_emit_failed() {
+    local mole_version="$1"
+    local mode="$2"
+    local code="$3"
+    local message="$4"
+    uninstall_plan_envelope_open "$mole_version" "$mode" "failed"
+    printf ',"warnings":[],"error":{"code":'
+    history_json_string "$code"
+    printf ',"message":'
+    history_json_string "$message"
+    printf '},"data":null}\n'
+}
+
+# Render the warnings array from the codes collected during the run. Codes are
+# deduplicated: one `size_unmeasured` warning describes the run, not each
+# entry — the per-entry fact is already in that entry's `size_known`.
+uninstall_plan_emit_warnings() {
+    local warn_file="$1"
+    printf '['
+    local first=1 code message
+    while IFS= read -r code; do
+        [[ -n "$code" ]] || continue
+        case "$code" in
+            size_unmeasured)
+                message="One or more paths could not be measured; total_bytes is a lower bound."
+                ;;
+            discovery_incomplete)
+                message="Leftover discovery did not complete; the plan may be missing entries."
+                ;;
+            path_unrepresentable)
+                message="A discovered path contains control characters and was excluded; it cannot be deleted."
+                ;;
+            *) message="$code" ;;
+        esac
+        [[ "$first" == "1" ]] || printf ','
+        first=0
+        printf '{"code":'
+        history_json_string "$code"
+        printf ',"message":'
+        history_json_string "$message"
+        printf '}'
+    done < <(LC_ALL=C sort -u "$warn_file")
+    printf ']'
+}
+
+# §7.3 plan payload.
+uninstall_plan_emit_json() {
+    local mole_version="$1"
+    local records_file="$2"
+    local warn_file="$3"
+    local digest="$4"
+    local scan_status="$5"
+
+    local total_items=0 unmeasured_items=0 total_bytes=0 plan_requires_sudo="false"
+    local line path size_bytes size_known is_dir protected requires_sudo category
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        IFS=$'\x1f' read -r path size_bytes size_known is_dir protected requires_sudo category <<< "$line"
+        total_items=$((total_items + 1))
+        if [[ "$size_known" == "true" ]]; then
+            total_bytes=$((total_bytes + size_bytes))
+        else
+            unmeasured_items=$((unmeasured_items + 1))
+        fi
+        [[ "$requires_sudo" == "true" ]] && plan_requires_sudo="true"
+    done < "$records_file"
+
+    uninstall_plan_envelope_open "$mole_version" "plan" "$scan_status"
+    printf ',"warnings":'
+    uninstall_plan_emit_warnings "$warn_file"
+    printf ',"error":null,"data":{"app":{"name":'
+    history_json_string "$PLAN_APP_NAME"
+    printf ',"bundle_id":'
+    history_json_string "$PLAN_APP_BUNDLE_ID"
+    printf ',"path":'
+    history_json_string "$PLAN_APP_PATH"
+    printf ',"uninstall_name":'
+    history_json_string "$PLAN_APP_UNINSTALL_NAME"
+    if [[ -n "$PLAN_APP_VERSION" ]]; then
+        printf ',"version":'
+        history_json_string "$PLAN_APP_VERSION"
+    fi
+    printf '},"plan_digest":'
+    history_json_string "$digest"
+    printf ',"total_bytes":%s,"total_items":%s,"unmeasured_items":%s,"requires_sudo":%s,"entries":[' \
+        "$total_bytes" "$total_items" "$unmeasured_items" "$plan_requires_sudo"
+
+    local first=1 entry_id label
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        IFS=$'\x1f' read -r path size_bytes size_known is_dir protected requires_sudo category <<< "$line"
+
+        entry_id=$(uninstall_plan_entry_id "$path")
+        label=$(uninstall_plan_category_label "$category")
+
+        [[ "$first" == "1" ]] || printf ','
+        first=0
+
+        printf '{"id":'
+        history_json_string "$entry_id"
+        printf ',"path":'
+        history_json_string "$path"
+        printf ',"label":'
+        history_json_string "$label"
+        printf ',"category":'
+        history_json_string "$category"
+        printf ',"size_known":%s' "$size_known"
+        [[ "$size_known" == "true" ]] && printf ',"size_bytes":%s' "$size_bytes"
+        printf ',"is_dir":%s,"requires_sudo":%s,"protected":%s}' \
+            "$is_dir" "$requires_sudo" "$protected"
+    done < "$records_file"
+
+    printf ']}}\n'
+}
+
+# `mole uninstall --plan <uninstall_name> [--json]`
+#
+# Read-only: deletes nothing, prompts for nothing, needs no privilege. JSON is
+# the only output format. §7 defines no text rendering for a plan, and
+# inventing one would create a second, unspecified representation of the most
+# destructive screen in the product; `--json` is accepted and documented so
+# callers can be explicit, as §6.1 requires of `--list`.
+uninstall_plan_command() {
+    local wanted="$1"
+    local mole_version
+    mole_version=$(uninstall_list_mole_version)
+
+    local apps_file=""
+    if ! apps_file=$(scan_applications); then
+        uninstall_plan_emit_failed "$mole_version" "plan" "scan_failed" \
+            "could not complete the application scan"
+        return 1
+    fi
+    if [[ ! -f "$apps_file" ]]; then
+        uninstall_plan_emit_failed "$mole_version" "plan" "scan_failed" \
+            "application scan produced no list"
+        return 1
+    fi
+    if ! load_applications "$apps_file"; then
+        rm -f "$apps_file"
+        # A completed scan that found nothing cannot match an exact name. That
+        # is the same usage error as any other miss (§1.6 exit 2: nothing ran,
+        # stdout empty), not a failed scan.
+        echo "No application named '$wanted' is installed." >&2
+        return 2
+    fi
+    rm -f "$apps_file"
+
+    local resolve_rc=0
+    uninstall_plan_resolve_app "$wanted" || resolve_rc=$?
+    case "$resolve_rc" in
+        0) ;;
+        2)
+            echo "No application named '$wanted' is installed." >&2
+            echo "Run 'mo uninstall --list' for the exact names --plan accepts." >&2
+            return 2
+            ;;
+        *)
+            echo "More than one application matches '$wanted'; --plan needs exactly one." >&2
+            echo "Run 'mo uninstall --list' for the exact names --plan accepts." >&2
+            return 2
+            ;;
+    esac
+
+    local records_file warn_file
+    records_file=$(create_temp_file) || return 1
+    warn_file=$(create_temp_file) || return 1
+    : > "$warn_file"
+
+    local build_rc=0
+    uninstall_plan_build_records "$PLAN_APP_BUNDLE_ID" "$PLAN_APP_NAME" \
+        "$PLAN_APP_PATH" "$records_file" "$warn_file" || build_rc=$?
+    if [[ $build_rc -eq 124 || $build_rc -ge 128 ]]; then
+        rm -f "$records_file" "$warn_file" 2> /dev/null || true # SAFE: exact tracked temp files created above
+        return "$build_rc"
+    fi
+    [[ $build_rc -eq 0 ]] || printf 'discovery_incomplete\n' >> "$warn_file"
+
+    uninstall_plan_has_unmeasured "$records_file" && printf 'size_unmeasured\n' >> "$warn_file"
+
+    local scan_status="complete"
+    [[ -s "$warn_file" ]] && scan_status="partial"
+
+    local digest
+    digest=$(uninstall_plan_digest "$PLAN_APP_BUNDLE_ID" "$PLAN_APP_PATH" "$records_file")
+
+    uninstall_plan_emit_json "$mole_version" "$records_file" "$warn_file" \
+        "$digest" "$scan_status"
+
+    rm -f "$records_file" "$warn_file" 2> /dev/null || true # SAFE: exact tracked temp files created above
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Apply
+# ---------------------------------------------------------------------------
+
+# Turn one `plutil -extract ... xml1` array of dicts into US-separated records.
+#
+# There is no JSON parser in this repo and none in a stock macOS shell, but
+# plutil reads JSON natively and its xml1 rendering puts one tag on one line,
+# which an awk pass can read without guessing. One plutil fork for the whole
+# array, not one per field: a 400-entry plan through per-key extraction would
+# be thousands of forks (.claude/skills/bugs archetype 4 — "the bound is on
+# the right command but the slow stage is the consumer").
+#
+# $1 is the comma-separated list of dict keys to emit, in order. A `<string>`
+# value that does not close on its own line means the value contains a
+# newline; awk exits 3 and the caller refuses the plan rather than acting on a
+# record it cannot trust.
+uninstall_apply_xml_records() {
+    local keys="$1"
+    awk -v keys="$keys" '
+        function unesc(s) {
+            gsub(/&lt;/, "<", s)
+            gsub(/&gt;/, ">", s)
+            gsub(/&quot;/, "\"", s)
+            gsub(/&apos;/, "'"'"'", s)
+            gsub(/&amp;/, "\\&", s)
+            return s
+        }
+        function flush(  i, out) {
+            out = ""
+            for (i = 1; i <= nkeys; i++) {
+                if (i > 1) out = out US
+                out = out val[keyname[i]]
+            }
+            print out
+        }
+        BEGIN {
+            US = sprintf("%c", 31)
+            nkeys = split(keys, keyname, ",")
+        }
+        /<dict>/ {
+            for (i = 1; i <= nkeys; i++) val[keyname[i]] = ""
+            indict = 1
+            curkey = ""
+            next
+        }
+        /<\/dict>/ {
+            if (indict) { flush(); indict = 0 }
+            next
+        }
+        {
+            line = $0
+            if (match(line, /<key>[^<]*<\/key>/)) {
+                curkey = substr(line, RSTART + 5, RLENGTH - 11)
+                next
+            }
+            if (line ~ /<string>/) {
+                if (line !~ /<\/string>[[:space:]]*$/) { exit 3 }
+                sub(/^[[:space:]]*<string>/, "", line)
+                sub(/<\/string>[[:space:]]*$/, "", line)
+                val[curkey] = unesc(line)
+                next
+            }
+            if (line ~ /<true\/>/) { val[curkey] = "true"; next }
+            if (line ~ /<false\/>/) { val[curkey] = "false"; next }
+            if (match(line, /<integer>[^<]*<\/integer>/)) {
+                val[curkey] = substr(line, RSTART + 9, RLENGTH - 19)
+                next
+            }
+        }
+    '
+}
+
+# `selected` is a flat array of strings rather than of dicts, so it gets its
+# own small reader. Same one-fork, fail-closed rules.
+uninstall_apply_xml_strings() {
+    awk '
+        function unesc(s) {
+            gsub(/&lt;/, "<", s)
+            gsub(/&gt;/, ">", s)
+            gsub(/&quot;/, "\"", s)
+            gsub(/&apos;/, "'"'"'", s)
+            gsub(/&amp;/, "\\&", s)
+            return s
+        }
+        /<string>/ {
+            if ($0 !~ /<\/string>[[:space:]]*$/) { exit 3 }
+            line = $0
+            sub(/^[[:space:]]*<string>/, "", line)
+            sub(/<\/string>[[:space:]]*$/, "", line)
+            print unesc(line)
+        }
+    '
+}
+
+# Read one scalar out of the submitted plan. A missing key returns nonzero.
+uninstall_apply_scalar() {
+    plutil -extract "$2" raw -o - "$1" 2> /dev/null
+}
+
+# Refuse the whole operation, on stdout as a §1.4 `failed` envelope. Every
+# apply refusal happens before any deletion, so "nothing was deleted" is a
+# statement of fact about the code path, not a hope.
+uninstall_apply_refuse() {
+    local mole_version="$1"
+    local code="$2"
+    local message="$3"
+    uninstall_plan_emit_failed "$mole_version" "apply" "$code" "$message"
+}
+
+# §7.5 apply payload.
+uninstall_apply_emit_json() {
+    local mole_version="$1"
+    local results_file="$2"
+    local digest="$3"
+    local result_mode="$4"
+    local freed_bytes="$5"
+    local scan_status="$6"
+    local warn_file="$7"
+
+    uninstall_plan_envelope_open "$mole_version" "apply" "$scan_status"
+    printf ',"warnings":'
+    uninstall_plan_emit_warnings "$warn_file"
+    printf ',"error":null,"data":{"app":{"name":'
+    history_json_string "$PLAN_APP_NAME"
+    printf ',"bundle_id":'
+    history_json_string "$PLAN_APP_BUNDLE_ID"
+    printf ',"path":'
+    history_json_string "$PLAN_APP_PATH"
+    printf ',"uninstall_name":'
+    history_json_string "$PLAN_APP_UNINSTALL_NAME"
+    if [[ -n "$PLAN_APP_VERSION" ]]; then
+        printf ',"version":'
+        history_json_string "$PLAN_APP_VERSION"
+    fi
+    printf '},"plan_digest":'
+    history_json_string "$digest"
+    printf ',"mode":'
+    history_json_string "$result_mode"
+    printf ',"freed_bytes":%s,"results":[' "$freed_bytes"
+
+    local first=1 line rid rpath outcome rsize rmessage
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        IFS=$'\x1f' read -r rid rpath outcome rsize rmessage <<< "$line"
+        [[ "$first" == "1" ]] || printf ','
+        first=0
+        printf '{"id":'
+        history_json_string "$rid"
+        printf ',"path":'
+        history_json_string "$rpath"
+        printf ',"outcome":'
+        history_json_string "$outcome"
+        if [[ "$rsize" =~ ^[0-9]+$ ]]; then
+            printf ',"size_bytes":%s' "$rsize"
+        fi
+        if [[ -n "$rmessage" ]]; then
+            printf ',"message":'
+            history_json_string "$rmessage"
+        fi
+        printf '}'
+    done < "$results_file"
+
+    printf ']}}\n'
+}
+
+# `mole uninstall --apply-plan [--json] [--permanent] < plan-with-selection.json`
+#
+# §7.4/§7.5. Reads the whole plan document back on stdin, verifies it against
+# fresh discovery, then deletes only the approved entries and reports one
+# record for every entry the plan contained.
+#
+# This does NOT call remove_file_list. That helper returns a bare count and
+# silently `continue`s past a path that fails validation or has disappeared,
+# which cannot produce §7.5's per-entry `results` — the evidence that the
+# approved set is the executed set. The loop below keeps per-id bookkeeping
+# around the same audited sink (`mole_delete`, which owns validation, Trash
+# routing, the forensic log and the dry-run gate) rather than reimplementing
+# deletion.
+uninstall_apply_command() {
+    local mole_version
+    mole_version=$(uninstall_list_mole_version)
+    local result_mode="permanent" success_outcome="removed"
+    if [[ "${MOLE_DELETE_MODE:-trash}" == "trash" ]]; then
+        result_mode="trash"
+        success_outcome="trashed"
+    fi
+
+    # --dry-run has no meaning here and is unsafe if accepted: mole_delete
+    # returns success without deleting under MOLE_DRY_RUN, so every approved
+    # entry would report `trashed` while still sitting on disk. `--plan` is
+    # the dry run for this command.
+    if [[ "${MOLE_DRY_RUN:-0}" == "1" ]]; then
+        echo "uninstall --apply-plan does not accept --dry-run; use --plan for a preview." >&2
+        return 2
+    fi
+
+    # One tracked scratch directory for the whole run, so every refusal path
+    # below tears down with a single statement and none of them can leak a
+    # file by forgetting one name.
+    local work_dir
+    work_dir=$(create_temp_dir) || return 1
+    local plan_file="$work_dir/plan.json"
+    local submitted_file="$work_dir/submitted"
+    local selected_file="$work_dir/selected"
+    local current_file="$work_dir/current"
+    local warn_file="$work_dir/warnings"
+    local submitted_paths="$work_dir/submitted-paths"
+    local current_paths="$work_dir/current-paths"
+    local normalized_file="$work_dir/normalized"
+    local results_file="$work_dir/results"
+    : > "$warn_file"
+
+    cat > "$plan_file"
+
+    # `plutil -lint` is plist-only and rejects a JSON document outright, so the
+    # validity gate is a no-output round trip through the JSON converter
+    # instead. Verified against both a real plan and a malformed one.
+    if ! plutil -convert json -o /dev/null "$plan_file" > /dev/null 2>&1; then
+        echo "uninstall --apply-plan: stdin is not a valid JSON plan document." >&2
+        rm -rf "$work_dir" 2> /dev/null || true # SAFE: tracked scratch dir this function created
+        return 2
+    fi
+
+    local submitted_digest app_name app_path app_bundle_id app_uninstall_name app_version
+    submitted_digest=$(uninstall_apply_scalar "$plan_file" "data.plan_digest") || submitted_digest=""
+    app_name=$(uninstall_apply_scalar "$plan_file" "data.app.name") || app_name=""
+    app_path=$(uninstall_apply_scalar "$plan_file" "data.app.path") || app_path=""
+    app_bundle_id=$(uninstall_apply_scalar "$plan_file" "data.app.bundle_id") || app_bundle_id=""
+    app_uninstall_name=$(uninstall_apply_scalar "$plan_file" "data.app.uninstall_name") || app_uninstall_name=""
+    app_version=$(uninstall_apply_scalar "$plan_file" "data.app.version") || app_version=""
+
+    if [[ -z "$submitted_digest" || -z "$app_path" || -z "$app_name" ]]; then
+        echo "uninstall --apply-plan: the plan is missing data.plan_digest or data.app." >&2
+        rm -rf "$work_dir" 2> /dev/null || true # SAFE: tracked scratch dir this function created
+        return 2
+    fi
+
+    # The submitted app identity is an INPUT to re-discovery, so it cannot be
+    # taken on trust: a plan naming an arbitrary directory as `app.path` would
+    # otherwise make that directory an entry of the recomputed plan. Pin it to
+    # a real application bundle before anything else runs.
+    if [[ "$app_path" != *.app || ! -d "$app_path" ]]; then
+        echo "uninstall --apply-plan: data.app.path is not an installed application bundle." >&2
+        rm -rf "$work_dir" 2> /dev/null || true # SAFE: tracked scratch dir this function created
+        return 2
+    fi
+    if [[ -n "$app_bundle_id" && "$app_bundle_id" != "unknown" ]]; then
+        local on_disk_bundle_id=""
+        on_disk_bundle_id=$(plutil -extract CFBundleIdentifier raw \
+            "$app_path/Contents/Info.plist" 2> /dev/null || echo "")
+        if [[ -n "$on_disk_bundle_id" && "$on_disk_bundle_id" != "$app_bundle_id" ]]; then
+            echo "uninstall --apply-plan: data.app.bundle_id does not match the bundle at data.app.path." >&2
+            rm -rf "$work_dir" 2> /dev/null || true # SAFE: tracked scratch dir this function created
+            return 2
+        fi
+    fi
+
+    local parse_rc=0
+    plutil -extract data.entries xml1 -o - "$plan_file" 2> /dev/null |
+        uninstall_apply_xml_records "id,path,size_bytes,size_known,protected" \
+            > "$submitted_file" || parse_rc=$?
+    if [[ $parse_rc -ne 0 ]]; then
+        echo "uninstall --apply-plan: data.entries could not be read." >&2
+        rm -rf "$work_dir" 2> /dev/null || true # SAFE: tracked scratch dir this function created
+        return 2
+    fi
+
+    # `selected` is required (§7.4). An absent key is a caller defect, not an
+    # empty selection: refuse rather than silently apply nothing.
+    if ! plutil -extract data.selected xml1 -o - "$plan_file" > /dev/null 2>&1; then
+        echo "uninstall --apply-plan: the plan has no data.selected array." >&2
+        rm -rf "$work_dir" 2> /dev/null || true # SAFE: tracked scratch dir this function created
+        return 2
+    fi
+    parse_rc=0
+    plutil -extract data.selected xml1 -o - "$plan_file" 2> /dev/null |
+        uninstall_apply_xml_strings > "$selected_file" || parse_rc=$?
+    if [[ $parse_rc -ne 0 ]]; then
+        echo "uninstall --apply-plan: data.selected could not be read." >&2
+        rm -rf "$work_dir" 2> /dev/null || true # SAFE: tracked scratch dir this function created
+        return 2
+    fi
+
+    PLAN_APP_NAME="$app_name"
+    PLAN_APP_PATH="$app_path"
+    PLAN_APP_BUNDLE_ID="$app_bundle_id"
+    PLAN_APP_UNINSTALL_NAME="${app_uninstall_name:-$app_name}"
+    PLAN_APP_VERSION="$app_version"
+
+    # §7.2 steps 1 and 2: re-run discovery and recompute the digest over the
+    # CURRENT discovery. Never over the submitted entries — hashing what the
+    # caller sent would only verify the caller against itself.
+    local build_rc=0
+    uninstall_plan_build_records "$app_bundle_id" "$app_name" "$app_path" \
+        "$current_file" "$warn_file" || build_rc=$?
+    if [[ $build_rc -eq 124 || $build_rc -ge 128 ]]; then
+        rm -rf "$work_dir" 2> /dev/null || true # SAFE: tracked scratch dir this function created
+        return "$build_rc"
+    fi
+    if [[ $build_rc -ne 0 ]]; then
+        # A truncated re-discovery cannot verify anything. Refuse before any
+        # deletion rather than compare a digest against a partial scan.
+        uninstall_apply_refuse "$mole_version" "scan_failed" \
+            "leftover discovery did not complete; nothing was deleted"
+        rm -rf "$work_dir" 2> /dev/null || true # SAFE: tracked scratch dir this function created
+        return 1
+    fi
+
+    local current_digest
+    current_digest=$(uninstall_plan_digest "$app_bundle_id" "$app_path" "$current_file")
+
+    if [[ "$current_digest" != "$submitted_digest" ]]; then
+        uninstall_apply_refuse "$mole_version" "plan_stale" \
+            "the submitted plan no longer matches what is on disk; nothing was deleted"
+        rm -rf "$work_dir" 2> /dev/null || true # SAFE: tracked scratch dir this function created
+        return 4
+    fi
+
+    # The digest already proves set equality of (path, size_bytes,
+    # size_known). Assert the path lists literally too: it costs one cmp, and
+    # it turns a digest collision or a builder defect into a refusal instead
+    # of a deletion nobody previewed.
+    local rec sid spath ssize sknown sprot rid
+    while IFS= read -r rec; do
+        [[ -n "$rec" ]] || continue
+        IFS=$'\x1f' read -r sid spath ssize sknown sprot <<< "$rec"
+        printf '%s\n' "$spath"
+    done < "$submitted_file" | LC_ALL=C sort > "$submitted_paths"
+    while IFS= read -r rec; do
+        [[ -n "$rec" ]] || continue
+        IFS=$'\x1f' read -r spath _ <<< "$rec"
+        printf '%s\n' "$spath"
+    done < "$current_file" | LC_ALL=C sort > "$current_paths"
+    if ! cmp -s "$submitted_paths" "$current_paths"; then
+        uninstall_apply_refuse "$mole_version" "plan_stale" \
+            "the submitted plan's paths do not match discovery; nothing was deleted"
+        rm -rf "$work_dir" 2> /dev/null || true # SAFE: tracked scratch dir this function created
+        return 4
+    fi
+
+    # Normalise the submitted entries, recomputing every id from its own path.
+    # The submitted id is display data, never authority: an entry whose id was
+    # tampered with simply stops matching anything in `selected`, and the
+    # selection check below then refuses the run.
+    #
+    # `protected` is the union of the submitted flag and the CURRENT verdict.
+    # Re-validation at apply time is what makes the deletion safe (§7.2), and
+    # a plan can only ever under-report a refusal.
+    local protected_index="|" submitted_index="|" selected_index="|"
+    local cur_prot_index="|" cpath cprot
+    while IFS= read -r rec; do
+        [[ -n "$rec" ]] || continue
+        IFS=$'\x1f' read -r cpath _ _ _ cprot _ <<< "$rec"
+        [[ "$cprot" == "true" ]] || continue
+        cur_prot_index+="$(uninstall_plan_entry_id "$cpath")|"
+    done < "$current_file"
+
+    : > "$normalized_file"
+    while IFS= read -r rec; do
+        [[ -n "$rec" ]] || continue
+        IFS=$'\x1f' read -r sid spath ssize sknown sprot <<< "$rec"
+        rid=$(uninstall_plan_entry_id "$spath")
+        submitted_index+="$rid|"
+        if [[ "$sprot" == "true" || "$cur_prot_index" == *"|$rid|"* ]]; then
+            protected_index+="$rid|"
+        fi
+        printf '%s\x1f%s\n' "$rid" "$spath" >> "$normalized_file"
+    done < "$submitted_file"
+
+    # §7.4: an id that is not in `entries`, or one whose entry is protected,
+    # refuses the WHOLE operation before anything is deleted. Not a partial
+    # skip — a caller that asked for something impossible has a defect, and
+    # applying the rest of its list would hide it.
+    local sel
+    while IFS= read -r sel; do
+        [[ -n "$sel" ]] || continue
+        if [[ "$submitted_index" != *"|$sel|"* ]]; then
+            uninstall_apply_refuse "$mole_version" "unknown_selection_id" \
+                "a selected id is not present in the plan's entries; nothing was deleted"
+            rm -rf "$work_dir" 2> /dev/null || true # SAFE: tracked scratch dir this function created
+            return 2
+        fi
+        if [[ "$protected_index" == *"|$sel|"* ]]; then
+            uninstall_apply_refuse "$mole_version" "protected_selection" \
+                "a selected entry is protected and cannot be removed; nothing was deleted"
+            rm -rf "$work_dir" 2> /dev/null || true # SAFE: tracked scratch dir this function created
+            return 2
+        fi
+        selected_index+="$sel|"
+    done < "$selected_file"
+
+    # Deletion. One record per submitted entry, in the plan's own order,
+    # including the entries the caller did not select — §7.5 is explicit that
+    # a bare count cannot distinguish 12 approved from 40 deleted.
+    : > "$results_file"
+    local freed_bytes=0 interrupted=0 any_failed=0 actual_bytes delete_rc
+    while IFS= read -r rec; do
+        [[ -n "$rec" ]] || continue
+        IFS=$'\x1f' read -r rid spath <<< "$rec"
+
+        if [[ $interrupted -eq 1 ]]; then
+            printf '%s\x1f%s\x1ffailed\x1f\x1fnot attempted: the run was interrupted\n' \
+                "$rid" "$spath" >> "$results_file"
+            continue
+        fi
+
+        if [[ "$selected_index" != *"|$rid|"* ]]; then
+            printf '%s\x1f%s\x1fnot_selected\x1f\x1f\n' "$rid" "$spath" >> "$results_file"
+            continue
+        fi
+
+        if [[ ! -e "$spath" && ! -L "$spath" ]]; then
+            printf '%s\x1f%s\x1fmissing\x1f\x1f\n' "$rid" "$spath" >> "$results_file"
+            continue
+        fi
+
+        # Third and final validation of this path (plan build, selection
+        # gate, here). mole_delete validates again internally; this call is
+        # what lets the result say `refused_protected` instead of `failed`.
+        if ! validate_path_for_deletion "$spath" 2> /dev/null; then
+            printf '%s\x1f%s\x1frefused_protected\x1f\x1fthe path failed validation at the deletion boundary\n' \
+                "$rid" "$spath" >> "$results_file"
+            continue
+        fi
+
+        actual_bytes=$(uninstall_plan_measure_bytes "$spath") || actual_bytes=""
+
+        delete_rc=0
+        mole_delete "$spath" "false" || delete_rc=$?
+
+        if [[ $delete_rc -eq 124 || $delete_rc -ge 128 ]]; then
+            interrupted=1
+            printf '%s\x1f%s\x1ffailed\x1f\x1finterrupted before this entry was removed\n' \
+                "$rid" "$spath" >> "$results_file"
+            continue
+        fi
+        if [[ $delete_rc -ne 0 ]]; then
+            any_failed=1
+            printf '%s\x1f%s\x1ffailed\x1f\x1fremoval failed (status %s)\n' \
+                "$rid" "$spath" "$delete_rc" >> "$results_file"
+            continue
+        fi
+
+        [[ "$actual_bytes" =~ ^[0-9]+$ ]] && freed_bytes=$((freed_bytes + actual_bytes))
+        printf '%s\x1f%s\x1f%s\x1f%s\x1f\n' "$rid" "$spath" "$success_outcome" "$actual_bytes" >> "$results_file"
+    done < "$normalized_file"
+
+    local scan_status="complete"
+    [[ $any_failed -eq 1 || $interrupted -eq 1 ]] && scan_status="partial"
+
+    uninstall_apply_emit_json "$mole_version" "$results_file" "$submitted_digest" \
+        "$result_mode" "$freed_bytes" "$scan_status" "$warn_file"
+
+    rm -rf "$work_dir" 2> /dev/null || true # SAFE: tracked scratch dir this function created
+    [[ $interrupted -eq 1 ]] && return 130
+    return 0
+}
+
 main() {
     # Set current command for operation logging
     export MOLE_CURRENT_COMMAND="uninstall"
@@ -1732,7 +2699,21 @@ main() {
     local -a app_name_args=()
     local list_mode=0
     local list_json=0
+    # CONTRACT.md §7. --plan takes the app's uninstall_name as its NEXT
+    # argument rather than a combined --plan=NAME form: an app name can
+    # contain '=' and every other flag in this parser is a bare word, so the
+    # separate-argument form is the one that stays unambiguous against the
+    # positional app-name arguments below.
+    local plan_mode=0
+    local plan_target=""
+    local expect_plan_target=0
+    local apply_plan_mode=0
     for arg in "$@"; do
+        if [[ $expect_plan_target -eq 1 ]]; then
+            plan_target="$arg"
+            expect_plan_target=0
+            continue
+        fi
         case "$arg" in
             "--help" | "-h")
                 show_uninstall_help
@@ -1753,6 +2734,13 @@ main() {
             "--json")
                 list_json=1
                 ;;
+            "--plan")
+                plan_mode=1
+                expect_plan_target=1
+                ;;
+            "--apply-plan")
+                apply_plan_mode=1
+                ;;
             "--whitelist")
                 echo "Unknown uninstall option: $arg"
                 echo "Whitelist management is currently supported by: mo clean --whitelist / mo optimize --whitelist"
@@ -1769,6 +2757,31 @@ main() {
                 ;;
         esac
     done
+
+    if [[ $expect_plan_target -eq 1 ]]; then
+        echo "uninstall --plan needs an uninstall name; see 'mo uninstall --list'." >&2
+        return 2
+    fi
+    if [[ $plan_mode -eq 1 && $apply_plan_mode -eq 1 ]]; then
+        echo "uninstall: --plan and --apply-plan are separate steps; pass one." >&2
+        return 2
+    fi
+    if [[ ($plan_mode -eq 1 || $apply_plan_mode -eq 1) && ${#app_name_args[@]} -gt 0 ]]; then
+        echo "uninstall: --plan/--apply-plan do not take positional app names." >&2
+        return 2
+    fi
+
+    # --plan / --apply-plan short-circuit before the interactive scan loop, the
+    # same way --list does: both are non-interactive by contract (§7.2) and
+    # must never reach a prompt. --plan additionally never deletes anything.
+    if [[ $plan_mode -eq 1 ]]; then
+        uninstall_plan_command "$plan_target"
+        return $?
+    fi
+    if [[ $apply_plan_mode -eq 1 ]]; then
+        uninstall_apply_command
+        return $?
+    fi
 
     # --list short-circuits before any destructive code. Read-only path:
     # scan, resolve uninstall names, print table or JSON, exit 0.

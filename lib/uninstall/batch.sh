@@ -554,6 +554,36 @@ remove_login_item() {
     fi
 }
 
+# Does removing this path need elevated privilege?
+#
+# A Trash rename is authorized by the source and destination parents, not by
+# the object's owner: do not elevate solely because a package-installed app is
+# root-owned when its parent is user-writable, because file_ops can retry a
+# TCC-blocked rename through unprivileged Finder. Permanent removal still
+# treats foreign ownership as requiring sudo.
+#
+# One definition, two readers: batch_uninstall_applications decides whether to
+# authorize before removing an app bundle, and uninstall_plan_* (CONTRACT.md
+# §7.3 `requires_sudo`) reports the same verdict to Molehouse at plan time.
+# Two copies of this predicate would let the preview promise a sudo-free
+# removal the real run then escalates (.claude/skills/bugs archetype 9).
+uninstall_path_requires_sudo() {
+    local path="$1"
+    local delete_mode="${MOLE_DELETE_MODE:-permanent}"
+    local parent
+    parent=$(dirname "$path")
+    if [[ ! -w "$parent" ]]; then
+        return 0
+    fi
+    [[ "$delete_mode" == "trash" ]] && return 1
+    local owner current_user
+    owner=$(get_file_owner "$path")
+    current_user=$(whoami)
+    [[ "$owner" == "root" ]] && return 0
+    [[ -n "$owner" && "$owner" != "$current_user" ]] && return 0
+    return 1
+}
+
 # Remove files (handles symlinks, optional sudo).
 # Security: All paths pass validate_path_for_deletion() before any deletion.
 # Performance: when MOLE_DELETE_MODE=trash and the batch is sudo-free and
@@ -1317,9 +1347,6 @@ _batch_scan_app_details() {
     # All selected-app discovery shares one wall-clock budget. Individual
     # producer probes clamp themselves to this deadline.
     local _MOLE_UNINSTALL_DISCOVERY_DEADLINE=$((SECONDS + (2 * MOLE_TIMEOUT_DISK_VERIFY_SEC)))
-    # Cache current user outside loop
-    local current_user=$(whoami)
-
     if [[ -t 1 ]]; then start_inline_spinner "Scanning files..."; fi
     # shellcheck disable=SC2154 # selected_apps is provided by batch_uninstall_applications via dynamic scope.
     for selected_app in "${selected_apps[@]}"; do
@@ -1500,18 +1527,11 @@ _batch_scan_app_details() {
             brew_cask_apps+=("$app_name")
         fi
 
-        # A Trash rename is authorized by the source and destination parents,
-        # not by the app bundle's owner. Do not elevate solely because a
-        # package-installed app is root-owned when its parent is user-writable;
-        # file_ops can retry a TCC-blocked rename through unprivileged Finder.
-        # Permanent removal still treats foreign ownership as requiring sudo.
+        # Ownership/writability rule lives in uninstall_path_requires_sudo so
+        # the plan preview (CONTRACT.md §7.3) and this real removal cannot
+        # drift apart.
         local needs_sudo=false
-        local app_owner=$(get_file_owner "$app_path")
-        local delete_mode="${MOLE_DELETE_MODE:-permanent}"
-        if [[ ! -w "$(dirname "$app_path")" ]] ||
-            { [[ "$delete_mode" != "trash" ]] &&
-                { [[ "$app_owner" == "root" ]] ||
-                    [[ -n "$app_owner" && "$app_owner" != "$current_user" ]]; }; }; then
+        if uninstall_path_requires_sudo "$app_path"; then
             needs_sudo=true
         fi
 
