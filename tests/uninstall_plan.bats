@@ -7,6 +7,11 @@
 # tests/uninstall_remove_file_list.bats does. No test here may reach a real
 # installed application, a real Trash, or a real Library.
 
+# `run --separate-stderr` needs bats 1.5+. Several assertions here are about
+# stdout being EMPTY (§1.6 exit 2), which the default merged capture cannot
+# express.
+bats_require_minimum_version 1.5.0
+
 setup_file() {
     PROJECT_ROOT="$(cd "${BATS_TEST_DIRNAME}/.." && pwd)"
     export PROJECT_ROOT
@@ -831,4 +836,37 @@ PY
     [[ -e "$HOME/Library/Caches/com.example.fixture" ]] || return 1
     [[ -e "$HOME/Library/Preferences/com.example.fixture.plist" ]] || return 1
     [[ -e "$HOME/Applications/Fixture.app" ]]
+}
+
+@test "uninstall --apply-plan's stdin-tty guard sits ahead of the blocking read" {
+    # A pty-based behavioural test was tried first and rejected: under bats
+    # 1.5+ semantics stdin is a socket, `script` cannot allocate a terminal,
+    # and the case fails for reasons that have nothing to do with the guard.
+    # A source invariant is the honest form here, per .claude/skills/bugs
+    # ("turn the fix into a source invariant") — it fails if the guard is
+    # removed or moved after the read that would otherwise block forever.
+    local guard_line cat_line
+    guard_line=$(grep -n 'if \[\[ -t 0 \]\]; then' "$PROJECT_ROOT/bin/uninstall.sh" | head -1 | cut -d: -f1)
+    # shellcheck disable=SC2016 # matching the literal source text, not expanding it
+    cat_line=$(grep -n 'cat > "$plan_file"' "$PROJECT_ROOT/bin/uninstall.sh" | head -1 | cut -d: -f1)
+    [ -n "$guard_line" ] || {
+        echo "no stdin-tty guard in uninstall_apply_command"
+        return 1
+    }
+    [ -n "$cat_line" ] || {
+        echo "no stdin read in uninstall_apply_command"
+        return 1
+    }
+    [ "$guard_line" -lt "$cat_line" ] || {
+        echo "guard at $guard_line is after the blocking read at $cat_line"
+        return 1
+    }
+
+    # Positive control: a redirected plan on stdin is not a terminal, so the
+    # guard must not fire for the normal path.
+    make_fixture_app
+    make_plan "$SANDBOX/plan.json"
+    add_selection "$SANDBOX/plan.json" "$SANDBOX/sel.json"
+    run_mole_stdin "$SANDBOX/sel.json" --apply-plan --json
+    [ "$status" -eq 0 ]
 }

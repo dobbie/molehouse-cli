@@ -2440,6 +2440,17 @@ uninstall_apply_command() {
     local results_file="$work_dir/results"
     : > "$warn_file"
 
+    # The plan arrives on stdin. Reading a terminal here would block on EOF
+    # with no output at all, which on the most destructive command in the tool
+    # is indistinguishable from a hang. Say which cause was hit and what to
+    # run next, per mole/CLAUDE.md's rule for refusing gates.
+    if [[ -t 0 ]]; then
+        echo "uninstall --apply-plan reads a plan document on stdin." >&2
+        echo "Produce one with: mo uninstall --plan <NAME> --json" >&2
+        rm -rf "$work_dir" 2> /dev/null || true # SAFE: tracked scratch dir this function created
+        return 2
+    fi
+
     cat > "$plan_file"
 
     # `plutil -lint` is plist-only and rejects a JSON document outright, so the
