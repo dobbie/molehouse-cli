@@ -2588,12 +2588,14 @@ uninstall_apply_command() {
     # Re-validation at apply time is what makes the deletion safe (§7.2), and
     # a plan can only ever under-report a refusal.
     local protected_index="|" submitted_index="|" selected_index="|"
-    local cur_prot_index="|" cpath cprot
+    local cur_prot_index="|" sudo_index="|" cpath cprot csudo cid
     while IFS= read -r rec; do
         [[ -n "$rec" ]] || continue
-        IFS=$'\x1f' read -r cpath _ _ _ cprot _ <<< "$rec"
-        [[ "$cprot" == "true" ]] || continue
-        cur_prot_index+="$(uninstall_plan_entry_id "$cpath")|"
+        IFS=$'\x1f' read -r cpath _ _ _ cprot csudo _ <<< "$rec"
+        [[ "$cprot" == "true" || "$csudo" == "true" ]] || continue
+        cid=$(uninstall_plan_entry_id "$cpath")
+        [[ "$cprot" != "true" ]] || cur_prot_index+="$cid|"
+        [[ "$csudo" != "true" ]] || sudo_index+="$cid|"
     done < "$current_file"
 
     : > "$normalized_file"
@@ -2626,6 +2628,20 @@ uninstall_apply_command() {
                 "a selected entry is protected and cannot be removed; nothing was deleted"
             rm -rf "$work_dir" 2> /dev/null || true # SAFE: tracked scratch dir this function created
             return 2
+        fi
+        # §7.6 / §1.6 exit 3: privilege required and unavailable, BEFORE any
+        # deletion. This command never prompts and never escalates — it is
+        # non-interactive by contract (§7.2) and F-003 leaves escalation
+        # unsolved — so a selected entry that needs privilege can only ever
+        # fail. Refusing the run up front is the honest answer; deleting the
+        # rest and reporting this one as `failed` would leave the app half
+        # removed on the strength of a preview that said otherwise. The plan
+        # tells the caller which entries these are through `requires_sudo`.
+        if [[ "$sudo_index" == *"|$sel|"* ]]; then
+            uninstall_apply_refuse "$mole_version" "permission" \
+                "a selected entry needs elevated privilege, which this command never acquires; nothing was deleted"
+            rm -rf "$work_dir" 2> /dev/null || true # SAFE: tracked scratch dir this function created
+            return 3
         fi
         selected_index+="$sel|"
     done < "$selected_file"

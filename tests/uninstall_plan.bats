@@ -870,3 +870,41 @@ PY
     run_mole_stdin "$SANDBOX/sel.json" --apply-plan --json
     [ "$status" -eq 0 ]
 }
+
+@test "uninstall --apply-plan refuses a selection needing privilege with exit 3 and deletes nothing" {
+    make_fixture_app
+    make_plan "$SANDBOX/plan.json"
+    add_selection "$SANDBOX/plan.json" "$SANDBOX/sel.json"
+
+    # The parent stops being writable between plan and apply, so the Trash
+    # rename genuinely cannot happen unprivileged. §7.6 wants that refused
+    # BEFORE any deletion, not discovered halfway through the list.
+    chmod 500 "$HOME/Library/Preferences"
+    local before
+    before=$(find "$HOME" -not -path "*/Library/Logs*" | LC_ALL=C sort)
+
+    run_mole_stdin "$SANDBOX/sel.json" --apply-plan --json
+    local apply_status="$status" apply_output="$output"
+    chmod 700 "$HOME/Library/Preferences"
+
+    [ "$apply_status" -eq 3 ] || {
+        echo "status=$apply_status $apply_output"
+        return 1
+    }
+    printf '%s\n' "$apply_output" > "$SANDBOX/apply.json"
+    python3 - "$SANDBOX/apply.json" << 'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["scan_status"] == "failed", d
+assert d["error"]["code"] == "permission", d["error"]
+assert d["data"] is None
+PY
+
+    local after
+    after=$(find "$HOME" -not -path "*/Library/Logs*" | LC_ALL=C sort)
+    [ "$before" = "$after" ] || {
+        diff <(printf '%s\n' "$before") <(printf '%s\n' "$after")
+        return 1
+    }
+    [[ ! -d "$MOLE_TEST_TRASH_DIR" ]] || [ -z "$(ls -A "$MOLE_TEST_TRASH_DIR")" ]
+}
