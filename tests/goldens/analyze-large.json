@@ -30,6 +30,9 @@
   ],
   "overview": false,
   "path": "{ROOT}/large",
+  "scan_status": "complete",
+  "schema_version": 1,
   "total_files": 3,
-  "total_size": 1638406
+  "total_size": 1638406,
+  "warnings": []
 }

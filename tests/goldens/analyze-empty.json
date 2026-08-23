@@ -2,5 +2,8 @@
   "entries": [],
   "overview": false,
   "path": "{ROOT}/empty",
-  "total_size": 0
+  "scan_status": "complete",
+  "schema_version": 1,
+  "total_size": 0,
+  "warnings": []
 }

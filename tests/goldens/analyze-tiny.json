@@ -10,6 +10,9 @@
   ],
   "overview": false,
   "path": "{ROOT}/tiny",
+  "scan_status": "complete",
+  "schema_version": 1,
   "total_files": 1,
-  "total_size": 5
+  "total_size": 5,
+  "warnings": []
 }
