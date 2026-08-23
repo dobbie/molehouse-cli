@@ -299,13 +299,21 @@ func animTickWithSpeed(cpuUsage float64) tea.Cmd {
 }
 
 // runJSONMode collects metrics once and outputs as JSON.
+//
+// CONTRACT.md §1.4/§2.4 (M1-T7): a collector failure is a *result*, not a
+// command failure -- data.scan_status carries it as "partial" plus a
+// collector_failed warning naming which one, and every other metric still
+// prints. Previously this exited 1 on ANY collector error, so one failed
+// collector (a battery-query timeout, say) cost the caller every other
+// metric. Only a JSON encoding failure -- which means no usable payload was
+// producible at all -- still exits 1, preserving today's empty-stdout
+// behaviour for that case.
 func runJSONMode() {
 	collector := NewCollector(processWatchOptionsFromFlags())
 
 	data, err := collector.Collect()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error collecting metrics: %v\n", err)
-		os.Exit(1)
+		fmt.Fprintf(os.Stderr, "warning: %v\n", err)
 	}
 
 	encoder := json.NewEncoder(os.Stdout)

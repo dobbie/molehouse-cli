@@ -397,6 +397,12 @@ func TestCollectorKeepsLiveProcessDataWhenApplyingEnrichment(t *testing.T) {
 
 func TestMetricsSnapshotFieldsHaveCollectionClassifications(t *testing.T) {
 	classified := map[string]string{
+		// CONTRACT.md §1.5's NEW envelope fields (M1-T7): computed from the
+		// collection result after the fact (applyEnvelope), not collected
+		// from a source of their own.
+		"SchemaVersion":  "envelope",
+		"ScanStatus":     "envelope",
+		"Warnings":       "envelope",
 		"CollectedAt":    "fast",
 		"Host":           "fast",
 		"Platform":       "fast",

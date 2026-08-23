@@ -164,34 +164,6 @@ assert_rejects() {
     }
 }
 
-# `status` and `analyze` come from upstream Go that has NOT yet gained §2.3 /
-# §4.2's three NEW fields — nobody has been assigned that work. The schema
-# states the contract, so the honest assertion is that these three, and
-# ONLY these three, are outstanding: every other field in the payload must
-# satisfy the contract today. When the Go work lands, this test fails and is
-# flipped to assert_valid. It cannot pass vacuously — any other violation, in
-# any of the ~25 status collectors, fails it.
-assert_only_pending_new_fields() {
-    local schema="$1" payload="$2"
-    run python3 "$VALIDATE" "$SCHEMAS/$schema" "$payload"
-    [ "$status" -eq 1 ] || {
-        echo "$schema now satisfies the contract in full — flip this to assert_valid"
-        echo "$output"
-        return 1
-    }
-    local expected
-    expected="<root>: missing required property 'scan_status'
-<root>: missing required property 'schema_version'
-<root>: missing required property 'warnings'"
-    local got
-    got="$(printf '%s\n' "$output" | sed 's/^frame [0-9]* //' | LC_ALL=C sort -u)"
-    [ "$got" = "$expected" ] || {
-        echo "unexpected violations beyond the three unimplemented NEW fields:"
-        printf '%s\n' "$got"
-        return 1
-    }
-}
-
 corrupt() {
     python3 - "$1" "$2" "$3" << 'PY'
 import json, sys
@@ -240,9 +212,79 @@ print(" ".join(sorted(mods)))
 
 # --- §2 status -------------------------------------------------------------
 
-@test "§2 status --json satisfies its schema apart from the unimplemented NEW fields" {
+@test "§2 status --json satisfies its schema in full, including schema_version/scan_status/warnings" {
     have_payload status
-    assert_only_pending_new_fields status.schema.json "$CONTRACT_PAYLOADS/status.json"
+    assert_valid status.schema.json "$CONTRACT_PAYLOADS/status.json"
+}
+
+# M1-T7 acceptance check 4: on a healthy run (this machine, no forced
+# failure), scan_status is complete and warnings is [], never null.
+@test "§2 M1-T7: status --json on a healthy machine is complete with warnings: []" {
+    have_payload status
+    run python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["schema_version"] == 1, d["schema_version"]
+assert d["scan_status"] == "complete", d["scan_status"]
+assert d["warnings"] == [], d["warnings"]
+' "$CONTRACT_PAYLOADS/status.json"
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+}
+
+# M1-T7 acceptance check 5: a forced collector failure exits 0, reports
+# scan_status partial, one collector_failed warning per failed collector,
+# and every other metric still present. Forced with a REAL cause -- a PATH
+# stripped of pmset and ps, so the batteries and top_processes collectors
+# hit genuine `exec: "pmset"/"ps" not found` errors -- not by stubbing a
+# collector function. Verifies the exit-1-to-exit-0 behaviour change
+# directly: this used to cost the caller every other metric for one
+# collector's failure.
+@test "§2 M1-T7: a forced real collector failure is partial at exit 0 with every other metric intact" {
+    [[ -x "${STATUS_BIN:-}" ]] || skip "status-go was not built"
+    run --separate-stderr env PATH=/nonexistent-empty-path "$STATUS_BIN" --json
+    [ "$status" -eq 0 ] || {
+        echo "exit $status, want 0 (a collector failure must not cost every other metric)"
+        echo "stdout: $output"
+        echo "stderr: $stderr"
+        return 1
+    }
+    run python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["scan_status"] == "partial", d["scan_status"]
+codes = {w["scope"]: w["code"] for w in d["warnings"]}
+assert codes.get("batteries") == "collector_failed", codes
+assert codes.get("top_processes") == "collector_failed", codes
+assert all(w["code"] == "collector_failed" for w in d["warnings"]), d["warnings"]
+# Every other metric is still present -- the whole point of the fix.
+for key in ("cpu", "memory", "disks", "hardware", "health_score"):
+    assert key in d, key
+assert d["cpu"]["usage"] >= 0
+' "$output"
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+}
+
+# M1-T7 acceptance check 6: sensors is disabled upstream and null in every
+# frame -- it must never get a collector_failed warning, which would be a
+# failure marker for hardware telemetry that was never asked to run.
+@test "§2 M1-T7: sensors is null with no collector_failed warning" {
+    have_payload status
+    run python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["sensors"] is None, d["sensors"]
+assert not any(w["scope"] == "sensors" for w in d["warnings"]), d["warnings"]
+' "$CONTRACT_PAYLOADS/status.json"
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
 }
 
 @test "§2 status --json REJECTED when uptime_seconds becomes a display string" {
@@ -260,7 +302,7 @@ for k in ("gpu", "disks", "network", "batteries", "sensors", "bluetooth",
     d.pop(k, None)
 d["sensors"] = None
 '
-    assert_only_pending_new_fields status.schema.json "$HOME/status-c-absent.json"
+    assert_valid status.schema.json "$HOME/status-c-absent.json"
 
     corrupt "$CONTRACT_PAYLOADS/status.json" "$HOME/status-g-gone.json" 'd.pop("hardware")'
     assert_rejects status.schema.json "$HOME/status-g-gone.json" "'hardware'"
@@ -278,14 +320,9 @@ d["sensors"] = None
     }
     run python3 "$VALIDATE" --ndjson "$SCHEMAS/status_watch_frame.schema.json" \
         "$CONTRACT_PAYLOADS/watch.ndjson"
-    [ "$status" -eq 1 ]
-    # Same three pending fields, per frame, and nothing else.
-    local got
-    got="$(printf '%s\n' "$output" | sed 's/^frame [0-9]* //' | LC_ALL=C sort -u)"
-    [ "$got" = "<root>: missing required property 'scan_status'
-<root>: missing required property 'schema_version'
-<root>: missing required property 'warnings'" ] || {
-        printf '%s\n' "$got"
+    [ "$status" -eq 0 ] || {
+        echo "a captured watch frame no longer satisfies the schema in full:"
+        echo "$output"
         return 1
     }
 }
@@ -313,13 +350,58 @@ PY
     }
 }
 
+# M1-T7 / F-048: frame 0 is the deliberate fast partial frame, and its
+# collector_pending warnings must name every collector the fast round did
+# not run -- not just the five fields that happen to marshal to null, but
+# also the struct/scalar-valued ones (proxy, hardware, ...) that would
+# otherwise carry a plausible zero with no signal at all.
+@test "§3 M1-T7: status --watch frame 0 is partial with collector_pending naming proxy and batteries" {
+    [[ -s "$CONTRACT_PAYLOADS/watch.ndjson" ]] || skip "watch frames were not captured"
+    run python3 -c '
+import json, sys
+frame = json.loads(open(sys.argv[1]).readline())
+assert frame["scan_status"] == "partial", frame["scan_status"]
+codes = {(w["code"], w["scope"]) for w in frame["warnings"]}
+# The five null arrays (bar sensors -- see below) plus the struct/scalar
+# fields that carry a plausible zero instead of null (F-048).
+for scope in ("gpu", "batteries", "bluetooth", "top_processes",
+              "proxy", "thermal", "trash_size", "hardware"):
+    assert ("collector_pending", scope) in codes, (scope, codes)
+# sensors is null in every frame, fast or full (it is disabled upstream,
+# never wired to any collector) -- marking it pending would promise a
+# resolution that never comes, so it is deliberately excluded. See
+# fastSkippedScopes in cmd/status/envelope.go.
+assert not any(scope == "sensors" for _, scope in codes), codes
+' "$CONTRACT_PAYLOADS/watch.ndjson"
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+}
+
+@test "§3 M1-T7: a later status --watch frame is complete with warnings: []" {
+    [[ -s "$CONTRACT_PAYLOADS/watch.ndjson" ]] || skip "watch frames were not captured"
+    run python3 -c '
+import json, sys
+lines = [l for l in open(sys.argv[1]) if l.strip()]
+assert len(lines) >= 2, "need at least a frame after frame 0"
+frame = json.loads(lines[1])
+assert frame["scan_status"] == "complete", frame["scan_status"]
+assert frame["warnings"] == [], frame["warnings"]
+' "$CONTRACT_PAYLOADS/watch.ndjson"
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+}
+
 # --- §4 analyze ------------------------------------------------------------
 
-@test "§4 analyze --json satisfies its schema on all three fixtures apart from the NEW fields" {
+@test "§4 analyze --json satisfies its schema in full on all three fixtures" {
     have_payload analyze-tiny
-    assert_only_pending_new_fields analyze.schema.json "$CONTRACT_PAYLOADS/analyze-tiny.json"
-    assert_only_pending_new_fields analyze.schema.json "$CONTRACT_PAYLOADS/analyze-large.json"
-    assert_only_pending_new_fields analyze.schema.json "$CONTRACT_PAYLOADS/analyze-empty.json"
+    assert_valid analyze.schema.json "$CONTRACT_PAYLOADS/analyze-tiny.json"
+    assert_valid analyze.schema.json "$CONTRACT_PAYLOADS/analyze-large.json"
+    assert_valid analyze.schema.json "$CONTRACT_PAYLOADS/analyze-empty.json"
 }
 
 @test "§4 analyze --json REJECTED when entries is an object instead of an array" {
@@ -343,7 +425,7 @@ assert d["total_size"] == 0
         echo "$output"
         return 1
     }
-    assert_only_pending_new_fields analyze.schema.json "$CONTRACT_PAYLOADS/analyze-empty.json"
+    assert_valid analyze.schema.json "$CONTRACT_PAYLOADS/analyze-empty.json"
 
     # total_size carries no omitempty (§4.3) and is G. Dropping it must fail.
     corrupt "$CONTRACT_PAYLOADS/analyze-empty.json" "$HOME/no-total-size.json" \
@@ -360,6 +442,146 @@ tiny = json.load(open(sys.argv[2]))
 assert [f["name"] for f in large["large_files"]] == ["big.bin"], large
 assert "large_files" not in tiny, tiny
 ' "$CONTRACT_PAYLOADS/analyze-large.json" "$CONTRACT_PAYLOADS/analyze-tiny.json"
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+}
+
+# M1-T7 acceptance check 8: a clean scan is complete with warnings: [].
+@test "§4 M1-T7: analyze --json on a clean directory is complete with warnings: []" {
+    have_payload analyze-tiny
+    run python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["schema_version"] == 1, d["schema_version"]
+assert d["scan_status"] == "complete", d["scan_status"]
+assert d["warnings"] == [], d["warnings"]
+' "$CONTRACT_PAYLOADS/analyze-tiny.json"
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+}
+
+# M1-T7 acceptance check 9 (part 1): the failure envelope itself. `analyze
+# --json` on a missing path is captured as `analyze-missing` in setup_file;
+# assert it is the flat §1.5/§4.6 failure shape -- no data key, no
+# path/entries/total_size, error.code present -- and validates against the
+# dedicated failed-envelope schema (analyze.schema.json cannot express this
+# shape: this validator has no oneOf, so a separate schema is the only way).
+@test "§4 M1-T7: analyze --json failure envelope is flat, has no path/entries/total_size" {
+    have_payload analyze-missing
+    assert_valid analyze_failed.schema.json "$CONTRACT_PAYLOADS/analyze-missing.json"
+    run python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["scan_status"] == "failed", d["scan_status"]
+assert d["error"]["code"] == "path_not_found", d["error"]
+for key in ("data", "path", "entries", "total_size", "large_files", "total_files", "overview"):
+    assert key not in d, (key, d)
+' "$CONTRACT_PAYLOADS/analyze-missing.json"
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+}
+
+# M1-T7 acceptance check 9 (part 2): all four error.code classifications,
+# each driven by a real OS cause -- never by stubbing classifyScanError --
+# each exiting 1 with the flat failed payload on stdout and nothing else.
+@test "§4 M1-T7: not_a_directory is classified from a real ENOTDIR" {
+    [[ -x "${ANALYZE_BIN:-}" ]] || skip "analyze-go was not built"
+    local plainfile="$HOME/m1t7-plainfile.txt"
+    printf 'not a directory\n' > "$plainfile"
+    run --separate-stderr "$ANALYZE_BIN" --json "$plainfile"
+    [ "$status" -eq 1 ]
+    run python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["scan_status"] == "failed", d
+assert d["error"]["code"] == "not_a_directory", d
+' "$output"
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+}
+
+@test "§4 M1-T7: permission_denied is classified from a real EACCES" {
+    [[ -x "${ANALYZE_BIN:-}" ]] || skip "analyze-go was not built"
+    local locked="$HOME/m1t7-locked"
+    mkdir -p "$locked"
+    chmod 000 "$locked"
+    run --separate-stderr "$ANALYZE_BIN" --json "$locked"
+    chmod 755 "$locked"
+    [ "$status" -eq 1 ]
+    run python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["scan_status"] == "failed", d
+assert d["error"]["code"] == "permission_denied", d
+' "$output"
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+}
+
+@test "§4 M1-T7: scan_failed is classified from a real ELOOP" {
+    [[ -x "${ANALYZE_BIN:-}" ]] || skip "analyze-go was not built"
+    local loopdir="$HOME/m1t7-loop"
+    mkdir -p "$loopdir"
+    ln -sfn "$loopdir/self" "$loopdir/self"
+    run --separate-stderr "$ANALYZE_BIN" --json "$loopdir/self"
+    [ "$status" -eq 1 ]
+    run python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["scan_status"] == "failed", d
+assert d["error"]["code"] == "scan_failed", d
+' "$output"
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+}
+
+# M1-T7 acceptance check 10: the silent-shrink fixture. Two equal subtrees,
+# one made unreadable -- must be partial, exit 0, name the unreadable path,
+# and the total must be PROVABLY lower than the all-readable run. Asserting
+# the two totals differ (not a literal byte count) is the point: a test that
+# pins a literal number pins nothing about the actual defect (F-045 brief).
+@test "§4 M1-T7: an unreadable subtree shrinks the total, exit 0, partial, named in warnings" {
+    [[ -x "${ANALYZE_BIN:-}" ]] || skip "analyze-go was not built"
+    local root="$HOME/m1t7-shrink"
+    mkdir -p "$root/open" "$root/locked"
+    dd if=/dev/zero of="$root/open/data.bin" bs=1024 count=500 2> /dev/null
+    dd if=/dev/zero of="$root/locked/data.bin" bs=1024 count=500 2> /dev/null
+
+    run --separate-stderr "$ANALYZE_BIN" --json "$root"
+    [ "$status" -eq 0 ]
+    local baseline
+    baseline="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["total_size"])' "$output")"
+
+    chmod 000 "$root/locked"
+    run --separate-stderr "$ANALYZE_BIN" --json "$root"
+    local rc=$status
+    chmod 755 "$root/locked"
+    [ "$rc" -eq 0 ] || {
+        echo "exit $rc, want 0 (one unreadable subtree must not fail the whole scan)"
+        echo "$output"
+        return 1
+    }
+    run python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+baseline = int(sys.argv[2])
+assert d["scan_status"] == "partial", d["scan_status"]
+assert d["total_size"] < baseline, (d["total_size"], baseline)
+scopes = {w["scope"]: w["code"] for w in d["warnings"]}
+assert any(code == "subtree_unreadable" and "locked" in scope for scope, code in scopes.items()), d["warnings"]
+' "$output" "$baseline"
     [ "$status" -eq 0 ] || {
         echo "$output"
         return 1

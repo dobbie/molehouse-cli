@@ -1,0 +1,20 @@
+{
+  "title": "mole analyze --json <path> failure envelope (CONTRACT.md §4.6)",
+  "description": "M1-T7. §4.6 requires the FAILURE payload, not the success payload, on a scan error: flat (§1.5 keeps analyze un-enveloped), error present, and no data key and no path/entries/total_size -- a failed scan has no entries to report and must not fake an empty list. Kept as a separate schema rather than a oneOf on analyze.schema.json because this validator does not implement oneOf (see validate.py's SUPPORTED keyword set) -- the brief's other option was not actually available.",
+  "type": "object",
+  "required": ["schema_version", "scan_status", "warnings", "error"],
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "scan_status": { "type": "string", "const": "failed" },
+    "warnings": { "type": "array", "items": { "$ref": "warning.schema.json" } },
+    "error": {
+      "type": "object",
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "type": "string", "pattern": "^[a-z0-9_]+$" },
+        "message": { "type": "string" }
+      }
+    }
+  },
+  "additionalProperties": false
+}

@@ -20,6 +20,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/tw93/mole/internal/contract"
 )
 
 var spotlightQueryRunner = func(ctx context.Context, root, query string) ([]byte, error) {
@@ -63,6 +65,15 @@ type scanLimiter struct {
 	// seen tracks (dev, ino) of hardlinked files counted so far in this
 	// scan so a file with multiple links is counted once, matching `du`.
 	seen sync.Map
+
+	// unreadable collects subtrees this scan could not read (CONTRACT.md
+	// §4.6 / M1-T7). Shared for the whole scan through the same limiter
+	// pointer every recursive call already threads, so every worker that
+	// hits a ReadDir failure -- calculateDirSizeConcurrent and
+	// calculateDirSizeFastWithLimiter both bare-`return`ed on one before
+	// this task -- feeds the same recorder instead of the total silently
+	// shrinking with no trace anywhere in the payload.
+	unreadable *unreadableRecorder
 }
 
 func newScanLimiter(childCount int) *scanLimiter {
@@ -76,7 +87,64 @@ func newScanLimiter(childCount int) *scanLimiter {
 		duSem:      make(chan struct{}, min(4, runtime.NumCPU())),
 		duQueueSem: make(chan struct{}, min(4, runtime.NumCPU())*2),
 		fastSem:    make(chan struct{}, min(runtime.NumCPU()*cpuMultiplier, maxWorkers)),
+		unreadable: newUnreadableRecorder(),
 	}
+}
+
+// unreadableRecorder deduplicates and caps the subtree_unreadable warnings a
+// single `analyze --json` scan can produce. A permission-dense tree could
+// otherwise grow the payload without bound (M1-T7 brief); capped at
+// maxUnreadableWarnings, with the overflow count reported as one summary
+// entry instead of being dropped silently.
+type unreadableRecorder struct {
+	mu      sync.Mutex
+	seen    map[string]bool
+	paths   []string
+	dropped int
+}
+
+// maxUnreadableWarnings caps how many subtree_unreadable entries one
+// analyze payload carries before the rest collapse into a single
+// subtree_unreadable_truncated summary warning.
+const maxUnreadableWarnings = contract.MaxSubtreeUnreadableWarnings
+
+func newUnreadableRecorder() *unreadableRecorder {
+	return &unreadableRecorder{seen: make(map[string]bool)}
+}
+
+// record notes that path could not be read. Safe for concurrent use from
+// any scan worker; a nil receiver is a no-op so call sites that run without
+// a recorder (there are none left after this task, but a defensive nil
+// check is cheap and matches the rest of scanLimiter's nil-receiver style,
+// e.g. tryAcquireEntry) never need their own guard.
+func (r *unreadableRecorder) record(path string) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.seen[path] {
+		return
+	}
+	r.seen[path] = true
+	if len(r.paths) >= maxUnreadableWarnings {
+		r.dropped++
+		return
+	}
+	r.paths = append(r.paths, path)
+}
+
+// snapshot returns the recorded paths (capped, insertion order) and how
+// many additional distinct paths were deduped away beyond the cap.
+func (r *unreadableRecorder) snapshot() ([]string, int) {
+	if r == nil {
+		return nil, 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]string, len(r.paths))
+	copy(out, r.paths)
+	return out, r.dropped
 }
 
 func (l *scanLimiter) tryAcquireEntry() bool {
@@ -434,12 +502,15 @@ func scanPathConcurrentWithLimiter(root string, filesScanned, dirsScanned, bytes
 		}
 	}
 
+	unreadablePaths, unreadableDropped := limiter.unreadable.snapshot()
 	return scanResult{
-		Entries:         entries,
-		LargeFiles:      largeFiles,
-		TotalSize:       total,
-		TotalFiles:      localFilesScanned + subtreeFilesScanned.Load(),
-		dedupedHardlink: dedupedHardlink.Load(),
+		Entries:           entries,
+		LargeFiles:        largeFiles,
+		TotalSize:         total,
+		TotalFiles:        localFilesScanned + subtreeFilesScanned.Load(),
+		dedupedHardlink:   dedupedHardlink.Load(),
+		UnreadablePaths:   unreadablePaths,
+		UnreadableDropped: unreadableDropped,
 	}, nil
 }
 
@@ -551,6 +622,14 @@ func calculateDirSizeFastWithLimiter(root string, limiter *scanLimiter, filesSca
 
 		entries, err := os.ReadDir(dirPath)
 		if err != nil {
+			// Was a bare `return`: the subtree silently vanished from the
+			// total with nothing anywhere saying so (M1-T7; reproduced with
+			// two equal 500 KB subtrees, one chmod 000 -- total_size halved
+			// at exit 0, empty stderr). Now recorded so the caller can turn
+			// it into a subtree_unreadable warning and mark the scan
+			// partial instead of quietly reporting a short total as
+			// complete (CONTRACT.md §4.6, §1.4's cardinal rule).
+			limiter.unreadable.record(dirPath)
 			return
 		}
 
@@ -683,6 +762,12 @@ func isInFoldedDir(path string) bool {
 func calculateDirSizeConcurrent(root string, largeFileChan chan<- fileEntry, largeFileMinSize *int64, limiter *scanLimiter, dirSem, duSem, duQueueSem chan struct{}, filesScanned, dirsScanned, bytesScanned *int64, currentPath *atomic.Value) int64 {
 	children, err := os.ReadDir(root)
 	if err != nil {
+		// This is the path actually hit by scanSubdirWithCache's fallback
+		// (scanPathConcurrentWithLimiter fails to read an unreadable
+		// top-level entry, falls back here, and this ReadDir fails
+		// identically) -- the real reproduction of the M1-T7 silent-shrink
+		// fixture. Recorded instead of a bare `return 0`.
+		limiter.unreadable.record(root)
 		return 0
 	}
 

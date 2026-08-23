@@ -13,6 +13,8 @@ import (
 	"github.com/shirou/gopsutil/v4/disk"
 	"github.com/shirou/gopsutil/v4/host"
 	"github.com/shirou/gopsutil/v4/net"
+
+	"github.com/tw93/mole/internal/contract"
 )
 
 // RingBuffer is a fixed-size circular buffer for float64 values.
@@ -60,6 +62,15 @@ func (rb *RingBuffer) Slice() []float64 {
 }
 
 type MetricsSnapshot struct {
+	// SchemaVersion, ScanStatus and Warnings are CONTRACT.md §1.5's NEW
+	// envelope fields (M1-T7 / F-045). `status` keeps its existing flat
+	// shape per §1.5's own text -- these three are added at top level and
+	// nothing else moves. Kept first in the struct for readability, though
+	// §1.7 does not guarantee field order.
+	SchemaVersion int                 `json:"schema_version"`
+	ScanStatus    contract.ScanStatus `json:"scan_status"`
+	Warnings      []contract.Warning  `json:"warnings"`
+
 	CollectedAt    time.Time    `json:"collected_at"`
 	Host           string       `json:"host"`
 	Platform       string       `json:"platform"`
@@ -311,41 +322,86 @@ func collectHostInfo() *host.InfoStat {
 	return hostInfo
 }
 
-func collectConcurrently(tasks ...func() error) error {
+// namedTask is one entry in a collectConcurrently task list: fn does the
+// actual collection, scope is the JSON field name it fills in
+// (MetricsSnapshot's json tag) -- not the Go function name. It is what
+// CONTRACT.md §2.4's collector_failed warning keys its `scope` off, and
+// Molehouse matches it against the payload key exactly.
+type namedTask struct {
+	scope string
+	fn    func() error
+}
+
+// collectorFailure names one collector's failure by scope, so a caller can
+// build one §2.4 collector_failed warning per entry instead of losing the
+// failing collector's identity to a single flattened string (M1-T7,
+// .claude/skills/bugs archetype 12 -- "a gate that cannot say why it
+// refused"). Distinct from a plain error specifically so it survives being
+// merged with the others.
+type collectorFailure struct {
+	scope string
+	err   error
+}
+
+// collectionFailures is what collectConcurrently returns when one or more
+// tasks failed. It still satisfies `error` (for the TUI's existing
+// display-only error handling), but a JSON-emitting caller can type-assert
+// it back to recover every failing collector's scope, which a flattened
+// `fmt.Errorf("%v; %w", ...)` chain destroys irrecoverably.
+type collectionFailures struct {
+	failures []collectorFailure
+}
+
+func (f *collectionFailures) Error() string {
+	if f == nil || len(f.failures) == 0 {
+		return "collector failure"
+	}
+	parts := make([]string, len(f.failures))
+	for i, cf := range f.failures {
+		parts[i] = fmt.Sprintf("%s: %v", cf.scope, cf.err)
+	}
+	return strings.Join(parts, "; ")
+}
+
+// collectConcurrently runs every task and, when any fail, returns the
+// per-collector failures keyed by scope rather than one merged string. The
+// mutex-guarded slice replaces the old mutex-guarded merged-error string
+// (the guarded structure the identity needed to be carried in already
+// existed; only its shape was wrong).
+//
+// Returns a plain nil `error` interface (not a nil-valued *collectionFailures)
+// when every task succeeds, so `err != nil` behaves correctly for every
+// caller -- a typed-nil pointer stored in an error interface would report a
+// failure that never happened.
+func collectConcurrently(tasks ...namedTask) error {
 	var (
-		wg     sync.WaitGroup
-		errMu  sync.Mutex
-		merged error
+		wg    sync.WaitGroup
+		mu    sync.Mutex
+		fails []collectorFailure
 	)
 
 	for _, task := range tasks {
 		wg.Go(func() {
 			defer func() {
 				if r := recover(); r != nil {
-					errMu.Lock()
-					panicErr := fmt.Errorf("collector panic: %v", r)
-					if merged == nil {
-						merged = panicErr
-					} else {
-						merged = fmt.Errorf("%v; %w", merged, panicErr)
-					}
-					errMu.Unlock()
+					mu.Lock()
+					fails = append(fails, collectorFailure{scope: task.scope, err: fmt.Errorf("collector panic: %v", r)})
+					mu.Unlock()
 				}
 			}()
-			if err := task(); err != nil {
-				errMu.Lock()
-				if merged == nil {
-					merged = err
-				} else {
-					merged = fmt.Errorf("%v; %w", merged, err)
-				}
-				errMu.Unlock()
+			if err := task.fn(); err != nil {
+				mu.Lock()
+				fails = append(fails, collectorFailure{scope: task.scope, err: err})
+				mu.Unlock()
 			}
 		})
 	}
 
 	wg.Wait()
-	return merged
+	if len(fails) == 0 {
+		return nil
+	}
+	return &collectionFailures{failures: fails}
 }
 
 func (c *Collector) CollectFast() (MetricsSnapshot, error) {
@@ -361,21 +417,31 @@ func (c *Collector) collectFast(includeProcesses bool) (MetricsSnapshot, error) 
 	hostInfo := collectHostInfo()
 	var collected collectedMetrics
 
-	tasks := []func() error{
-		func() (err error) { collected.cpuStats, err = collectCPUFast(); return },
-		func() (err error) { collected.memStats, err = collectMemoryFast(); return },
-		func() (err error) { collected.diskStats, err = collectDisksFast(); return },
-		func() (err error) { collected.diskIO = c.collectDiskIO(now); return nil },
-		func() (err error) { collected.netStats = c.collectNetwork(now); return nil },
+	tasks := []namedTask{
+		{"cpu", func() (err error) { collected.cpuStats, err = collectCPUFast(); return }},
+		{"memory", func() (err error) { collected.memStats, err = collectMemoryFast(); return }},
+		{"disks", func() (err error) { collected.diskStats, err = collectDisksFast(); return }},
+		// disk_io and network return no error today -- structurally unable
+		// to fail as written (M1-T7 report). Named all the same, so a
+		// future error return on either wires straight into §2.4 without
+		// another silent-`_`-discard trap.
+		{"disk_io", func() error { collected.diskIO = c.collectDiskIO(now); return nil }},
+		{"network", func() error { collected.netStats = c.collectNetwork(now); return nil }},
 	}
 	if includeProcesses {
-		tasks = append(tasks, func() error { return collectProcessesInto(&collected) })
+		tasks = append(tasks, namedTask{"top_processes", func() error { return collectProcessesInto(&collected) }})
 	}
+
+	// Read before this round's tasks run (they never touch hasEnrichment);
+	// decides whether the scopes this round skips are cache-backed or
+	// genuinely pending. See fastPendingScopes.
+	hadEnrichment := c.hasEnrichment
 
 	mergeErr := collectConcurrently(tasks...)
 
 	snapshot := c.snapshotFromMetrics(now, hostInfo, collected, false)
 	c.applyEnrichment(&snapshot, collected.hasProcesses)
+	applyEnvelope(&snapshot, mergeErr, fastPendingScopes(includeProcesses, hadEnrichment))
 	return snapshot, mergeErr
 }
 
@@ -395,21 +461,33 @@ func (c *Collector) collectFull() (MetricsSnapshot, error) {
 	var cpuErr error
 	collected.cpuStats, cpuErr = collectCPU()
 
-	// Launch independent collection tasks.
-	tasks := []func() error{
-		func() error { return cpuErr },
-		func() (err error) { collected.memStats, err = collectMemory(); return },
-		func() (err error) { collected.diskStats, err = collectDisks(); return },
-		func() (err error) { collected.trashSize, collected.trashApprox = collectTrashSize(); return nil },
-		func() (err error) { collected.diskIO = c.collectDiskIO(now); return nil },
-		func() (err error) { collected.netStats = c.collectNetwork(now); return nil },
-		func() (err error) { collected.proxyStats = collectProxy(); return nil },
-		func() (err error) { collected.batteryStats, _ = collectBatteries(); return nil },
-		func() (err error) { collected.thermalStats = collectThermal(); return nil },
+	// Launch independent collection tasks. Each is named for the JSON field
+	// it fills (metrics.go's MetricsSnapshot tags), which is what §2.4's
+	// collector_failed warning keys its `scope` off (M1-T7).
+	//
+	// trash_size, disk_io, network, proxy, thermal and bluetooth return no
+	// error today -- structurally unable to fail as written, not silently
+	// swallowing one. Reported, not worked around: see the M1-T7 report's
+	// per-collector table for the full enumeration.
+	//
+	// batteries previously discarded its error with `_` here -- the exact
+	// case §2.4 was written for, a MacBook's battery collector failing and
+	// a Mac mini both reading `"batteries": null` with no way to tell them
+	// apart. Now captured like every other fallible collector.
+	tasks := []namedTask{
+		{"cpu", func() error { return cpuErr }},
+		{"memory", func() (err error) { collected.memStats, err = collectMemory(); return }},
+		{"disks", func() (err error) { collected.diskStats, err = collectDisks(); return }},
+		{"trash_size", func() error { collected.trashSize, collected.trashApprox = collectTrashSize(); return nil }},
+		{"disk_io", func() error { collected.diskIO = c.collectDiskIO(now); return nil }},
+		{"network", func() error { collected.netStats = c.collectNetwork(now); return nil }},
+		{"proxy", func() error { collected.proxyStats = collectProxy(); return nil }},
+		{"batteries", func() (err error) { collected.batteryStats, err = collectBatteries(); return }},
+		{"thermal", func() error { collected.thermalStats = collectThermal(); return nil }},
 		// Sensors disabled - CPU temp already shown in CPU card
 		// collect(func() (err error) { sensorStats, _ = collectSensors(); return nil })
-		func() (err error) { collected.gpuStats, err = c.collectGPU(now); return },
-		func() (err error) {
+		{"gpu", func() (err error) { collected.gpuStats, err = c.collectGPU(now); return }},
+		{"bluetooth", func() error {
 			// Bluetooth is slow; cache for 30s.
 			if now.Sub(c.lastBTAt) > 30*time.Second || len(c.lastBT) == 0 {
 				collected.btStats = c.collectBluetooth(now)
@@ -419,8 +497,8 @@ func (c *Collector) collectFull() (MetricsSnapshot, error) {
 				collected.btStats = c.lastBT
 			}
 			return nil
-		},
-		func() error { return collectProcessesInto(&collected) },
+		}},
+		{"top_processes", func() error { return collectProcessesInto(&collected) }},
 	}
 	mergeErr := collectConcurrently(tasks...)
 
@@ -428,6 +506,9 @@ func (c *Collector) collectFull() (MetricsSnapshot, error) {
 	if mergeErr == nil {
 		c.cacheEnrichment(snapshot)
 	}
+	// A full collect never skips a collector, so nothing is pending -- only
+	// collector_failed can apply here.
+	applyEnvelope(&snapshot, mergeErr, nil)
 	return snapshot, mergeErr
 }
 

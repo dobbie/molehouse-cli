@@ -34,6 +34,14 @@ type scanResult struct {
 	// scan. Such a result is scan-order dependent and must not be written
 	// to the on-disk cache. In-memory only; never serialized to cacheEntry.
 	dedupedHardlink bool
+	// UnreadablePaths and UnreadableDropped surface the scanLimiter's
+	// unreadableRecorder for the top-level caller (CONTRACT.md §4.6,
+	// M1-T7): every subtree this scan could not read, capped, plus how
+	// many more were deduped away beyond the cap. In-memory only; never
+	// serialized to cacheEntry -- a cached result is reused verbatim for a
+	// re-scan whose permissions may since have changed.
+	UnreadablePaths   []string
+	UnreadableDropped int
 }
 
 type cacheEntry struct {
