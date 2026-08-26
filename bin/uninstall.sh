@@ -1561,13 +1561,18 @@ uninstall_list_emit_json() {
         local source_label="App"
         [[ -n "$cask" ]] && source_label="Homebrew"
         local size_display
-        size_display=$(uninstall_normalize_size_display "$size")
+        size_display=$(uninstall_normalize_size_display "$size" "$app_path")
 
         [[ "$size_kb" =~ ^[0-9]+$ ]] || size_kb=0
         # §1.1: size_known false + size_bytes absent, never size_bytes: 0.
         # human_size() in the scan awk returns "--" for kb <= 0 — F-022's
         # sentinel at its source — so kb > 0 is the same test this emitter
-        # must use to agree with it.
+        # must use to agree with it. A Steam launcher shortcut's own size is
+        # not the game's size (upstream #1461-adjacent Steam-managed work,
+        # lib/uninstall/steam.sh): keep size_known/size_bytes reporting the
+        # shortcut bundle's real, honest kb — only the deprecated display
+        # string "size" is replaced with the Steam-managed label, matching
+        # uninstall_normalize_size_display's existing text-mode behaviour.
         local size_known="false" size_bytes=""
         if [[ "$size_kb" -gt 0 ]]; then
             size_known="true"

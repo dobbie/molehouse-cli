@@ -238,10 +238,17 @@ uninstall_list_apps
 EOF
 
     [ "$status" -eq 0 ] || return 1
-    [[ "$output" == *'"name": "SteamGame"'* ]] || return 1
-    [[ "$output" == *'"size": "N/A (Steam-managed)"'* ]] || return 1
-    [[ "$output" == *'"name": "Regular"'* ]] || return 1
-    [[ "$output" == *'"size": "420MB"'* ]]
+    # bin/uninstall.sh emits the CONTRACT.md §6 envelope (uninstall_list_emit_json),
+    # not a bare array — compact JSON, no space after ":". M9-T1a merge note:
+    # this test originally asserted upstream's plain-array --list --json
+    # format (`uninstall_list_apps`'s pre-fork body), which the fork replaced
+    # wholesale with the envelope in M1. Adjusted to the envelope's shape
+    # while keeping the Steam-managed size-masking assertion this test exists
+    # for.
+    [[ "$output" == *'"name":"SteamGame"'* ]] || return 1
+    [[ "$output" == *'"size":"N/A (Steam-managed)"'* ]] || return 1
+    [[ "$output" == *'"name":"Regular"'* ]] || return 1
+    [[ "$output" == *'"size":"420MB"'* ]]
 }
 
 @test "uninstall preview marks Steam launchers as launcher-only" {
