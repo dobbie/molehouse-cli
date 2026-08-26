@@ -51,33 +51,45 @@ EOF
     [ -f "$HOME/.mix/archives/test_tool.ez" ]
 }
 
-@test "clean_dev_haskell cleans cabal install cache" {
-    mkdir -p "$HOME/.cabal" "$HOME/.stack"
+@test "Haskell has no cleanup stage at all" {
+    # ~/.cabal/packages is the source-tarball store cabal resolves builds
+    # against and ~/.stack/programs holds Stack-installed GHC compilers, so
+    # neither is a redundant copy Mole can drop. The stage was removed rather
+    # than emptied; a no-op stage would invite someone to refill it.
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/dev.sh"
-safe_clean() { echo "$2"; }
-clean_dev_haskell
+declare -f clean_dev_haskell > /dev/null 2>&1 && echo "STAGE_STILL_DEFINED"
+declare -f clean_developer_tools | grep -c clean_dev_haskell || true
 EOF
 
-    [ "$status" -eq 0 ]
-    [[ "$output" == *"Cabal install cache"* ]]
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" != *"STAGE_STILL_DEFINED"* ]] || return 1
+    [[ "$output" == *"0"* ]]
 }
 
-@test "clean_dev_haskell does not clean stack programs" {
-    mkdir -p "$HOME/.stack/programs/x86_64-osx"
-    touch "$HOME/.stack/programs/x86_64-osx/ghc-9.2.8.tar.xz"
+@test "no cleanup call site targets the cabal or stack stores" {
+    # Comment lines are stripped first: the notes explaining why these paths
+    # are excluded name the paths, and matching prose instead of code is how a
+    # guard like this reports a false failure.
+    run env PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+sed 's/#.*$//' "$PROJECT_ROOT/lib/clean/dev.sh" |
+    grep -nE '(safe_clean|mole_delete|clean_tool_cache|safe_remove)[^#]*(\.cabal/packages|\.stack/programs)' || true
+EOF
 
-    # Source and run the function
-    source "$PROJECT_ROOT/lib/core/common.sh"
-    source "$PROJECT_ROOT/lib/clean/dev.sh"
-    # shellcheck disable=SC2329
-    safe_clean() { :; }
-    clean_dev_haskell > /dev/null 2>&1 || true
-
-    # Verify the file still exists
-    [ -f "$HOME/.stack/programs/x86_64-osx/ghc-9.2.8.tar.xz" ]
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ -z "$output" ]] || {
+        echo "unexpected cleanup call site: $output"
+        return 1
+    }
 }
 
 @test "clean_dev_ocaml cleans opam cache" {

@@ -159,7 +159,7 @@ _detect_cask_via_caskroom_search() {
     local candidate existing seen
     for candidate in "${tokens[@]}"; do
         seen=false
-        for existing in "${uniq[@]}"; do
+        for existing in "${uniq[@]+"${uniq[@]}"}"; do
             if [[ "$candidate" == "$existing" ]]; then
                 seen=true
                 break

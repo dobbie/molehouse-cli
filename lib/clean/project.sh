@@ -27,6 +27,9 @@ readonly PURGE_CONFIG_FILE="$HOME/.config/mole/purge_paths"
 # Resolved search paths.
 PURGE_SEARCH_PATHS=()
 PURGE_CATEGORY_FULL_PATHS_ARRAY=()
+PURGE_CATEGORY_PROJECT_IDS_ARRAY=()
+PURGE_CATEGORY_PROJECT_PATHS_ARRAY=()
+PURGE_CATEGORY_SIZE_UNKNOWN_FLAGS_ARRAY=()
 
 # Project indicators for container detection.
 # Monorepo indicators (higher priority)
@@ -48,6 +51,24 @@ is_project_container() {
     [[ "$basename" == "Music" ]] && return 1
     [[ "$basename" == "Pictures" ]] && return 1
     [[ "$basename" == "Public" ]] && return 1
+
+    # A purge target is an artifact, never a container. A stray ~/node_modules
+    # is otherwise globbed as one: every npm package ships package.json, the
+    # first project indicator, so the maxdepth-2 probe matches immediately and
+    # each package becomes a "project root". The scan then starts below the
+    # artifact, so filter_nested_artifacts never sees node_modules itself and
+    # emits package-internal dist/ and build/ instead. Deleting those leaves
+    # the package half-installed: package.json stays, npm reports the tree as
+    # up to date, and recovery needs a network restore, which purge must never
+    # require (#1459). Same shape for vendor/ and Pods/. A container that
+    # happens to share an artifact name stays reachable through
+    # ~/.config/mole/purge_paths, which bypasses discovery.
+    local purge_target
+    for purge_target in "${PURGE_TARGETS[@]}"; do
+        if [[ "$basename" == "$purge_target" ]]; then
+            return 1
+        fi
+    done
 
     # Single find expression for indicators.
     local -a find_args=("$dir" "-maxdepth" "$max_depth" "(")
@@ -170,8 +191,22 @@ save_discovered_paths() {
 load_purge_config() {
     PURGE_SEARCH_PATHS=()
 
+    local line existing_path already_found
     while IFS= read -r line; do
-        [[ -n "$line" ]] && PURGE_SEARCH_PATHS+=("$line")
+        [[ -n "$line" ]] || continue
+        # mole_purge_read_paths_config already folds case variants to the
+        # on-disk path, so a config listing ~/code and ~/Code yields the
+        # same resolved string twice. Drop the duplicate here so downstream
+        # scans and the menu show each path once (#1416).
+        already_found=false
+        for existing_path in "${PURGE_SEARCH_PATHS[@]+"${PURGE_SEARCH_PATHS[@]}"}"; do
+            if [[ "$line" == "$existing_path" ]]; then
+                already_found=true
+                break
+            fi
+        done
+        [[ "$already_found" == "true" ]] && continue
+        PURGE_SEARCH_PATHS+=("$line")
     done < <(mole_purge_read_paths_config "$PURGE_CONFIG_FILE")
 
     if [[ ${#PURGE_SEARCH_PATHS[@]} -eq 0 ]]; then
@@ -272,16 +307,19 @@ is_safe_project_artifact() {
         return 1
     fi
 
-    if [[ "$path" != "$search_path/"* ]]; then
-        # fd may emit physical/canonical paths (for example /private/var)
-        # while configured search roots use symlink aliases (for example /var).
-        # Compare physical paths as a fallback to avoid false negatives.
+    local lexically_contained=false
+    [[ "$path" == "$search_path/"* ]] && lexically_contained=true
+
+    # Always compare existing directories physically. A lexical prefix alone
+    # is not containment when any ancestor is a symlink; it can otherwise turn
+    # a configured project root into authority over an unrelated directory.
+    # This also preserves aliases such as /var -> /private/var because both
+    # sides are resolved before the comparison.
+    if [[ -d "$path" && -d "$search_path" ]]; then
         local physical_path=""
         local physical_search_path=""
-        if [[ -d "$path" && -d "$search_path" ]]; then
-            physical_path=$(cd "$path" 2> /dev/null && pwd -P || echo "")
-            physical_search_path=$(cd "$search_path" 2> /dev/null && pwd -P || echo "")
-        fi
+        physical_path=$(cd "$path" 2> /dev/null && pwd -P) || return 1
+        physical_search_path=$(cd "$search_path" 2> /dev/null && pwd -P) || return 1
 
         if [[ -z "$physical_path" || -z "$physical_search_path" || "$physical_path" != "$physical_search_path/"* ]]; then
             return 1
@@ -289,6 +327,8 @@ is_safe_project_artifact() {
 
         path="$physical_path"
         search_path="$physical_search_path"
+    elif [[ "$lexically_contained" != "true" ]]; then
+        return 1
     fi
 
     # Must not be a direct child of the search root.
@@ -426,6 +466,9 @@ is_protected_purge_artifact() {
 scan_purge_targets() {
     local search_path="$1"
     local output_file="$2"
+    local target_output="${output_file}.targets"
+    local tag_output="${output_file}.tags"
+    local processed_output="${output_file}.processed"
     local min_depth="$PURGE_MIN_DEPTH_DEFAULT"
     local max_depth="$PURGE_MAX_DEPTH_DEFAULT"
     if [[ ! "$min_depth" =~ ^[0-9]+$ ]]; then
@@ -440,6 +483,12 @@ scan_purge_targets() {
     if [[ ! -d "$search_path" ]]; then
         return
     fi
+
+    # A scan result is publishable only after every producer and filter for the
+    # root completes. Keep the caller-visible file empty until that point so a
+    # timeout or read failure cannot turn a partial prefix into delete candidates.
+    : > "$output_file"
+    rm -f "$target_output" "$tag_output" "$processed_output" 2> /dev/null || true
 
     local cachedir_tag_min_depth=$((min_depth + 1))
     local cachedir_tag_max_depth=$((max_depth + 1))
@@ -462,23 +511,38 @@ scan_purge_targets() {
     process_scan_results() {
         local input_file="$1"
         if [[ -f "$input_file" ]]; then
-            while IFS= read -r item; do
-                # Check if we should abort (scanning file removed by Ctrl+C)
-                if [[ ! -f "$stats_dir/purge_scanning" ]]; then
-                    return
-                fi
+            local process_status=0
+            (
+                while IFS= read -r item; do
+                    # Check if we should abort (scanning file removed by Ctrl+C)
+                    if [[ ! -f "$stats_dir/purge_scanning" ]]; then
+                        exit 130
+                    fi
 
-                if [[ -n "$item" ]] && is_safe_project_artifact "$item" "$search_path"; then
-                    echo "$item"
-                    # Update scanning path to show current project directory
-                    local project_dir="${item%/*}"
-                    echo "$project_dir" > "$stats_dir/purge_scanning" 2> /dev/null || true
-                fi
-            done < "$input_file" | filter_nested_artifacts | filter_protected_artifacts > "$output_file"
-            rm -f "$input_file"
+                    if [[ -n "$item" ]] && is_safe_project_artifact "$item" "$search_path"; then
+                        echo "$item"
+                        # Update scanning path to show current project directory
+                        local project_dir="${item%/*}"
+                        echo "$project_dir" > "$stats_dir/purge_scanning" 2> /dev/null || true
+                    fi
+                done < "$input_file"
+            ) | filter_nested_artifacts | filter_protected_artifacts > "$processed_output" || process_status=$?
+
+            if [[ $process_status -ne 0 ]]; then
+                rm -f "$processed_output" 2> /dev/null || true
+                return "$process_status"
+            fi
+            if ! mv "$processed_output" "$output_file"; then
+                rm -f "$processed_output" 2> /dev/null || true
+                return 1
+            fi
         else
-            touch "$output_file"
+            return 1
         fi
+    }
+
+    cleanup_scan_outputs() {
+        rm -f "$target_output" "$tag_output" "$processed_output" 2> /dev/null || true
     }
 
     local use_find=true
@@ -524,14 +588,27 @@ scan_purge_targets() {
         # Empty scans are common in healthy project trees; falling back to find
         # doubles the scan cost and can make "nothing to clean" feel slow.
         local _scan_timeout="${MO_PURGE_SCAN_TIMEOUT_SEC:-60}"
-        if run_with_timeout "$_scan_timeout" fd "${fd_args[@]}" "$pattern" "$search_path" 2> /dev/null > "$output_file.raw"; then
+        local fd_status=0
+        run_with_timeout "$_scan_timeout" fd "${fd_args[@]}" "$pattern" "$search_path" \
+            2> /dev/null > "$target_output" || fd_status=$?
+        if [[ $fd_status -eq 0 ]]; then
             run_with_timeout "$_scan_timeout" fd "${fd_tag_args[@]}" "^${MOLE_CACHEDIR_TAG_NAME}$" "$search_path" \
-                2> /dev/null | emit_valid_cachedir_tag_dirs >> "$output_file.raw" || true
+                2> /dev/null > "$tag_output" || fd_status=$?
+        fi
+        if [[ $fd_status -eq 0 ]]; then
+            emit_valid_cachedir_tag_dirs < "$tag_output" >> "$target_output" || fd_status=$?
+        fi
+        if [[ $fd_status -eq 0 ]]; then
+            process_scan_results "$target_output" || fd_status=$?
+        fi
+        if [[ $fd_status -eq 0 ]]; then
             debug_log "Using fd for scanning"
-            process_scan_results "$output_file.raw"
+            cleanup_scan_outputs
             use_find=false
         else
-            debug_log "fd command failed, falling back to find"
+            debug_log "fd scan failed (status $fd_status), falling back to find"
+            cleanup_scan_outputs
+            : > "$output_file"
         fi
     fi
 
@@ -556,17 +633,31 @@ scan_purge_targets() {
         # Use plain `find` here for compatibility with environments where
         # `command find` behaves inconsistently in this complex expression.
         local _scan_timeout="${MO_PURGE_SCAN_TIMEOUT_SEC:-60}"
+        local find_status=0
         run_with_timeout "$_scan_timeout" find "$search_path" -mindepth "$min_depth" -maxdepth "$max_depth" -type d \
             \( "${prune_expr[@]}" \) -prune -o \
             \( "${target_expr[@]}" \) -print -prune \
-            2> /dev/null > "$output_file.raw" || true
+            2> /dev/null > "$target_output" || find_status=$?
 
-        run_with_timeout "$_scan_timeout" find "$search_path" -mindepth "$cachedir_tag_min_depth" -maxdepth "$cachedir_tag_max_depth" \
-            \( "${prune_expr[@]}" \) -prune -o \
-            -type f -name "$MOLE_CACHEDIR_TAG_NAME" -print \
-            2> /dev/null | emit_valid_cachedir_tag_dirs >> "$output_file.raw" || true
+        if [[ $find_status -eq 0 ]]; then
+            run_with_timeout "$_scan_timeout" find "$search_path" -mindepth "$cachedir_tag_min_depth" -maxdepth "$cachedir_tag_max_depth" \
+                \( "${prune_expr[@]}" \) -prune -o \
+                -type f -name "$MOLE_CACHEDIR_TAG_NAME" -print \
+                2> /dev/null > "$tag_output" || find_status=$?
+        fi
+        if [[ $find_status -eq 0 ]]; then
+            emit_valid_cachedir_tag_dirs < "$tag_output" >> "$target_output" || find_status=$?
+        fi
+        if [[ $find_status -eq 0 ]]; then
+            process_scan_results "$target_output" || find_status=$?
+        fi
 
-        process_scan_results "$output_file.raw"
+        cleanup_scan_outputs
+        if [[ $find_status -ne 0 ]]; then
+            : > "$output_file"
+            debug_log "find scan failed (status $find_status): $search_path"
+            return "$find_status"
+        fi
     fi
 }
 # Filter out nested artifacts (e.g. node_modules inside node_modules, .build inside build).
@@ -695,6 +786,16 @@ purge_target_activity_still_safe() {
     [[ "$_PURGE_ACTIVITY_STATE" == "old" || "$_PURGE_ACTIVITY_STATE" == "uncertain" ]]
 }
 
+# Final safe_remove hook for purge. Candidate identity is checked separately by
+# safe_remove; this hook rebinds the policy that depends on current contents so
+# a project cannot become active or protected in the last pre-delete window.
+_mole_purge_final_remove_guard() {
+    local path="$1"
+    is_safe_configured_purge_artifact "$path" || return 1
+    is_protected_purge_artifact "$path" && return 1
+    purge_target_activity_still_safe "$path" "${_MOLE_PURGE_FINAL_WAS_RECENT:-true}"
+}
+
 # Args: $1 - path
 # Get directory size in KB.
 get_dir_size_kb() {
@@ -741,6 +842,63 @@ get_dir_size_kb() {
         echo "ERROR"
     fi
 }
+
+# Resolve the owning project for a purge artifact. Monorepo indicators take
+# precedence so every artifact in one workspace shares the same identity.
+find_purge_project_root_for_artifact() {
+    local path="$1"
+    local current_dir="${path%/*}"
+    [[ -z "$current_dir" ]] && current_dir="/"
+    local monorepo_root=""
+    local project_root=""
+
+    while [[ "$current_dir" != "/" && "$current_dir" != "$HOME" && -n "$current_dir" ]]; do
+        if [[ -z "$monorepo_root" ]]; then
+            for indicator in "${MONOREPO_INDICATORS[@]}"; do
+                if [[ -e "$current_dir/$indicator" ]]; then
+                    monorepo_root="$current_dir"
+                    break
+                fi
+            done
+        fi
+
+        if [[ -z "$project_root" ]]; then
+            for indicator in "${PROJECT_INDICATORS[@]}"; do
+                if [[ -e "$current_dir/$indicator" ]]; then
+                    project_root="$current_dir"
+                    break
+                fi
+            done
+        fi
+
+        if [[ -n "$monorepo_root" ]]; then
+            break
+        fi
+
+        local relative_to_home="${current_dir#"$HOME"}"
+        local without_slashes="${relative_to_home//\//}"
+        local depth=$((${#relative_to_home} - ${#without_slashes}))
+        if [[ -n "$project_root" && $depth -lt 2 ]]; then
+            break
+        fi
+
+        local parent="${current_dir%/*}"
+        current_dir="${parent:-/}"
+    done
+
+    if [[ -n "$monorepo_root" ]]; then
+        printf '%s\n' "$monorepo_root"
+        return 0
+    fi
+
+    if [[ -n "$project_root" ]]; then
+        printf '%s\n' "$project_root"
+        return 0
+    fi
+
+    return 1
+}
+
 # Purge category selector.
 select_purge_categories() {
     local -a categories=("$@")
@@ -763,7 +921,9 @@ select_purge_categories() {
                 term_height=24
             fi
         fi
-        local reserved=8
+        # Title, footer context, full path, controls, and spacing. The project
+        # context can use two lines on narrow terminals.
+        local reserved=10
         local available=$((term_height - reserved))
         if [[ $available -lt 3 ]]; then
             echo 3
@@ -830,6 +990,7 @@ select_purge_categories() {
         [[ -n "$_prev_exit" ]] && eval "$_prev_exit"
         [[ -n "$_prev_int" ]] && eval "$_prev_int"
         [[ -n "$_prev_term" ]] && eval "$_prev_term"
+        return 0
     }
     # shellcheck disable=SC2329
     handle_interrupt() {
@@ -884,7 +1045,7 @@ select_purge_categories() {
             scroll_indicator=" ${GRAY}[${current_pos}/${total_items}]${NC}"
         fi
 
-        printf "%s${PURPLE_BOLD}Select Categories to Clean${NC}%s${GRAY}, ${selected_size_human}, ${selected_count} selected${NC}\n" "$clear_line" "$scroll_indicator"
+        printf "%s${PURPLE_BOLD}Select Artifacts to Purge${NC}%s${GRAY}, ${selected_size_human}, ${selected_count} selected${NC}\n" "$clear_line" "$scroll_indicator"
         printf "%s\n" "$clear_line"
 
         IFS=',' read -r -a recent_flags <<< "${PURGE_RECENT_CATEGORIES:-}"
@@ -897,21 +1058,83 @@ select_purge_categories() {
         for ((i = top_index; i < end_index; i++)); do
             local checkbox="$ICON_EMPTY"
             [[ ${selected[i]} == true ]] && checkbox="$ICON_SOLID"
+            local group_marker="─"
+            local row_project_id="${PURGE_CATEGORY_PROJECT_IDS_ARRAY[i]:-}"
+            if [[ -n "$row_project_id" ]]; then
+                local previous_same_project=false
+                local next_same_project=false
+                if [[ $i -gt 0 && "${PURGE_CATEGORY_PROJECT_IDS_ARRAY[i - 1]:-}" == "$row_project_id" ]]; then
+                    previous_same_project=true
+                fi
+                if [[ $i -lt $((total_items - 1)) && "${PURGE_CATEGORY_PROJECT_IDS_ARRAY[i + 1]:-}" == "$row_project_id" ]]; then
+                    next_same_project=true
+                fi
+                if [[ "$previous_same_project" == "true" && "$next_same_project" == "true" ]]; then
+                    group_marker="├"
+                elif [[ "$next_same_project" == "true" ]]; then
+                    group_marker="┌"
+                elif [[ "$previous_same_project" == "true" ]]; then
+                    group_marker="└"
+                fi
+            fi
             local recent_marker=""
             local _age="${age_labels[i]:-}"
             [[ -n "$_age" ]] && recent_marker=" ${GRAY}| ${_age}${NC}"
             local rel_pos=$((i - top_index))
             if [[ $rel_pos -eq $cursor_pos ]]; then
-                printf "%s${CYAN}${ICON_ARROW} %s %s%s${NC}\n" "$clear_line" "$checkbox" "${categories[i]}" "$recent_marker"
+                printf "%s${CYAN}${ICON_ARROW} %s %s %s%s${NC}\n" "$clear_line" "$checkbox" "$group_marker" "${categories[i]}" "$recent_marker"
             else
-                printf "%s  %s %s%s\n" "$clear_line" "$checkbox" "${categories[i]}" "$recent_marker"
+                printf "%s  %s %s %s%s\n" "$clear_line" "$checkbox" "$group_marker" "${categories[i]}" "$recent_marker"
             fi
         done
 
         # Keep one blank line between the list and footer tips.
         printf "%s\n" "$clear_line"
 
+        local _term_w
+        _term_w=$(tput cols 2> /dev/null || echo 80)
+        [[ "$_term_w" =~ ^[0-9]+$ ]] || _term_w=80
+
         local current_index=$((top_index + cursor_pos))
+        local current_project_id="${PURGE_CATEGORY_PROJECT_IDS_ARRAY[current_index]:-}"
+        local current_project_path="${PURGE_CATEGORY_PROJECT_PATHS_ARRAY[current_index]:-}"
+        if [[ -n "$current_project_path" ]]; then
+            local group_size=0
+            local group_item_count=0
+            local group_selected_count=0
+            local group_has_unknown_size=false
+            for ((i = 0; i < total_items; i++)); do
+                if { [[ -n "$current_project_id" ]] && [[ "${PURGE_CATEGORY_PROJECT_IDS_ARRAY[i]:-}" == "$current_project_id" ]]; } || { [[ -z "$current_project_id" ]] && [[ $i -eq $current_index ]]; }; then
+                    group_item_count=$((group_item_count + 1))
+                    group_size=$((group_size + ${sizes[i]:-0}))
+                    [[ ${selected[i]} == true ]] && group_selected_count=$((group_selected_count + 1))
+                    [[ "${PURGE_CATEGORY_SIZE_UNKNOWN_FLAGS_ARRAY[i]:-false}" == "true" ]] && group_has_unknown_size=true
+                fi
+            done
+
+            local group_size_label
+            group_size_label=$(bytes_to_human_kb "$group_size")
+            if [[ "$group_has_unknown_size" == "true" ]]; then
+                if [[ $group_size -gt 0 ]]; then
+                    group_size_label="${group_size_label} + unknown"
+                else
+                    group_size_label="unknown size"
+                fi
+            fi
+
+            local project_label="Project: "
+            local project_summary=" · ${group_size_label} · ${group_selected_count}/${group_item_count} selected"
+            local project_path_width=$((_term_w - ${#project_label} - ${#project_summary}))
+            if [[ $project_path_width -ge 12 ]]; then
+                printf "%s${GRAY}%s${NC}%s%s\n" "$clear_line" "$project_label" "$(compact_purge_menu_path "$current_project_path" "$project_path_width")" "$project_summary"
+            else
+                project_path_width=$((_term_w - ${#project_label}))
+                [[ $project_path_width -lt 4 ]] && project_path_width=4
+                printf "%s${GRAY}%s${NC}%s\n" "$clear_line" "$project_label" "$(compact_purge_menu_path "$current_project_path" "$project_path_width")"
+                printf "%s${GRAY}Group:${NC} %s · %s/%s selected\n" "$clear_line" "$group_size_label" "$group_selected_count" "$group_item_count"
+            fi
+        fi
+
         local current_full_path=""
         local paths_len="${#PURGE_CATEGORY_FULL_PATHS_ARRAY[@]}"
         if [[ "$paths_len" -gt 0 && "$current_index" -lt "$paths_len" ]]; then
@@ -923,33 +1146,36 @@ select_purge_categories() {
         fi
 
         # Adaptive footer hints, mirrors menu_paginated.sh pattern
-        local _term_w
-        _term_w=$(tput cols 2> /dev/null || echo 80)
-        [[ "$_term_w" =~ ^[0-9]+$ ]] || _term_w=80
-
         local _sep=" ${GRAY}|${NC} "
         local _nav="${GRAY}${ICON_NAV_UP}${ICON_NAV_DOWN}${NC}"
         local _space="${GRAY}Space Select${NC}"
         local _enter="${GRAY}Enter Confirm${NC}"
         local _all="${GRAY}A All${NC}"
         local _invert="${GRAY}I Invert${NC}"
+        local _skip_project="${GRAY}X Skip Project${NC}"
         local _quit="${GRAY}Q Quit${NC}"
 
         # Strip ANSI to measure real length
         _ph_len() { printf "%s" "$1" | LC_ALL=C awk '{gsub(/\033\[[0-9;]*[A-Za-z]/,""); printf "%d", length}'; }
 
-        # Level 0 (full): ↑↓ | Space Select | Enter Confirm | A All | I Invert | Q Quit
-        local _full="${_nav}${_sep}${_space}${_sep}${_enter}${_sep}${_all}${_sep}${_invert}${_sep}${_quit}"
+        # Level 0 (full): ↑↓ | Space Select | Enter Confirm | A All | I Invert | X Skip Project | Q Quit
+        local _full="${_nav}${_sep}${_space}${_sep}${_enter}${_sep}${_all}${_sep}${_invert}${_sep}${_skip_project}${_sep}${_quit}"
         if (($(_ph_len "$_full") <= _term_w)); then
             printf "%s${_full}${NC}\n" "$clear_line"
         else
-            # Level 1: ↑↓ | Enter Confirm | A All | I Invert | Q Quit
-            local _l1="${_nav}${_sep}${_enter}${_sep}${_all}${_sep}${_invert}${_sep}${_quit}"
+            # Level 1: ↑↓ | Enter Confirm | A All | X Skip Project | Q Quit
+            local _l1="${_nav}${_sep}${_enter}${_sep}${_all}${_sep}${_skip_project}${_sep}${_quit}"
             if (($(_ph_len "$_l1") <= _term_w)); then
                 printf "%s${_l1}${NC}\n" "$clear_line"
             else
-                # Level 2 (minimal): ↑↓ | Enter | Q Quit
-                printf "%s${_nav}${_sep}${_enter}${_sep}${_quit}${NC}\n" "$clear_line"
+                # Level 2: keep the project action discoverable on narrow terminals.
+                local _l2="${_nav}${_sep}${GRAY}Enter${NC}${_sep}${_skip_project}${_sep}${_quit}"
+                if (($(_ph_len "$_l2") <= _term_w)); then
+                    printf "%s${_l2}${NC}\n" "$clear_line"
+                else
+                    # Level 3 (minimal): ↑↓ | Enter | X Skip | Q
+                    printf "%s${_nav}${_sep}${GRAY}Enter${NC}${_sep}${GRAY}X Skip${NC}${_sep}${GRAY}Q${NC}\n" "$clear_line"
+                fi
             fi
         fi
 
@@ -1038,6 +1264,19 @@ select_purge_categories() {
                     fi
                 done
                 ;;
+            "x" | "X") # Deselect the current artifact's exact project
+                local current_index=$((top_index + cursor_pos))
+                local project_id="${PURGE_CATEGORY_PROJECT_IDS_ARRAY[current_index]:-}"
+                if [[ -n "$project_id" ]]; then
+                    for ((i = 0; i < total_items; i++)); do
+                        if [[ "${PURGE_CATEGORY_PROJECT_IDS_ARRAY[i]:-}" == "$project_id" ]]; then
+                            selected[i]=false
+                        fi
+                    done
+                else
+                    selected[current_index]=false
+                fi
+                ;;
             "q" | "Q" | $'\x03') # Quit or Ctrl-C
                 restore_terminal
                 return 1
@@ -1117,12 +1356,17 @@ confirm_purge_cleanup() {
     esac
 }
 
-# Main cleanup function - scans and prompts user to select artifacts to clean
+# Main cleanup function - scans and prompts user to select artifacts to clean.
+# Sets PURGE_RUN_OUTCOME to completed, no_candidates, cancelled, or scan_failed.
 clean_project_artifacts() {
+    PURGE_RUN_OUTCOME="completed"
     local -a all_found_items=()
     local -a safe_to_clean=()
     local -a safe_recent_flags=()
     local -a safe_activity_states=()
+    local -a safe_expected_parents=()
+    local -a safe_expected_parent_ids=()
+    local -a safe_expected_target_ids=()
     local previous_int_trap=""
     local previous_term_trap=""
     local trap_installed_by_this_call=false
@@ -1130,6 +1374,7 @@ clean_project_artifacts() {
     # Note: Declared without 'local' so cleanup_scan trap can access them
     scan_pids=()
     scan_temps=()
+    scan_roots=()
     _cleanup_scan_done=false
     # shellcheck disable=SC2329
     cleanup_scan() {
@@ -1141,7 +1386,7 @@ clean_project_artifacts() {
         done
         # Clean up temp files
         for temp in "${scan_temps[@]+"${scan_temps[@]}"}"; do
-            rm -f "$temp" 2> /dev/null || true
+            rm -f "$temp" "${temp}.targets" "${temp}.tags" "${temp}.processed" 2> /dev/null || true
         done
         # Clean up purge scanning file
         local stats_dir="${XDG_CACHE_HOME:-$HOME/.cache}/mole"
@@ -1154,23 +1399,64 @@ clean_project_artifacts() {
     previous_term_trap=$(trap -p TERM || true)
     trap cleanup_scan INT TERM
     trap_installed_by_this_call=true
+    local -a scan_statuses=()
+    local -a scan_root_parents=()
+    local -a scan_root_parent_ids=()
+    local -a scan_root_target_ids=()
+    local -a failed_scan_roots=()
+    local -a failed_scan_statuses=()
+    local failed_scan_count=0
+    local max_scan_jobs
+    max_scan_jobs=$(get_optimal_parallel_jobs io)
+    if ! [[ "$max_scan_jobs" =~ ^[0-9]+$ ]] || [[ "$max_scan_jobs" -lt 1 ]]; then
+        max_scan_jobs=1
+    elif [[ "$max_scan_jobs" -gt 4 ]]; then
+        max_scan_jobs=4
+    fi
+
+    _wait_for_purge_scan_batch() {
+        local pid
+        for pid in "${scan_pids[@]+"${scan_pids[@]}"}"; do
+            local scan_status=0
+            if wait "$pid" 2> /dev/null; then
+                scan_status=0
+            else
+                scan_status=$?
+            fi
+            scan_statuses+=("$scan_status")
+        done
+        scan_pids=()
+    }
+
     # Scanning is started from purge.sh with start_inline_spinner
-    # Launch all scans in parallel
+    # Keep root-level concurrency bounded because each fd scan has its own
+    # worker pool. Batches preserve launch-order alignment with scan_statuses.
     for path in "${PURGE_SEARCH_PATHS[@]}"; do
         if [[ -d "$path" ]]; then
+            if ! _mole_snapshot_path_identity "$path"; then
+                failed_scan_count=$((failed_scan_count + 1))
+                failed_scan_roots+=("$path")
+                failed_scan_statuses+=("1")
+                debug_log "Purge scan root identity unavailable: $path"
+                continue
+            fi
             local scan_output
             scan_output=$(mktemp)
             scan_temps+=("$scan_output")
+            scan_roots+=("$path")
+            scan_root_parents+=("$_MOLE_PATH_SNAPSHOT_PARENT")
+            scan_root_parent_ids+=("$_MOLE_PATH_SNAPSHOT_PARENT_ID")
+            scan_root_target_ids+=("$_MOLE_PATH_SNAPSHOT_TARGET_ID")
             # Launch scan in background for true parallelism
             scan_purge_targets "$path" "$scan_output" < /dev/null &
             local scan_pid=$!
             scan_pids+=("$scan_pid")
+            if [[ ${#scan_pids[@]} -ge $max_scan_jobs ]]; then
+                _wait_for_purge_scan_batch
+            fi
         fi
     done
-    # Wait for all scans to complete
-    for pid in "${scan_pids[@]+"${scan_pids[@]}"}"; do
-        wait "$pid" 2> /dev/null || true
-    done
+    _wait_for_purge_scan_batch
 
     # Stop the scanning monitor (removes purge_scanning file to signal completion)
     local stats_dir="${XDG_CACHE_HOME:-$HOME/.cache}/mole"
@@ -1185,11 +1471,40 @@ clean_project_artifacts() {
     # when overlapping search roots produce the same artifact many times.
     local dedupe_output
     dedupe_output=$(mktemp_file "mole-purge-dedupe") || return 1
-    for scan_output in "${scan_temps[@]+"${scan_temps[@]}"}"; do
-        if [[ -f "$scan_output" ]]; then
-            cat "$scan_output" >> "$dedupe_output"
-            rm -f "$scan_output"
+    local completed_scan_count=0
+    local scan_index
+    for ((scan_index = 0; scan_index < ${#scan_temps[@]}; scan_index++)); do
+        scan_output="${scan_temps[$scan_index]}"
+        local scan_status="${scan_statuses[$scan_index]:-1}"
+        if [[ $scan_status -eq 0 ]] && ! _mole_path_matches_identity \
+            "${scan_roots[$scan_index]}" \
+            "${scan_root_parents[$scan_index]}" \
+            "${scan_root_parent_ids[$scan_index]}" \
+            "${scan_root_target_ids[$scan_index]}"; then
+            scan_status=1
+            scan_statuses[scan_index]=1
+            debug_log "Purge scan root changed before results were collected: ${scan_roots[$scan_index]}"
         fi
+        if [[ $scan_status -eq 0 && ! -f "$scan_output" ]]; then
+            scan_status=1
+            scan_statuses[scan_index]=1
+        fi
+        if [[ $scan_status -eq 0 && -f "$scan_output" ]]; then
+            if cat "$scan_output" >> "$dedupe_output"; then
+                completed_scan_count=$((completed_scan_count + 1))
+            else
+                scan_status=1
+                scan_statuses[scan_index]=1
+                debug_log "Purge scan output unreadable: ${scan_roots[$scan_index]:-unknown root}"
+            fi
+        fi
+        if [[ $scan_status -ne 0 || ! -f "$scan_output" ]]; then
+            failed_scan_count=$((failed_scan_count + 1))
+            failed_scan_roots+=("${scan_roots[$scan_index]:-unknown root}")
+            failed_scan_statuses+=("$scan_status")
+            debug_log "Purge scan incomplete (status $scan_status): ${scan_roots[$scan_index]:-unknown root}"
+        fi
+        rm -f "$scan_output" "${scan_output}.targets" "${scan_output}.tags" "${scan_output}.processed" 2> /dev/null || true
     done
     if [[ -s "$dedupe_output" ]]; then
         while IFS= read -r item; do
@@ -1204,11 +1519,32 @@ clean_project_artifacts() {
         [[ -n "$previous_int_trap" ]] && eval "$previous_int_trap"
         [[ -n "$previous_term_trap" ]] && eval "$previous_term_trap"
     fi
+    if [[ $failed_scan_count -gt 0 ]]; then
+        local root_text="root"
+        [[ $failed_scan_count -ne 1 ]] && root_text="roots"
+        echo ""
+        echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped ${failed_scan_count} project scan ${root_text} because scanning did not complete:"
+        for ((scan_index = 0; scan_index < ${#failed_scan_roots[@]}; scan_index++)); do
+            local display_root="${failed_scan_roots[$scan_index]/#$HOME/~}"
+            echo -e "  ${GRAY}${display_root}${NC} (status ${failed_scan_statuses[$scan_index]:-1})"
+        done
+        echo -e "${GRAY}Re-run with 'mo purge --debug' to inspect the scan failure.${NC}"
+        if [[ $completed_scan_count -eq 0 ]]; then
+            printf '\n'
+            PURGE_RUN_OUTCOME="scan_failed"
+            return 0
+        fi
+    fi
     if [[ ${#all_found_items[@]} -eq 0 ]]; then
         echo ""
-        echo -e "${GREEN}${ICON_SUCCESS}${NC} Great! No old project artifacts to clean"
+        if [[ $failed_scan_count -gt 0 ]]; then
+            echo -e "${GRAY}No artifacts found in the completed project scans${NC}"
+        else
+            echo -e "${GREEN}${ICON_SUCCESS}${NC} Great! No old project artifacts to clean"
+        fi
         printf '\n'
-        return 2 # Special code: nothing to clean
+        PURGE_RUN_OUTCOME="no_candidates"
+        return 0
     fi
     # Mark recently modified items (for default selection state)
     if [[ -t 1 ]]; then
@@ -1222,6 +1558,58 @@ clean_project_artifacts() {
     fi
     local _PURGE_ACTIVITY_DEADLINE_EPOCH=$((_now_epoch + _activity_total_timeout))
     for item in "${all_found_items[@]}"; do
+        local candidate_bound=false
+        local candidate_parent=""
+        local candidate_parent_id=""
+        local candidate_target_id=""
+        local root_index
+        for ((root_index = 0; root_index < ${#scan_roots[@]}; root_index++)); do
+            [[ ${scan_statuses[$root_index]:-1} -eq 0 ]] || continue
+            if ! is_safe_project_artifact "$item" "${scan_roots[$root_index]}"; then
+                continue
+            fi
+            if ! _mole_path_matches_identity \
+                "${scan_roots[$root_index]}" \
+                "${scan_root_parents[$root_index]}" \
+                "${scan_root_parent_ids[$root_index]}" \
+                "${scan_root_target_ids[$root_index]}"; then
+                continue
+            fi
+            if [[ ! -d "$item" || -L "$item" ]] || ! _mole_snapshot_path_identity "$item"; then
+                continue
+            fi
+            candidate_parent="$_MOLE_PATH_SNAPSHOT_PARENT"
+            candidate_parent_id="$_MOLE_PATH_SNAPSHOT_PARENT_ID"
+            candidate_target_id="$_MOLE_PATH_SNAPSHOT_TARGET_ID"
+            # Bind the candidate only while both endpoints still match the
+            # completed scan. Rechecking the root after the candidate snapshot
+            # closes a replacement between those two observations.
+            if ! _mole_path_matches_identity \
+                "${scan_roots[$root_index]}" \
+                "${scan_root_parents[$root_index]}" \
+                "${scan_root_parent_ids[$root_index]}" \
+                "${scan_root_target_ids[$root_index]}"; then
+                continue
+            fi
+            if ! _mole_path_matches_identity \
+                "$item" "$candidate_parent" "$candidate_parent_id" "$candidate_target_id"; then
+                continue
+            fi
+            if ! is_safe_project_artifact "$item" "${scan_roots[$root_index]}"; then
+                continue
+            fi
+            candidate_bound=true
+            break
+        done
+        if [[ "$candidate_bound" != "true" ]]; then
+            debug_log "Skipping purge target whose scan identity changed: $item"
+            continue
+        fi
+        if is_protected_purge_artifact "$item"; then
+            debug_log "Skipping purge target that became protected after scanning: $item"
+            continue
+        fi
+
         local is_recent=false
         _PURGE_ACTIVITY_STATE="uncertain"
         if is_recently_modified "$item" "$_now_epoch"; then
@@ -1239,6 +1627,9 @@ clean_project_artifacts() {
         safe_to_clean+=("$item")
         safe_recent_flags+=("$is_recent")
         safe_activity_states+=("$activity_state")
+        safe_expected_parents+=("$candidate_parent")
+        safe_expected_parent_ids+=("$candidate_parent_id")
+        safe_expected_target_ids+=("$candidate_target_id")
     done
     if [[ -t 1 ]]; then
         stop_inline_spinner
@@ -1308,151 +1699,28 @@ clean_project_artifacts() {
     local -a item_recent_flags=()
     local -a item_age_labels=()
     local -a item_cloud_flags=()
-    # Find the best project root for an artifact once; callers decide how to
-    # display it. Monorepo indicators win over plain project indicators.
-    find_purge_project_root_for_artifact() {
-        local path="$1"
-        local current_dir="${path%/*}"
-        [[ -z "$current_dir" ]] && current_dir="/"
-        local monorepo_root=""
-        local project_root=""
-
-        while [[ "$current_dir" != "/" && "$current_dir" != "$HOME" && -n "$current_dir" ]]; do
-            if [[ -z "$monorepo_root" ]]; then
-                for indicator in "${MONOREPO_INDICATORS[@]}"; do
-                    if [[ -e "$current_dir/$indicator" ]]; then
-                        monorepo_root="$current_dir"
-                        break
-                    fi
-                done
-            fi
-
-            if [[ -z "$project_root" ]]; then
-                for indicator in "${PROJECT_INDICATORS[@]}"; do
-                    if [[ -e "$current_dir/$indicator" ]]; then
-                        project_root="$current_dir"
-                        break
-                    fi
-                done
-            fi
-
-            if [[ -n "$monorepo_root" ]]; then
-                break
-            fi
-
-            local _rel="${current_dir#"$HOME"}"
-            local _stripped="${_rel//\//}"
-            local depth=$((${#_rel} - ${#_stripped}))
-            if [[ -n "$project_root" && $depth -lt 2 ]]; then
-                break
-            fi
-
-            local _parent="${current_dir%/*}"
-            current_dir="${_parent:-/}"
-        done
-
-        if [[ -n "$monorepo_root" ]]; then
-            echo "$monorepo_root"
-            return 0
-        fi
-
-        if [[ -n "$project_root" ]]; then
-            echo "$project_root"
-            return 0
-        fi
-
-        return 1
-    }
-
-    # Helper to get project name from path.
-    get_project_name() {
-        local path="$1"
-        local project_root=""
-
-        if project_root=$(find_purge_project_root_for_artifact "$path"); then
-            echo "${project_root##*/}"
-            return
-        fi
-
-        local result=""
-        local search_roots=()
-        if [[ ${#PURGE_SEARCH_PATHS[@]} -gt 0 ]]; then
-            search_roots=("${PURGE_SEARCH_PATHS[@]}")
-        else
-            search_roots=("$HOME/www" "$HOME/dev" "$HOME/Projects")
-        fi
-        for root in "${search_roots[@]}"; do
-            root="${root%/}"
-            if [[ -n "$root" && "$path" == "$root/"* ]]; then
-                local relative_path="${path#"$root"/}"
-                result="${relative_path%%/*}"
-                break
-            fi
-        done
-
-        if [[ -z "$result" ]]; then
-            local _gp="${path%/*}"
-            _gp="${_gp%/*}"
-            result="${_gp##*/}"
-        fi
-
-        echo "$result"
-    }
-
-    # Helper to get project path (more complete than just project name).
-    get_project_path() {
-        local path="$1"
-        local project_root=""
-        if ! project_root=$(find_purge_project_root_for_artifact "$path"); then
-            project_root="${path%/*}"
-        fi
-        echo "${project_root/#$HOME/~}"
-    }
-
+    local -a item_expected_parents=()
+    local -a item_expected_parent_ids=()
+    local -a item_expected_target_ids=()
     # Helper to get artifact display name
     # For duplicate artifact names within same project, include parent directory for context
-    # Uses pre-computed _cached_basenames and _cached_project_names arrays when available.
     get_artifact_display_name() {
         local path="$1"
+        local item_index="$2"
         local artifact_name="${path##*/}"
         local parent_name="${path%/*}"
         parent_name="${parent_name##*/}"
-
-        local project_name
-        if [[ -n "${_cached_project_names[*]+x}" ]]; then
-            # Fast path: use pre-computed cache
-            local _idx
-            project_name=""
-            for _idx in "${!safe_to_clean[@]}"; do
-                if [[ "${safe_to_clean[$_idx]}" == "$path" ]]; then
-                    project_name="${_cached_project_names[$_idx]}"
-                    break
-                fi
-            done
-        else
-            project_name=$(get_project_name "$path")
-        fi
+        local project_name="${_cached_project_names[item_index]}"
 
         # Check if there are other items with same artifact name AND same project
         local has_duplicate=false
-        if [[ -n "${_cached_basenames[*]+x}" ]]; then
-            local _idx
-            for _idx in "${!safe_to_clean[@]}"; do
-                if [[ "${safe_to_clean[$_idx]}" != "$path" && "${_cached_basenames[$_idx]}" == "$artifact_name" && "${_cached_project_names[$_idx]}" == "$project_name" ]]; then
-                    has_duplicate=true
-                    break
-                fi
-            done
-        else
-            for other_item in "${safe_to_clean[@]}"; do
-                if [[ "$other_item" != "$path" && "${other_item##*/}" == "$artifact_name" ]]; then
-                    if [[ "$(get_project_name "$other_item")" == "$project_name" ]]; then
-                        has_duplicate=true
-                        break
-                    fi
-                fi
-            done
-        fi
+        local other_index
+        for other_index in "${!safe_to_clean[@]}"; do
+            if [[ "$other_index" != "$item_index" && "${_cached_basenames[other_index]}" == "$artifact_name" && "${_cached_project_names[other_index]}" == "$project_name" ]]; then
+                has_duplicate=true
+                break
+            fi
+        done
 
         # If duplicate exists in same project and parent is not the project itself, show parent/artifact
         if [[ "$has_duplicate" == "true" && "$parent_name" != "$project_name" && "$parent_name" != "." && "$parent_name" != "/" ]]; then
@@ -1481,8 +1749,8 @@ clean_project_artifacts() {
         if [[ -n "$max_path_width" ]]; then
             available_width="$max_path_width"
         else
-            # Standalone fallback: overhead = prefix(4)+space(1)+size(9)+sep(3)+artifact_col+recent(9) = artifact_col+26
-            local fixed_width=$((artifact_col + 26))
+            # Standalone fallback: include the two-column project-group marker.
+            local fixed_width=$((artifact_col + 28))
             available_width=$((terminal_width - fixed_width))
 
             local min_width=10
@@ -1520,16 +1788,29 @@ clean_project_artifacts() {
         # Format: "project_path  size | artifact_type"
         printf "%-*s %9s | %-*s" "$printf_width" "$truncated_path" "$size_str" "$artifact_col" "$artifact_type"
     }
-    # Pre-compute basenames and project names once so get_artifact_display_name()
-    # can avoid repeated filesystem traversals during the O(N^2) duplicate check.
+    # Resolve project ownership once per artifact. An indicator-backed root is
+    # preferred. Without one, the artifact's direct parent is the narrowest
+    # exact ownership boundary we can prove without grouping unrelated paths.
+    # The physical identity is authoritative; display text is never a selector.
     local -a _cached_basenames=()
     local -a _cached_project_names=()
     local -a _cached_project_paths=()
+    local -a _cached_project_identities=()
     local _pre_idx
     for _pre_idx in "${!safe_to_clean[@]}"; do
-        _cached_basenames[_pre_idx]="${safe_to_clean[$_pre_idx]##*/}"
-        _cached_project_names[_pre_idx]=$(get_project_name "${safe_to_clean[$_pre_idx]}")
-        _cached_project_paths[_pre_idx]=$(get_project_path "${safe_to_clean[$_pre_idx]}")
+        local artifact_path="${safe_to_clean[$_pre_idx]}"
+        local project_root=""
+        _cached_basenames[_pre_idx]="${artifact_path##*/}"
+        if project_root=$(find_purge_project_root_for_artifact "$artifact_path"); then
+            _cached_project_names[_pre_idx]="${project_root##*/}"
+            _cached_project_paths[_pre_idx]="${project_root/#$HOME/~}"
+            _cached_project_identities[_pre_idx]=$(mole_path_identity "$project_root")
+        else
+            project_root="${artifact_path%/*}"
+            _cached_project_names[_pre_idx]="${project_root##*/}"
+            _cached_project_paths[_pre_idx]="${project_root/#$HOME/~}"
+            _cached_project_identities[_pre_idx]=$(mole_path_identity "$project_root")
+        fi
     done
 
     # Build menu options - one line per artifact
@@ -1538,12 +1819,14 @@ clean_project_artifacts() {
     local -a raw_project_paths=()
     local -a raw_artifact_types=()
     local -a item_display_paths=()
+    local -a item_project_identities=()
+    local -a item_project_paths=()
     local _sz_idx=0
     for item in "${safe_to_clean[@]}"; do
         local item_index=$_sz_idx
         local project_path="${_cached_project_paths[$item_index]}"
         local artifact_type
-        artifact_type=$(get_artifact_display_name "$item")
+        artifact_type=$(get_artifact_display_name "$item" "$item_index")
         local size_raw
         size_raw=$(cat "${_size_tmpfiles[$item_index]}" 2> /dev/null || echo "0")
         rm -f "${_size_tmpfiles[$item_index]}" 2> /dev/null || true
@@ -1586,10 +1869,15 @@ clean_project_artifacts() {
         raw_artifact_types+=("$artifact_type")
         item_paths+=("$item")
         item_display_paths+=("$display_item_path")
+        item_project_identities+=("${_cached_project_identities[$item_index]}")
+        item_project_paths+=("$display_project_path")
         item_sizes+=("$size_kb")
         item_size_unknown_flags+=("$size_unknown")
         item_recent_flags+=("$is_recent")
         item_cloud_flags+=("$is_cloud")
+        item_expected_parents+=("${safe_expected_parents[$item_index]}")
+        item_expected_parent_ids+=("${safe_expected_parent_ids[$item_index]}")
+        item_expected_target_ids+=("${safe_expected_target_ids[$item_index]}")
         # Build human-readable age label (bash 3.2 compatible, no assoc arrays).
         local _mod_time _age_secs _age_d
         _mod_time=$(get_file_mtime "$item" 2> /dev/null || echo "0")
@@ -1630,8 +1918,8 @@ clean_project_artifacts() {
     [[ $max_artifact_width -lt 6 ]] && max_artifact_width=6
     [[ $max_artifact_width -gt 17 ]] && max_artifact_width=17
 
-    # Exact overhead: prefix(4) + space(1) + size(9) + " | "(3) + artifact_col + " | 11mo"(7) = artifact_col + 24
-    local fixed_overhead=$((max_artifact_width + 26))
+    # Include the two-column project-group marker in the selector prefix.
+    local fixed_overhead=$((max_artifact_width + 28))
     local available_for_path=$((terminal_width - fixed_overhead))
 
     local min_path_width=10
@@ -1661,22 +1949,70 @@ clean_project_artifacts() {
         menu_options+=("$(format_purge_display "${raw_project_paths[idx]}" "${raw_artifact_types[idx]}" "$size_human_val" "$terminal_width" "$max_path_display_width" "$max_artifact_width")")
     done
 
-    # Sort by size descending (largest first) - requested in issue #311
-    # Use external sort for better performance with many items
+    # Keep every exact project together. Project groups are ordered by their
+    # aggregate known size, then artifacts within each group by item size. Only
+    # numeric local indices cross the sort boundary; canonical path identities
+    # remain in their aligned shell arrays.
     if [[ ${#item_sizes[@]} -gt 0 ]]; then
-        # Create temporary file with index|size pairs
-        local sort_temp
-        sort_temp=$(mktemp)
-        for ((i = 0; i < ${#item_sizes[@]}; i++)); do
-            printf '%d|%d\n' "$i" "${item_sizes[i]}"
-        done > "$sort_temp"
+        local -a group_project_identities=()
+        local -a group_total_sizes=()
+        local -a item_group_indices=()
+        local group_index
 
-        # Sort by size (field 2) descending, extract indices
+        # Sort an injective, line-safe encoding of each identity once, then
+        # assign adjacent rows to the same group. This keeps grouping O(n log n)
+        # when a large workspace contains hundreds of distinct projects.
+        local grouping_temp
+        grouping_temp=$(mktemp)
+        for ((i = 0; i < ${#item_sizes[@]}; i++)); do
+            local encoded_identity="${item_project_identities[i]}"
+            encoded_identity="${encoded_identity//%/%25}"
+            encoded_identity="${encoded_identity//|/%7C}"
+            encoded_identity="${encoded_identity//$'\n'/%0A}"
+            printf '%s|%d|%d\n' "$encoded_identity" "$i" "${item_sizes[i]}"
+        done > "$grouping_temp"
+
+        local previous_encoded_identity=""
+        local have_previous_identity=false
+        while IFS='|' read -r encoded_identity i item_size; do
+            if [[ "$have_previous_identity" != "true" || "$encoded_identity" != "$previous_encoded_identity" ]]; then
+                group_index=${#group_project_identities[@]}
+                group_project_identities+=("${item_project_identities[i]}")
+                group_total_sizes+=(0)
+                previous_encoded_identity="$encoded_identity"
+                have_previous_identity=true
+            fi
+            item_group_indices[i]=$group_index
+            group_total_sizes[group_index]=$((group_total_sizes[group_index] + item_size))
+        done < <(LC_ALL=C sort -t'|' -k1,1 -k2,2n "$grouping_temp")
+        rm -f "$grouping_temp" # SAFE: this is the exact scratch file created by mktemp above.
+
+        local group_sort_temp
+        group_sort_temp=$(mktemp)
+        for ((group_index = 0; group_index < ${#group_project_identities[@]}; group_index++)); do
+            printf '%d|%d\n' "$group_index" "${group_total_sizes[group_index]}"
+        done > "$group_sort_temp"
+
+        local -a group_ranks=()
+        local group_rank=0
+        while IFS='|' read -r group_index group_total_size; do
+            group_ranks[group_index]=$group_rank
+            group_rank=$((group_rank + 1))
+        done < <(sort -t'|' -k2,2nr -k1,1n "$group_sort_temp")
+        rm -f "$group_sort_temp"
+
+        local item_sort_temp
+        item_sort_temp=$(mktemp)
+        for ((i = 0; i < ${#item_sizes[@]}; i++)); do
+            group_index=${item_group_indices[i]}
+            printf '%d|%d|%d\n' "${group_ranks[group_index]}" "${item_sizes[i]}" "$i"
+        done > "$item_sort_temp"
+
         local -a sorted_indices=()
-        while IFS='|' read -r idx size; do
+        while IFS='|' read -r group_rank size idx; do
             sorted_indices+=("$idx")
-        done < <(sort -t'|' -k2,2nr "$sort_temp")
-        rm -f "$sort_temp"
+        done < <(sort -t'|' -k1,1n -k2,2nr -k3,3n "$item_sort_temp")
+        rm -f "$item_sort_temp"
 
         # Rebuild arrays in sorted order
         local -a sorted_menu_options=()
@@ -1685,8 +2021,13 @@ clean_project_artifacts() {
         local -a sorted_item_size_unknown_flags=()
         local -a sorted_item_recent_flags=()
         local -a sorted_item_display_paths=()
+        local -a sorted_item_project_identities=()
+        local -a sorted_item_project_paths=()
         local -a sorted_item_age_labels=()
         local -a sorted_item_cloud_flags=()
+        local -a sorted_item_expected_parents=()
+        local -a sorted_item_expected_parent_ids=()
+        local -a sorted_item_expected_target_ids=()
 
         for idx in "${sorted_indices[@]}"; do
             sorted_menu_options+=("${menu_options[idx]}")
@@ -1695,8 +2036,13 @@ clean_project_artifacts() {
             sorted_item_size_unknown_flags+=("${item_size_unknown_flags[idx]}")
             sorted_item_recent_flags+=("${item_recent_flags[idx]}")
             sorted_item_display_paths+=("${item_display_paths[idx]}")
+            sorted_item_project_identities+=("${item_project_identities[idx]}")
+            sorted_item_project_paths+=("${item_project_paths[idx]}")
             sorted_item_age_labels+=("${item_age_labels[idx]}")
             sorted_item_cloud_flags+=("${item_cloud_flags[idx]}")
+            sorted_item_expected_parents+=("${item_expected_parents[idx]}")
+            sorted_item_expected_parent_ids+=("${item_expected_parent_ids[idx]}")
+            sorted_item_expected_target_ids+=("${item_expected_target_ids[idx]}")
         done
 
         # Replace original arrays with sorted versions
@@ -1706,8 +2052,13 @@ clean_project_artifacts() {
         item_size_unknown_flags=("${sorted_item_size_unknown_flags[@]}")
         item_recent_flags=("${sorted_item_recent_flags[@]}")
         item_display_paths=("${sorted_item_display_paths[@]}")
+        item_project_identities=("${sorted_item_project_identities[@]}")
+        item_project_paths=("${sorted_item_project_paths[@]}")
         item_age_labels=("${sorted_item_age_labels[@]}")
         item_cloud_flags=("${sorted_item_cloud_flags[@]}")
+        item_expected_parents=("${sorted_item_expected_parents[@]}")
+        item_expected_parent_ids=("${sorted_item_expected_parent_ids[@]}")
+        item_expected_target_ids=("${sorted_item_expected_target_ids[@]}")
     fi
     if [[ -t 1 ]]; then
         stop_inline_spinner
@@ -1718,6 +2069,7 @@ clean_project_artifacts() {
         echo ""
         echo -e "${GRAY}No artifacts found to purge${NC}"
         printf '\n'
+        PURGE_RUN_OUTCOME="no_candidates"
         return 0
     fi
     # Set global vars for selector
@@ -1736,11 +2088,18 @@ clean_project_artifacts() {
     # Interactive selection (only if terminal is available)
     PURGE_SELECTION_RESULT=""
     PURGE_CATEGORY_FULL_PATHS_ARRAY=("${item_display_paths[@]}")
+    PURGE_CATEGORY_PROJECT_IDS_ARRAY=("${item_project_identities[@]}")
+    PURGE_CATEGORY_PROJECT_PATHS_ARRAY=("${item_project_paths[@]}")
+    PURGE_CATEGORY_SIZE_UNKNOWN_FLAGS_ARRAY=("${item_size_unknown_flags[@]}")
     if [[ -t 0 ]]; then
         if ! select_purge_categories "${menu_options[@]}"; then
             PURGE_CATEGORY_FULL_PATHS_ARRAY=()
+            PURGE_CATEGORY_PROJECT_IDS_ARRAY=()
+            PURGE_CATEGORY_PROJECT_PATHS_ARRAY=()
+            PURGE_CATEGORY_SIZE_UNKNOWN_FLAGS_ARRAY=()
             unset PURGE_CATEGORY_SIZES PURGE_RECENT_CATEGORIES PURGE_AGE_LABELS PURGE_SELECTION_RESULT
-            return 1
+            PURGE_RUN_OUTCOME="cancelled"
+            return 0
         fi
     else
         # Non-interactive: select all non-recent items
@@ -1767,7 +2126,11 @@ clean_project_artifacts() {
         echo -e "${GRAY}No items selected${NC}"
         printf '\n'
         PURGE_CATEGORY_FULL_PATHS_ARRAY=()
+        PURGE_CATEGORY_PROJECT_IDS_ARRAY=()
+        PURGE_CATEGORY_PROJECT_PATHS_ARRAY=()
+        PURGE_CATEGORY_SIZE_UNKNOWN_FLAGS_ARRAY=()
         unset PURGE_CATEGORY_SIZES PURGE_RECENT_CATEGORIES PURGE_AGE_LABELS PURGE_SELECTION_RESULT
+        PURGE_RUN_OUTCOME="cancelled"
         return 0
     fi
     IFS=',' read -r -a selected_indices <<< "$PURGE_SELECTION_RESULT"
@@ -1793,11 +2156,18 @@ clean_project_artifacts() {
             echo -e "${GRAY}Purge cancelled${NC}"
             printf '\n'
             PURGE_CATEGORY_FULL_PATHS_ARRAY=()
+            PURGE_CATEGORY_PROJECT_IDS_ARRAY=()
+            PURGE_CATEGORY_PROJECT_PATHS_ARRAY=()
+            PURGE_CATEGORY_SIZE_UNKNOWN_FLAGS_ARRAY=()
             unset PURGE_CATEGORY_SIZES PURGE_RECENT_CATEGORIES PURGE_AGE_LABELS PURGE_SELECTION_RESULT
-            return 1
+            PURGE_RUN_OUTCOME="cancelled"
+            return 0
         fi
     fi
     PURGE_CATEGORY_FULL_PATHS_ARRAY=()
+    PURGE_CATEGORY_PROJECT_IDS_ARRAY=()
+    PURGE_CATEGORY_PROJECT_PATHS_ARRAY=()
+    PURGE_CATEGORY_SIZE_UNKNOWN_FLAGS_ARRAY=()
 
     # Clean selected items
     echo ""
@@ -1816,8 +2186,20 @@ clean_project_artifacts() {
             size_human=$(bytes_to_human "$((size_kb * 1024))")
         fi
         # Safety checks
+        local expected_parent="${item_expected_parents[idx]}"
+        local expected_parent_id="${item_expected_parent_ids[idx]}"
+        local expected_target_id="${item_expected_target_ids[idx]}"
+        if ! _mole_path_matches_identity \
+            "$item_path" "$expected_parent" "$expected_parent_id" "$expected_target_id"; then
+            echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped $display_item_path (path changed after review)"
+            continue
+        fi
         if ! is_safe_configured_purge_artifact "$item_path"; then
             debug_log "Skipping purge target outside configured safe roots: ${item_path:-<empty>}"
+            continue
+        fi
+        if is_protected_purge_artifact "$item_path"; then
+            debug_log "Skipping purge target that became protected after review: $item_path"
             continue
         fi
         if ! purge_target_activity_still_safe "$item_path" "${item_recent_flags[idx]:-true}"; then
@@ -1829,7 +2211,10 @@ clean_project_artifacts() {
         fi
         local removal_recorded=false
         if [[ -e "$item_path" ]]; then
-            if safe_remove "$item_path" true; then
+            local _MOLE_PURGE_FINAL_WAS_RECENT="${item_recent_flags[idx]:-true}"
+            local _MOLE_SAFE_REMOVE_FINAL_GUARD="_mole_purge_final_remove_guard"
+            if safe_remove "$item_path" true "$size_kb" "" \
+                "$expected_parent" "$expected_parent_id" "$expected_target_id"; then
                 if [[ "$dry_run_mode" == "1" || ! -e "$item_path" ]]; then
                     local current_total
                     current_total=$(cat "$stats_dir/purge_stats" 2> /dev/null || echo "0")

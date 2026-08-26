@@ -1041,7 +1041,7 @@ write_install_channel_metadata() {
     }
 }
 
-# CLI parsing (supports main/latest and version tokens).
+# CLI parsing (supports main, the legacy latest alias, and version tokens).
 parse_args() {
     local -a args=("$@")
     local version_token=""
@@ -1323,7 +1323,7 @@ download_binary() {
         # downgrade). Explicit source builds remain available via
         # MOLE_VERSION=main / MOLE_EDGE_INSTALL=true.
         log_error "Verification failed for ${binary_name}; aborting instead of falling back to an unverified build"
-        log_error "Retry later, or opt into a source build explicitly: MOLE_VERSION=main ./install.sh (piping from curl: | bash -s latest)"
+        log_error "Retry later, or opt into a source build explicitly: MOLE_VERSION=main ./install.sh (piping from curl: | bash -s -- main)"
         return 1
     fi
     rm -f "$staged_path"
@@ -1348,7 +1348,7 @@ download_binary() {
             # or a corrupted checksums file, not of unavailability. Only a
             # plain download failure may continue into the source build.
             log_error "Verification failed for ${binary_name} from ${fallback_tag}; aborting instead of falling back to an unverified build"
-            log_error "Retry later, or opt into a source build explicitly: MOLE_VERSION=main ./install.sh (piping from curl: | bash -s latest)"
+            log_error "Retry later, or opt into a source build explicitly: MOLE_VERSION=main ./install.sh (piping from curl: | bash -s -- main)"
             return 1
         fi
         rm -f "$staged_path"

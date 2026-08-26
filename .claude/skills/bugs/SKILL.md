@@ -1,11 +1,13 @@
 ---
 name: bugs
-description: "Mole's project-specific defect catalog: twelve recurring bug shapes, grep probes, and regression guards. Use when reviewing, auditing, debugging, or accepting a contributed PR in Mole. Not for generic review workflow or unrelated repositories."
+description: "Mole's project-specific incident catalog: twelve recurring bug shapes, grep probes, and regression guards. Use when a Mole symptom or diff touches destructive candidates or guards, uncertain discovery, bounded scans or TTY, Bash 3.2 or system parsing, stale derivations, inconsistent totals, silent progress, test validity, or refusal diagnostics. Not for generic review preflight, unrelated documentation or release-copy work, or other repositories."
 ---
 
 # Mole bug patterns
 
 Use this project-specific catalog after reading the current diff and code. Generic pattern sweeps belong to Waza `check` Pattern-Fix Completeness; root-causing a live symptom belongs to `hunt`.
+
+Load only the archetypes signaled by the symptom or touched surface, then use their probes to sweep siblings. A whole-project audit should classify surfaces before opening sections instead of treating all twelve as a mandatory checklist. Read [references/shell-and-test-pitfalls.md](references/shell-and-test-pitfalls.md) only for Shell code, Bats tests, install/update flows, timeout wrappers, TTY handling, plist fixtures, or macOS-specific CI.
 
 ## How to use the catalog
 

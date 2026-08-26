@@ -77,6 +77,10 @@ readonly MOLE_PURGE_MONOREPO_INDICATORS=(
     "pnpm-workspace.yaml"
     "nx.json"
     "rush.json"
+    # A repository or worktree is the project-wide ownership boundary even
+    # when nested packages have their own manifests. Keep .git in the project
+    # indicators too because container discovery consumes that list directly.
+    ".git"
 )
 
 readonly MOLE_PURGE_PROJECT_INDICATORS=(
@@ -172,10 +176,18 @@ mole_purge_quick_hint_target_names() {
 # On case-insensitive macOS (APFS), ~/Code and ~/code point to the same
 # directory but with different display names.  This function returns the
 # real (on-disk) path so that string comparisons work correctly for dedup.
+#
+# Uses the external /bin/pwd rather than the bash builtin: bash's `pwd -P`
+# resolves symlink chains in $PWD but reuses the casing of the `cd`
+# argument instead of querying the filesystem, so on case-insensitive APFS
+# it returns ~/Workspace even when the on-disk directory is ~/workspace.
+# That breaks the string dedup in discover_project_dirs and a project
+# appears twice (#1416). /bin/pwd calls getcwd(3), which returns the real
+# on-disk name.
 mole_purge_resolve_path_case() {
     local path="$1"
     if [[ -d "$path" ]]; then
-        (cd "$path" 2> /dev/null && pwd -P) || printf '%s\n' "$path"
+        (cd "$path" 2> /dev/null && /bin/pwd -P) || printf '%s\n' "$path"
     else
         printf '%s\n' "$path"
     fi

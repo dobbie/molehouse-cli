@@ -39,6 +39,24 @@ setup() {
 	mkdir -p "$HOME"
 }
 
+@test "find_app_files never treats shared XDG roots as Local app leftovers (#1446)" {
+	mkdir -p "$HOME/.Local/bin"
+	mkdir -p "$HOME/Library/Application Support/Local"
+	touch "$HOME/.Local/bin/unrelated-cli"
+	touch "$HOME/Library/Application Support/Local/app-state"
+
+	result="$(
+		HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+find_app_files "com.getflywheel.lightning.local" "Local"
+EOF
+	)"
+
+	[[ "$result" != *"$HOME/.Local"* ]] || { echo "leaked shared ~/.local root"; exit 1; }
+	[[ "$result" == *"$HOME/Library/Application Support/Local"* ]] || { echo "missed Local app state"; exit 1; }
+}
+
 @test "find_app_files preserves Android Studio project source and credentials" {
 	mkdir -p "$HOME/AndroidStudioProjects/my-app"
 	mkdir -p "$HOME/.android/avd/Pixel_5.avd"

@@ -238,7 +238,13 @@ teardown() {
     printf 'shm' > "$db-shm"
 
     for path in "$db" "$db-wal" "$db-shm"; do
-        run /bin/bash -c "source '$PROJECT_ROOT/lib/core/common.sh'; validate_path_for_deletion '$path'"
+        run env PROJECT_ROOT="$PROJECT_ROOT" path="$path" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+lsof() { return 0; }
+run_with_timeout() { shift; "$@"; }
+validate_path_for_deletion "$path"
+EOF
         [ "$status" -eq 1 ] || return 1
     done
 }
@@ -270,6 +276,136 @@ source "$PROJECT_ROOT/lib/core/common.sh"
 lsof() { return 1; }
 run_with_timeout() { shift; "$@"; }
 validate_path_for_deletion "$db"
+EOF
+
+    [ "$status" -eq 0 ]
+}
+
+@test "validate_path_for_deletion allows stale SQLite -shm files (#1439)" {
+    local db="$TEST_DIR/stale-sqlite/Cache.db"
+    mkdir -p "$(dirname "$db")"
+    printf 'db' > "$db"
+    printf 'shm' > "$db-shm"
+
+    for path in "$db" "$db-shm"; do
+        run env PROJECT_ROOT="$PROJECT_ROOT" path="$path" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+lsof() { return 1; }
+run_with_timeout() { shift; "$@"; }
+validate_path_for_deletion "$path"
+EOF
+        [ "$status" -eq 0 ] || return 1
+    done
+}
+
+@test "validate_path_for_deletion refuses a SQLite cache directory when lsof is inconclusive (#1439)" {
+    local cache_dir="$HOME/Library/Caches/com.example.UnknownSQLite"
+    local db="$cache_dir/Cache.db"
+    mkdir -p "$cache_dir"
+    printf 'db' > "$db"
+    printf 'shm' > "$db-shm"
+
+    run env PROJECT_ROOT="$PROJECT_ROOT" cache_dir="$cache_dir" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+_mole_user_cache_owner_process_state() { return 1; }
+lsof() { return 1; }
+run_with_timeout() { return 124; }
+validate_path_for_deletion "$cache_dir"
+EOF
+
+    [ "$status" -eq 1 ]
+}
+
+@test "validate_path_for_deletion checks every supported SQLite name inside a cache directory (#1439)" {
+    local filename=""
+    for filename in state.sqlite state.sqlite3 STATE.SQLITE .hidden.sqlite; do
+        local cache_dir="$HOME/Library/Caches/com.example.${filename//[^A-Za-z0-9]/_}"
+        mkdir -p "$cache_dir"
+        printf 'db' > "$cache_dir/$filename"
+
+        run env PROJECT_ROOT="$PROJECT_ROOT" cache_dir="$cache_dir" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+_mole_user_cache_owner_process_state() { return 1; }
+lsof() { return 0; }
+run_with_timeout() { shift; "$@"; }
+validate_path_for_deletion "$cache_dir"
+EOF
+
+        [ "$status" -eq 1 ] || return 1
+    done
+}
+
+@test "SQLite cache directory guard isolates caller nullglob and failglob on Bash 3.2 (#1439)" {
+    local cache_dir="$HOME/Library/Caches/com.example.EmptySQLite"
+    mkdir -p "$cache_dir"
+
+    run env PROJECT_ROOT="$PROJECT_ROOT" cache_dir="$cache_dir" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+_mole_user_cache_owner_process_state() { return 1; }
+shopt -s nullglob failglob
+validate_path_for_deletion "$cache_dir"
+shopt -q nullglob
+shopt -q failglob
+EOF
+
+    [ "$status" -eq 0 ]
+}
+
+@test "SQLite cache directory guard ignores and restores caller GLOBIGNORE (#1439)" {
+    local cache_dir="$HOME/Library/Caches/com.example.GlobIgnoreSQLite"
+    mkdir -p "$cache_dir"
+    printf 'db' > "$cache_dir/state.db"
+
+    run env PROJECT_ROOT="$PROJECT_ROOT" cache_dir="$cache_dir" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+_mole_user_cache_owner_process_state() { return 1; }
+lsof() { return 0; }
+run_with_timeout() { shift; "$@"; }
+export GLOBIGNORE='*.db'
+validation_state=0
+validate_path_for_deletion "$cache_dir" || validation_state=$?
+# Every assertion exits explicitly. `set -e` does NOT abort a script bash reads
+# from stdin, which is exactly how this heredoc is fed, so a bare `[[ ... ]]`
+# here is decorative: it fails, execution continues, and the test still passes.
+[[ $validation_state -eq 1 ]] || exit 1
+[[ "$GLOBIGNORE" == '*.db' ]] || exit 1
+[[ "$(declare -p GLOBIGNORE)" == 'declare -x GLOBIGNORE='* ]] || exit 1
+shopt -q dotglob || exit 1
+EOF
+
+    [ "$status" -eq 0 ]
+}
+
+@test "SQLite cache directory guard probes each database family once (#1439)" {
+    local cache_dir="$HOME/Library/Caches/com.example.OneSQLiteFamily"
+    local db="$cache_dir/Cache.db"
+    mkdir -p "$cache_dir"
+    printf 'db' > "$db"
+    printf 'wal' > "$db-wal"
+    printf 'shm' > "$db-shm"
+
+    run env PROJECT_ROOT="$PROJECT_ROOT" cache_dir="$cache_dir" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+_mole_user_cache_owner_process_state() { return 1; }
+# Counted through a file, not a variable: the probe reads lsof's stdout, so it
+# runs inside a command substitution and a subshell counter never comes back.
+lsof_log=$(mktemp)
+lsof() { printf 'call\n' >> "$lsof_log"; return 1; }
+run_with_timeout() { shift; "$@"; }
+guard_state=0
+_mole_should_refuse_live_user_cache_path "$cache_dir" || guard_state=$?
+[[ $guard_state -eq 1 ]] || exit 1
+# One call for the whole Cache.db / -wal / -shm family. If family dedup breaks,
+# each member is probed as its own family and this becomes 3.
+lsof_calls=$(wc -l < "$lsof_log" | tr -d ' ')
+rm -f "$lsof_log"
+[[ $lsof_calls -eq 1 ]] || exit 1
 EOF
 
     [ "$status" -eq 0 ]
@@ -1009,26 +1145,30 @@ SCRIPT
     run env PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'SCRIPT'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
-# `remaining` is `deadline - SECONDS`, and SECONDS keeps ticking in real
-# time, so one shared `SECONDS=100` before four forks means the last call
-# sees a smaller window than the first. On a slow runner the window reached
-# zero, the helper returned 124 with no output, and the case failed for
-# reasons that had nothing to do with clamping. Re-pin the clock per call.
+# `remaining` is `deadline - SECONDS`, and SECONDS keeps ticking in real time.
+# Re-pinning the clock per call narrowed the race but did not close it: with a
+# deadline one second out, a command-substitution fork that straddles a second
+# boundary leaves remaining at zero, and the helper returns 124 with no output.
+# That is what reddened this case twice on loaded runners. A five-second window
+# gives each fork five times the slack while every assertion below keeps its
+# exact meaning: 30.5 and 08.5 still clamp because their whole parts are >= 5,
+# 0.5 still passes through because its whole part is not, and 0 still reports
+# the remaining window.
 SECONDS=100
-printf 'CLAMPED=%s\n' "$(_mole_timeout_with_deadline 30.5 101)"
+printf 'CLAMPED=%s\n' "$(_mole_timeout_with_deadline 30.5 105)"
 SECONDS=100
-printf 'SHORT=%s\n' "$(_mole_timeout_with_deadline 0.5 101)"
+printf 'SHORT=%s\n' "$(_mole_timeout_with_deadline 0.5 105)"
 SECONDS=100
-printf 'ZERO=%s\n' "$(_mole_timeout_with_deadline 0 101)"
+printf 'ZERO=%s\n' "$(_mole_timeout_with_deadline 0 105)"
 SECONDS=100
-printf 'LEADING=%s\n' "$(_mole_timeout_with_deadline 08.5 101)"
+printf 'LEADING=%s\n' "$(_mole_timeout_with_deadline 08.5 105)"
 SCRIPT
 
     [ "$status" -eq 0 ] || return 1
-    [[ "$output" == *"CLAMPED=1"* ]] || return 1
+    [[ "$output" == *"CLAMPED=5"* ]] || return 1
     [[ "$output" == *"SHORT=0.5"* ]] || return 1
-    [[ "$output" == *"ZERO=1"* ]] || return 1
-    [[ "$output" == *"LEADING=1"* ]]
+    [[ "$output" == *"ZERO=5"* ]] || return 1
+    [[ "$output" == *"LEADING=5"* ]]
 }
 
 @test "get_path_size_kb bounds the app metadata fast path" {

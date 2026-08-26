@@ -93,7 +93,7 @@ scan_file=$(create_temp_file)
 materialize_completed_system_scan "$scan_file" 1 "$PRODUCER"
 record=""
 IFS= read -r -d '' record < "$scan_file" || true
-[[ "$record" == $'/Volumes/Backup/line\nbreak.inProgress' ]]
+[[ "$record" == $'/Volumes/Backup/line\nbreak.inProgress' ]] || exit 1
 printf 'PRESERVED\n'
 rm -f -- "$scan_file"
 SCRIPT
@@ -798,9 +798,9 @@ brew() {
 }
 
 clean_homebrew
-[[ -L "$TEST_BREW_PREFIX/bin/node" ]]
-[[ "$(readlink "$TEST_BREW_PREFIX/bin/node")" == "../Cellar/node/26.4.0/bin/node" ]]
-[[ "$(readlink "$TEST_BREW_PREFIX/bin/npx")" == "../Cellar/node/26.5.0/bin/npx" ]]
+[[ -L "$TEST_BREW_PREFIX/bin/node" ]] || exit 1
+[[ "$(readlink "$TEST_BREW_PREFIX/bin/node")" == "../Cellar/node/26.4.0/bin/node" ]] || exit 1
+[[ "$(readlink "$TEST_BREW_PREFIX/bin/npx")" == "../Cellar/node/26.5.0/bin/npx" ]] || exit 1
 [[ -x "$node_target" || -f "$node_target" ]]
 EOF
 
@@ -983,8 +983,8 @@ BREW_ACTIVE_LINK_TARGETS=("$target")
 BREW_ACTIVE_RESOLVED_TARGETS=("$target")
 
 restore_homebrew_active_links
-[[ -L "$link_path" ]]
-[[ "$(readlink "$link_path")" == "$target" ]]
+[[ -L "$link_path" ]] || exit 1
+[[ "$(readlink "$link_path")" == "$target" ]] || exit 1
 grep -Fq "/bin/ln -s $target $link_path" "$calls"
 EOF
 

@@ -60,7 +60,7 @@ Issue reporters and PR contributors this cycle: @handle1 · @handle2.
 
 ### Mole Mac App
 
-Prefer a GUI? Try [Mole Mac App](https://mole.fit). The CLI stays free and open source.
+Prefer a GUI? [Mole Mac App](https://mole.fit/) brings cleaning, app management, maintenance, disk analysis, and live system status into one native app, with review before deletion and a customizable menu bar HUD. It is $19 once, with lifetime updates and a 14-day refund. [Download and try it](https://mole.fit/download). The CLI stays free and open source.
 ```
 
 No `---` separators between sections, and no trailing repository link; the published pages end on the Mole Mac App line.
@@ -77,7 +77,7 @@ No `---` separators between sections, and no trailing repository link; the publi
 - **Do not describe overview icons that no longer exist**. Analyze overview rows are text-only because emoji width and baselines vary across terminals. If icons return later, they must not imply that user data such as iOS Backups, Xcode Archives, or Old Downloads is safe to delete.
 - **Verify every command mentioned in the notes actually exists in HEAD**. The deleted `mo check` / `mo doctor` commands nearly shipped in notes as a "feature" after they were removed.
 - **An incident or troubleshooting note is one sentence of symptom plus one command**. No cause taxonomy, no command per branch; the user needs the one line that gets them unstuck. Match the previous release's language treatment for that note: if the last release carried it in one language, do not add a second.
-- **Keep the Mole Mac App cross-link only if it matches the current release style**. Do not turn it into a sales block.
+- **Keep the Mole Mac App cross-link to one restrained, fact-backed paragraph**. Validate the product scope, price, updates, refund window, and download URL against the current homepage before publishing.
 
 ## Publish
 

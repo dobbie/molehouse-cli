@@ -262,7 +262,7 @@ bundle_has_installed_app() { return 0; }
 note_activity() { :; }
 
 live_output=$(show_user_launch_agent_hint_notice)
-[[ "$live_output" != *"Stale login item"* ]]
+[[ "$live_output" != *"Stale login item"* ]] || exit 1
 
 chmod -x "$UPDATER"
 show_user_launch_agent_hint_notice

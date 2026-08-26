@@ -22,6 +22,360 @@ teardown_file() {
     fi
 }
 
+make_gh_cache_stub() {
+    mkdir -p "$HOME/bin"
+    cat > "$HOME/bin/gh" <<'SCRIPT'
+#!/bin/bash
+printf '%s\n' "$*" >> "$GH_TRACE"
+if [[ "${GH_TRACE_CACHE_ROOT:-0}" == "1" ]]; then
+    printf 'ROOT:%s\n' "${XDG_CACHE_HOME:-<unset>}" >> "$GH_TRACE"
+fi
+if [[ "$*" == "config clear-cache --help" ]]; then
+    if [[ -n "${GH_SWAP_LINK:-}" && -n "${GH_SWAP_TARGET:-}" ]]; then
+        /bin/unlink "$GH_SWAP_LINK"
+        /bin/ln -s "$GH_SWAP_TARGET" "$GH_SWAP_LINK"
+    fi
+    if [[ -n "${GH_REPLACE_ROOT:-}" && -n "${GH_REPLACE_TARGET:-}" ]]; then
+        /bin/mv "$GH_REPLACE_ROOT" "$GH_REPLACE_ROOT-old"
+        /bin/ln -s "$GH_REPLACE_TARGET" "$GH_REPLACE_ROOT"
+    fi
+    exit "${GH_HELP_RC:-0}"
+fi
+if [[ "$*" == "config clear-cache" ]]; then
+    exit "${GH_CLEAR_RC:-0}"
+fi
+exit 2
+SCRIPT
+    chmod +x "$HOME/bin/gh"
+}
+
+@test "clean_github_cli_cache uses gh owner command for the default cache" {
+    local trace="$HOME/gh-default.trace"
+    mkdir -p "$HOME/.cache/gh"
+    make_gh_cache_stub
+
+    run env HOME="$HOME" PATH="$HOME/bin:/usr/bin:/bin" PROJECT_ROOT="$PROJECT_ROOT" \
+        GH_TRACE="$trace" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+DRY_RUN=false
+run_with_timeout() { shift; "$@"; }
+is_path_whitelisted() { return 1; }
+should_protect_path() { return 1; }
+clean_tool_cache() {
+    local description="$1"
+    local cache_path="$2"
+    shift 2
+    printf 'CACHE:%s|%s\n' "$description" "$cache_path"
+    "$@"
+}
+clean_github_cli_cache
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"GitHub CLI cache"* ]] || return 1
+    [ "$(grep -cFx 'config clear-cache --help' "$trace")" -eq 1 ] || return 1
+    [ "$(grep -cFx 'config clear-cache' "$trace")" -eq 1 ] || return 1
+}
+
+@test "clean_github_cli_cache dry-run never invokes the mutating command" {
+    local trace="$HOME/gh-dry-run.trace"
+    mkdir -p "$HOME/.cache/gh"
+    make_gh_cache_stub
+
+    run env HOME="$HOME" PATH="$HOME/bin:/usr/bin:/bin" PROJECT_ROOT="$PROJECT_ROOT" \
+        GH_TRACE="$trace" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+DRY_RUN=true
+run_with_timeout() { shift; "$@"; }
+is_path_whitelisted() { return 1; }
+should_protect_path() { return 1; }
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+note_activity() { :; }
+clean_github_cli_cache
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"GitHub CLI cache · would clean"* ]] || return 1
+    [ "$(grep -cFx 'config clear-cache --help' "$trace")" -eq 1 ] || return 1
+    run grep -qFx 'config clear-cache' "$trace"
+    [ "$status" -eq 1 ] || return 1
+}
+
+@test "clean_github_cli_cache honors custom XDG cache whitelists" {
+    local trace="$HOME/gh-xdg-whitelist.trace"
+    local xdg_cache="$HOME/custom-cache"
+    mkdir -p "$xdg_cache/gh"
+    make_gh_cache_stub
+
+    run env HOME="$HOME" XDG_CACHE_HOME="$xdg_cache" PATH="$HOME/bin:/usr/bin:/bin" \
+        PROJECT_ROOT="$PROJECT_ROOT" GH_TRACE="$trace" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+DRY_RUN=false
+is_path_whitelisted() { [[ "$1" == "$XDG_CACHE_HOME/gh" ]]; }
+should_protect_path() { return 1; }
+note_activity() { :; }
+clean_github_cli_cache
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"GitHub CLI cache · skipped (whitelist)"* ]] || return 1
+    [ ! -e "$trace" ] || return 1
+}
+
+@test "clean_github_cli_cache honors the physical target of a symlinked XDG root" {
+    local trace="$HOME/gh-xdg-symlink.trace"
+    local physical_cache="$HOME/physical-cache"
+    mkdir -p "$physical_cache/gh"
+    ln -s "$physical_cache" "$HOME/xdg-cache"
+    make_gh_cache_stub
+
+    run env HOME="$HOME" XDG_CACHE_HOME="$HOME/xdg-cache" PATH="$HOME/bin:/usr/bin:/bin" \
+        PROJECT_ROOT="$PROJECT_ROOT" GH_TRACE="$trace" PHYSICAL_CACHE="$physical_cache/gh" \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+DRY_RUN=false
+is_path_whitelisted() { [[ "$1" == "$PHYSICAL_CACHE" ]]; }
+should_protect_path() { return 1; }
+note_activity() { :; }
+clean_github_cli_cache
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"GitHub CLI cache · skipped (whitelist)"* ]] || return 1
+    [ ! -e "$trace" ] || return 1
+}
+
+@test "clean_github_cli_cache binds the owner command to the verified physical root" {
+    local trace="$HOME/gh-xdg-swap.trace"
+    local physical_cache="$HOME/physical-cache"
+    local swapped_cache="$HOME/swapped-cache"
+    local xdg_link="$HOME/xdg-cache"
+    rm -rf "$physical_cache" "$swapped_cache" "$xdg_link"
+    mkdir -p "$physical_cache/gh" "$swapped_cache/gh"
+    ln -s "$physical_cache" "$xdg_link"
+    make_gh_cache_stub
+
+    run env HOME="$HOME" XDG_CACHE_HOME="$xdg_link" PATH="$HOME/bin:/usr/bin:/bin" \
+        PROJECT_ROOT="$PROJECT_ROOT" GH_TRACE="$trace" GH_TRACE_CACHE_ROOT=1 \
+        GH_SWAP_LINK="$xdg_link" GH_SWAP_TARGET="$swapped_cache" \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+DRY_RUN=false
+is_path_whitelisted() { return 1; }
+should_protect_path() { return 1; }
+note_activity() { :; }
+clean_github_cli_cache
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ "$(grep -cFx "ROOT:$physical_cache" "$trace")" -eq 2 ] || return 1
+    run grep -qFx "ROOT:$swapped_cache" "$trace"
+    [ "$status" -eq 1 ] || return 1
+    local link_target
+    link_target=$(readlink "$xdg_link" 2> /dev/null || true)
+    [ "$link_target" = "$swapped_cache" ] || {
+        printf 'expected swapped link %s, got %s\n' "$swapped_cache" "${link_target:-<missing>}"
+        return 1
+    }
+}
+
+@test "clean_github_cli_cache rejects a replaced physical root at the owner command" {
+    local trace="$HOME/gh-physical-root-swap.trace"
+    local physical_cache="$HOME/replaceable-cache"
+    local swapped_cache="$HOME/replacement-cache"
+    rm -rf "$physical_cache" "$physical_cache-old" "$swapped_cache"
+    mkdir -p "$physical_cache/gh" "$swapped_cache/gh"
+    make_gh_cache_stub
+
+    run env HOME="$HOME" XDG_CACHE_HOME="$physical_cache" PATH="$HOME/bin:/usr/bin:/bin" \
+        PROJECT_ROOT="$PROJECT_ROOT" GH_TRACE="$trace" \
+        GH_REPLACE_ROOT="$physical_cache" GH_REPLACE_TARGET="$swapped_cache" \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+DRY_RUN=false
+is_path_whitelisted() { return 1; }
+should_protect_path() { return 1; }
+note_activity() { :; }
+clean_github_cli_cache
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ "$(grep -cFx 'config clear-cache --help' "$trace")" -eq 1 ] || return 1
+    run grep -qFx 'config clear-cache' "$trace"
+    [ "$status" -eq 1 ] || return 1
+    [ -L "$physical_cache" ] || return 1
+    [ -d "$swapped_cache/gh" ] || return 1
+}
+
+@test "clean_github_cli_cache refuses when gh starts at the owner command boundary" {
+    local trace="$HOME/gh-process-race.trace"
+    rm -rf "$HOME/.cache/gh"
+    rm -f "$trace"
+    mkdir -p "$HOME/.cache/gh"
+    make_gh_cache_stub
+
+    run env HOME="$HOME" PATH="$HOME/bin:/usr/bin:/bin" PROJECT_ROOT="$PROJECT_ROOT" \
+        GH_TRACE="$trace" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+DRY_RUN=false
+run_with_timeout() { shift; "$@"; }
+is_path_whitelisted() { return 1; }
+should_protect_path() { return 1; }
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+note_activity() { :; }
+mole_defer_cleanup_family() { printf 'DEFER:%s\n' "$1"; }
+pgrep_calls=0
+pgrep() {
+    pgrep_calls=$((pgrep_calls + 1))
+    [[ $pgrep_calls -ge 2 ]]
+}
+clean_github_cli_cache
+printf 'PGREP_CALLS=%s\n' "$pgrep_calls"
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"DEFER:GitHub CLI"* ]] || return 1
+    [[ "$output" == *"PGREP_CALLS=2"* ]] || return 1
+    [ "$(grep -cFx 'config clear-cache --help' "$trace")" -eq 1 ] || return 1
+    run grep -qFx 'config clear-cache' "$trace"
+    [ "$status" -eq 1 ] || return 1
+}
+
+@test "clean_github_cli_cache preserves a symlinked cache leaf" {
+    local trace="$HOME/gh-leaf-symlink.trace"
+    local cache_target="$HOME/relocated-gh-cache"
+    rm -rf "$HOME/.cache/gh" "$cache_target"
+    mkdir -p "$HOME/.cache" "$cache_target"
+    ln -s "$cache_target" "$HOME/.cache/gh"
+    make_gh_cache_stub
+
+    run env HOME="$HOME" PATH="$HOME/bin:/usr/bin:/bin" PROJECT_ROOT="$PROJECT_ROOT" \
+        GH_TRACE="$trace" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+DRY_RUN=false
+debug_log() { printf 'DEBUG:%s\n' "$*"; }
+clean_github_cli_cache
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"cache leaf is not a real directory"* ]] || return 1
+    [ -L "$HOME/.cache/gh" ] || return 1
+    [ ! -e "$trace" ] || return 1
+}
+
+@test "clean_github_cli_cache rejects unsafe XDG paths before probing gh" {
+    local trace="$HOME/gh-invalid-xdg.trace"
+    make_gh_cache_stub
+
+    run env HOME="$HOME" XDG_CACHE_HOME="relative/cache" PATH="$HOME/bin:/usr/bin:/bin" \
+        PROJECT_ROOT="$PROJECT_ROOT" GH_TRACE="$trace" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+DRY_RUN=false
+debug_log() { printf 'DEBUG:%s\n' "$*" >&2; }
+clean_github_cli_cache
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"unsafe XDG_CACHE_HOME"* ]] || return 1
+    [ ! -e "$trace" ] || return 1
+}
+
+@test "clean_dev_cloud continues when gh cache clearing fails" {
+    local trace="$HOME/gh-failure.trace"
+    rm -rf "$HOME/.cache/gh"
+    rm -f "$trace"
+    mkdir -p "$HOME/.cache/gh"
+    make_gh_cache_stub
+
+    run env HOME="$HOME" PATH="$HOME/bin:/usr/bin:/bin" PROJECT_ROOT="$PROJECT_ROOT" \
+        GH_TRACE="$trace" GH_CLEAR_RC=2 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+DRY_RUN=false
+run_with_timeout() { shift; "$@"; }
+is_path_whitelisted() { return 1; }
+should_protect_path() { return 1; }
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+note_activity() { :; }
+safe_clean() { printf 'SAFE:%s\n' "$2"; }
+clean_dev_cloud
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ "$(grep -cFx 'config clear-cache' "$trace")" -eq 1 ] || return 1
+    [[ "$output" == *"GitHub CLI cache · stopped (owner cleanup failed)"* ]] || return 1
+    [[ "$output" == *"SAFE:AWS CLI cache"* ]] || return 1
+    [[ "$output" == *"SAFE:Google Cloud logs"* ]] || return 1
+}
+
+@test "clean_dev_cloud stops on GitHub CLI probe or clear cancellation" {
+    local failure_phase failure_rc
+    for failure_phase in help clear; do
+        for failure_rc in 124 130; do
+            local trace="$HOME/gh-$failure_phase-$failure_rc.trace"
+            local help_rc=0
+            local clear_rc=0
+            if [[ "$failure_phase" == "help" ]]; then
+                help_rc="$failure_rc"
+            else
+                clear_rc="$failure_rc"
+            fi
+            rm -rf "$HOME/.cache/gh"
+            rm -f "$trace"
+            mkdir -p "$HOME/.cache/gh"
+            make_gh_cache_stub
+
+            run env HOME="$HOME" PATH="$HOME/bin:/usr/bin:/bin" PROJECT_ROOT="$PROJECT_ROOT" \
+                GH_TRACE="$trace" GH_HELP_RC="$help_rc" GH_CLEAR_RC="$clear_rc" \
+                MOLE_CURRENT_COMMAND=clean MOLE_CLEAN_CANCEL_STATUS=0 \
+                /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+DRY_RUN=false
+run_with_timeout() { shift; "$@"; }
+is_path_whitelisted() { return 1; }
+should_protect_path() { return 1; }
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+note_activity() { :; }
+safe_clean() { printf 'UNEXPECTED:%s\n' "$2"; }
+set +e
+_run_developer_cleanup_step clean_dev_cloud
+rc=$?
+set -e
+printf 'RC=%s CANCEL=%s\n' "$rc" "$MOLE_CLEAN_CANCEL_STATUS"
+EOF
+
+            [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+            [[ "$output" == *"RC=$failure_rc CANCEL=$failure_rc"* ]] || return 1
+            [[ "$output" != *"UNEXPECTED:"* ]] || return 1
+        done
+    done
+}
+
 @test "clean_dev_npm prunes pnpm store without deleting orphaned global store" {
     # Real file on PATH so type -P prefers the stub over any host pnpm.
     mkdir -p "$HOME/bin"
@@ -1426,9 +1780,175 @@ EOF
     [[ "$output" == *"PHP Composer cache|"* ]]
 }
 
+@test "PyInstaller cleanup keeps non-bincache state" {
+    local cache_root="$HOME/Library/Application Support/pyinstaller"
+    mkdir -p "$cache_root/bincache00py311" "$cache_root/hooks"
+    printf 'state\n' > "$cache_root/config.json"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+pyinstaller_build_process_state() { return 1; }
+safe_clean() {
+    local description="${!#}"
+    while [[ $# -gt 1 ]]; do
+        printf 'CLEAN=%s|%s\n' "$description" "$1"
+        shift
+    done
+}
+clean_pyinstaller_bincache
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"CLEAN=PyInstaller binary cache|$cache_root/bincache00py311"* ]] || return 1
+    [[ "$output" != *"$cache_root/hooks"* ]] || return 1
+    [[ "$output" != *"$cache_root/config.json"* ]]
+}
+
+@test "PyInstaller cleanup reaches the guarded deletion sink" {
+    local cache_root="$HOME/Library/Application Support/pyinstaller"
+    mkdir -p "$cache_root/bincache00py310"
+    printf 'cache\n' > "$cache_root/bincache00py310/module.bin"
+    printf 'keep\n' > "$cache_root/config.json"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/clean.sh"
+DRY_RUN=false
+pyinstaller_build_process_state() { return 1; }
+clean_pyinstaller_bincache
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ ! -e "$cache_root/bincache00py310" ] || return 1
+    [ -f "$cache_root/config.json" ]
+}
+
+@test "PyInstaller cleanup fails closed when the process state is unknown" {
+    local cache_root="$HOME/Library/Application Support/pyinstaller"
+    mkdir -p "$cache_root/bincache00py312"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+pyinstaller_build_process_state() { return 2; }
+safe_clean() { printf 'UNEXPECTED_CLEAN=%s\n' "$1"; }
+note_activity() { :; }
+clean_pyinstaller_bincache
+EOF
+
+    if [[ -L "$cache_root" && -d "$cache_root-original" ]]; then
+        /bin/unlink "$cache_root"
+        /bin/mv "$cache_root-original" "$cache_root"
+    fi
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"PyInstaller binary cache · stopped (process state unknown)"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_CLEAN="* ]]
+}
+
+@test "PyInstaller cleanup rechecks the process at the deletion boundary" {
+    local cache_root="$HOME/Library/Application Support/pyinstaller"
+    mkdir -p "$cache_root/bincache00py313"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+probe_calls=0
+pyinstaller_build_process_state() {
+    probe_calls=$((probe_calls + 1))
+    [[ $probe_calls -eq 1 ]] && return 1
+    return 0
+}
+mole_defer_cleanup_family() { printf 'DEFER=%s\n' "$1"; }
+safe_clean() { printf 'UNEXPECTED_CLEAN=%s\n' "$1"; }
+safe_clean_guarded() {
+    local guard="$1"
+    shift
+    "$guard" "$1" || return 75
+    safe_clean "$@"
+}
+clean_pyinstaller_bincache
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"DEFER=PyInstaller"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_CLEAN="* ]]
+}
+
+@test "PyInstaller cleanup rejects a root replaced before deletion" {
+    local cache_root="$HOME/Library/Application Support/pyinstaller"
+    local outside_root="$HOME/outside-pyinstaller"
+    mkdir -p "$cache_root/bincache00py314" "$outside_root/bincache00py314"
+    printf 'keep\n' > "$outside_root/bincache00py314/private-data"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+pyinstaller_build_process_state() { return 1; }
+safe_clean() { printf 'UNEXPECTED_CLEAN=%s\n' "$1"; }
+safe_clean_guarded() {
+    local guard="$1"
+    shift
+    local cache_root="$HOME/Library/Application Support/pyinstaller"
+    /bin/mv "$cache_root" "$cache_root-original"
+    /bin/ln -s "$HOME/outside-pyinstaller" "$cache_root"
+    "$guard" "$1" || return 75
+    safe_clean "$@"
+}
+note_activity() { :; }
+clean_pyinstaller_bincache
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"PyInstaller binary cache · stopped (process or cache path state unknown)"* ]] || return 1
+    [[ "$output" != *"UNEXPECTED_CLEAN="* ]] || return 1
+    [ -f "$outside_root/bincache00py314/private-data" ]
+}
+
+@test "Clang cleanup uses the macOS cache root and keeps symlink entries" {
+    local darwin_cache="$HOME/darwin-cache"
+    local cache_root="$darwin_cache/clang"
+    local outside_root="$HOME/outside-clang"
+    mkdir -p "$cache_root/module-cache" "$cache_root/.locks" "$outside_root/private-data"
+    ln -s "$outside_root" "$cache_root/redirected"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DARWIN_CACHE="$darwin_cache" \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+mole_darwin_user_cache_root() { printf '%s\n' "$DARWIN_CACHE"; }
+clang_module_cache_process_state() { return 1; }
+safe_clean() {
+    local description="${!#}"
+    while [[ $# -gt 1 ]]; do
+        printf 'CLEAN=%s|%s\n' "$description" "$1"
+        shift
+    done
+}
+clean_clang_module_cache
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"CLEAN=Clang module cache|$cache_root/module-cache"* ]] || return 1
+    [[ "$output" == *"CLEAN=Clang module cache|$cache_root/.locks"* ]] || return 1
+    [[ "$output" != *"$cache_root/redirected"* ]] || return 1
+    [ -d "$outside_root/private-data" ]
+}
+
 @test "clean_dev_rust honors CARGO_HOME and RUSTUP_HOME when absolute" {
     # mise and friends relocate cargo/rustup via env; hardcoded ~/.cargo misses
-    # the live cache (issue #1378). Scope stays regenerable leaves only.
+    # the live cache (issue #1378). Scope stays redundant download copies only.
+    mkdir -p \
+        "$HOME/.local/share/mise/cargo/registry/cache" \
+        "$HOME/.local/share/mise/cargo/registry/src" \
+        "$HOME/.local/share/mise/cargo/git"
+
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" \
         CARGO_HOME="$HOME/.local/share/mise/cargo" \
         RUSTUP_HOME="$HOME/.local/share/mise/rustup" \
@@ -1437,18 +1957,53 @@ set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/dev.sh"
 safe_clean() { echo "$2|$1"; }
+mole_cleanup_targets_exist() { return 0; }
+rust_build_process_state() { return 1; }
 clean_dev_rust
 EOF
 
     [ "$status" -eq 0 ]
     [[ "$output" == *"Rust cargo cache|$HOME/.local/share/mise/cargo/registry/cache/*"* ]] || return 1
-    [[ "$output" == *"Cargo git cache|$HOME/.local/share/mise/cargo/git/*"* ]] || return 1
+    # registry/src keeps offline builds working after registry/cache is emptied.
+    [[ "$output" != *"/registry/src"* ]] || return 1
+    # Cargo owns age-aware GC for git checkouts; Mole must not sweep the store.
+    [[ "$output" != *"/cargo/git"* ]] || return 1
     [[ "$output" == *"Rustup downloads cache|$HOME/.local/share/mise/rustup/downloads/*"* ]] || return 1
+    [[ "$output" != *"/registry/index/"* ]] || return 1
     [[ "$output" != *"/.cargo/"* ]] || return 1
     [[ "$output" != *"/.rustup/"* ]] || return 1
 }
 
+@test "clean_dev_rust rejects a registry cache root that escapes CARGO_HOME" {
+    cargo_home="$HOME/custom-cargo"
+    outside_root="$HOME/outside-registry-cache"
+    mkdir -p "$cargo_home/registry" "$outside_root/crate-data"
+    ln -s "$outside_root" "$cargo_home/registry/cache"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" CARGO_HOME="$cargo_home" \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+mole_cleanup_targets_exist() { return 0; }
+rust_build_process_state() { return 1; }
+safe_clean() { printf 'DELETE=%s|%s\n' "$2" "$1"; }
+note_activity() { :; }
+clean_dev_rust
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"Rust cargo cache · stopped (cache path leaves CARGO_HOME)"* ]] || return 1
+    [[ "$output" != *"DELETE=Rust cargo cache"* ]] || return 1
+    [[ -d "$outside_root/crate-data" ]]
+}
+
 @test "clean_dev_rust falls back to default homes without env" {
+    mkdir -p \
+        "$HOME/.cargo/registry/cache" \
+        "$HOME/.cargo/registry/src" \
+        "$HOME/.cargo/git"
+
     run env -u CARGO_HOME -u RUSTUP_HOME \
         HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" \
         /bin/bash --noprofile --norc << 'EOF'
@@ -1457,6 +2012,8 @@ unset CARGO_HOME RUSTUP_HOME
 source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/clean/dev.sh"
 safe_clean() { echo "$2|$1"; }
+mole_cleanup_targets_exist() { return 0; }
+rust_build_process_state() { return 1; }
 clean_dev_rust
 EOF
 
@@ -1465,8 +2022,169 @@ EOF
         return 1
     }
     [[ "$output" == *"Rust cargo cache|$HOME/.cargo/registry/cache/*"* ]] || return 1
-    [[ "$output" == *"Cargo git cache|$HOME/.cargo/git/*"* ]] || return 1
+    [[ "$output" != *"/registry/src"* ]] || return 1
+    [[ "$output" != *"/.cargo/git"* ]] || return 1
     [[ "$output" == *"Rustup downloads cache|$HOME/.rustup/downloads/*"* ]] || return 1
+    [[ "$output" != *"/registry/index/"* ]] || return 1
+}
+
+@test "clean_dev_rust skips dependency caches while cargo is active" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+mole_cleanup_targets_exist() { return 0; }
+rust_build_process_state() { return 0; }
+mole_defer_cleanup_family() { printf 'DEFER=%s\n' "$1"; }
+safe_clean() { printf 'DELETE=%s|%s\n' "$2" "$1"; }
+clean_dev_rust
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"DEFER=Rust"* ]] || return 1
+    [[ "$output" != *"DELETE=Rust cargo cache"* ]] || return 1
+    [[ "$output" != *"DELETE=Rust crate sources"* ]] || return 1
+    [[ "$output" != *"DELETE=Cargo git cache"* ]] || return 1
+    [[ "$output" == *"DELETE=Rustup downloads cache"* ]]
+}
+
+@test "clean_dev_rust fails closed when process state is unknown" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+mole_cleanup_targets_exist() { return 0; }
+rust_build_process_state() { return 2; }
+safe_clean() { printf 'DELETE=%s|%s\n' "$2" "$1"; }
+note_activity() { :; }
+clean_dev_rust
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"Rust dependency cache · stopped (process state unknown)"* ]] || return 1
+    [[ "$output" != *"DELETE=Rust cargo cache"* ]] || return 1
+    [[ "$output" != *"DELETE=Rust crate sources"* ]] || return 1
+    [[ "$output" != *"DELETE=Cargo git cache"* ]] || return 1
+    [[ "$output" == *"DELETE=Rustup downloads cache"* ]]
+}
+
+@test "clean_dev_rust rechecks cargo at the deletion boundary" {
+    mkdir -p "$HOME/.cargo/registry/cache"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+mole_cleanup_targets_exist() { return 0; }
+probe_calls=0
+rust_build_process_state() {
+    probe_calls=$((probe_calls + 1))
+    [[ $probe_calls -eq 1 ]] && return 1
+    return 0
+}
+mole_defer_cleanup_family() { printf 'DEFER=%s\n' "$1"; }
+safe_clean() { printf 'DELETE=%s|%s\n' "$2" "$1"; }
+safe_clean_guarded() {
+    local guard="$1"
+    shift
+    "$guard" || return 75
+    safe_clean "$@"
+}
+clean_dev_rust
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"DEFER=Rust"* ]] || return 1
+    [[ "$output" != *"DELETE="* ]]
+}
+
+@test "clean_dev_rust rechecks Cargo cache containment at the deletion boundary" {
+    cache_root="$HOME/.cargo/registry/cache"
+    outside_root="$HOME/outside-rust-cache"
+    mkdir -p "$cache_root/crate" "$outside_root/private-data"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+mole_cleanup_targets_exist() { return 0; }
+rust_build_process_state() { return 1; }
+mole_defer_cleanup_family() { printf 'DEFER=%s\n' "$1"; }
+safe_clean() { printf 'DELETE=%s|%s\n' "$2" "$1"; }
+safe_clean_guarded() {
+    local guard="$1"
+    shift
+    if [[ "$_MOLE_RUST_CACHE_ROOT" == "$HOME/.cargo/registry/cache" ]]; then
+        mv "$HOME/.cargo/registry/cache" "$HOME/.cargo/registry/cache-original"
+        ln -s "$HOME/outside-rust-cache" "$HOME/.cargo/registry/cache"
+    fi
+    "$guard" || return 75
+    safe_clean "$@"
+}
+clean_dev_rust
+EOF
+
+    [ "$status" -eq 0 ] || return 1
+    [[ "$output" == *"Rust cargo cache · stopped (process or cache path state unknown)"* ]] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" != *"DELETE=Rust cargo cache"* ]] || return 1
+    [[ -d "$outside_root/private-data" ]]
+}
+
+@test "clean_dev_rust binds each Cargo cache leaf to its checked root" {
+    cargo_home="$HOME/bound-cargo"
+    cache_root="$cargo_home/registry/cache"
+    outside_root="$HOME/outside-rust-cache-after-guard"
+    mkdir -p "$cache_root/crate" "$outside_root/crate"
+    printf 'inside\n' > "$cache_root/crate/inside-marker"
+    printf 'outside\n' > "$outside_root/crate/outside-marker"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/bin/clean.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+DRY_RUN=false
+files_cleaned=0
+total_size_cleaned=0
+total_items=0
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+start_inline_spinner() { :; }
+stop_inline_spinner() { :; }
+note_activity() { :; }
+rust_build_process_state() { return 1; }
+
+# Swap the checked Cargo root after the guard returns but before the real
+# safe_remove sink performs its final identity comparison.
+eval "$(declare -f safe_remove | sed '1s/safe_remove/_real_safe_remove/')"
+swapped=0
+safe_remove() {
+    if [[ $swapped -eq 0 ]]; then
+        swapped=1
+        mv "$HOME/bound-cargo/registry/cache" "$HOME/bound-cargo/registry/cache-original"
+        ln -s "$HOME/outside-rust-cache-after-guard" "$HOME/bound-cargo/registry/cache"
+    fi
+    _real_safe_remove "$@"
+}
+
+clean_rust_dependency_cache_root \
+    "$HOME/bound-cargo" \
+    "$HOME/bound-cargo/registry/cache" \
+    "Rust cargo cache"
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ -f "$cache_root-original/crate/inside-marker" ]] || return 1
+    [[ -f "$outside_root/crate/outside-marker" ]] || return 1
+    [[ "$output" != *"Rust cargo cache ·"* ]]
 }
 
 @test "resolve_tool_home rejects relative and traversal env values" {
@@ -1558,7 +2276,10 @@ EOF
     [[ "$output" == *"Ruby Bundler cache|"* ]]
 }
 
-@test "clean_dev_perl cleans CPAN build and source caches" {
+@test "clean_dev_perl clears the CPAN build tree but keeps the source store" {
+    # ~/.cpan/sources holds the distribution tarballs CPAN installs from and
+    # reuses across installs, so dropping it costs a re-download. The build
+    # tree next to it is throwaway scratch.
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
@@ -1569,7 +2290,7 @@ EOF
 
     [ "$status" -eq 0 ]
     [[ "$output" == *"CPAN build artifacts|"* ]] || return 1
-    [[ "$output" == *"CPAN source cache|"* ]]
+    [[ "$output" != *"/.cpan/sources"* ]]
 }
 
 @test "clean_dev_other_langs no longer includes Ruby Bundler cache" {
@@ -1583,6 +2304,427 @@ EOF
 
     [ "$status" -eq 0 ]
     [[ "$output" != *"Ruby Bundler cache"* ]]
+}
+
+@test "clean_dev_python keeps downloaded model weights and run artifacts" {
+    # Hugging Face, PyTorch, TensorFlow and Weights & Biases store multi-GB
+    # downloads and experiment output, not rebuildable build products. Only
+    # ~/.cache/huggingface was ever covered by DEFAULT_WHITELIST_PATTERNS, and
+    # that array stops applying once a user saves their own whitelist file, so
+    # the other three were deleted for everyone.
+    mkdir -p "$HOME/.cache/huggingface/hub" "$HOME/.cache/torch/hub" \
+        "$HOME/.cache/tensorflow/datasets" "$HOME/.cache/wandb/run-1"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+safe_clean() { echo "$2|$1"; }
+clean_tool_cache() { echo "$1|$2"; }
+clean_uv_cache() { :; }
+clean_pyinstaller_bincache() { :; }
+clean_conda_metadata_caches() { :; }
+note_activity() { :; }
+clean_dev_python
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" != *"huggingface"* ]] || return 1
+    [[ "$output" != *"/.cache/torch"* ]] || return 1
+    [[ "$output" != *"/.cache/tensorflow"* ]] || return 1
+    [[ "$output" != *"/.cache/wandb"* ]] || return 1
+    # The rebuildable linter and type-checker caches next to them still go.
+    [[ "$output" == *"Ruff cache"* ]] || return 1
+    [[ "$output" == *"MyPy cache"* ]]
+}
+
+@test "clean_dev_go refuses a symlinked module root but still clears the build cache" {
+    # `go clean -modcache` removes the module root directory itself, so handing
+    # it the resolved physical path of a symlinked GOMODCACHE deletes the target
+    # and leaves the owner's root dangling for the next build. `go clean -cache`
+    # empties GOCACHE in place, so a symlinked build root stays supported.
+    local module_physical="$HOME/go-module-physical"
+    local module_link="$HOME/go-module-link"
+    local build_root="$HOME/go-build-cache"
+    local trace="$HOME/go-clean.trace"
+    mkdir -p "$module_physical" "$build_root"
+    ln -s "$module_physical" "$module_link"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" \
+        GO_MODULE_ROOT="$module_link" GO_BUILD_ROOT="$build_root" GO_TRACE="$trace" \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+DRY_RUN=false
+go() { :; }
+run_with_timeout() {
+    shift
+    if [[ "$1" == "go" && "$2" == "env" ]]; then
+        case "$3" in
+            GOMODCACHE) printf '%s\n' "$GO_MODULE_ROOT" ;;
+            GOCACHE) printf '%s\n' "$GO_BUILD_ROOT" ;;
+        esac
+        return 0
+    fi
+    printf '%s\n' "$*" >> "$GO_TRACE"
+}
+is_path_whitelisted() { return 1; }
+should_protect_path() { return 1; }
+go_cache_process_state() { return 1; }
+note_activity() { :; }
+clean_dev_go
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"Go module cache · stopped (symlinked module root)"* ]] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"Go build cache"* ]] || return 1
+    # Nothing may be handed to the owner command for the symlinked root, and
+    # the physical directory the link points at must survive.
+    ! grep -q -- "-modcache" "$trace" || return 1
+    [[ -d "$module_physical" ]] || return 1
+    grep -qFx "env GOCACHE=$build_root go clean -cache" "$trace" || return 1
+    rm -f "$trace" "$module_link"
+    rm -rf "$module_physical" "$build_root"
+}
+
+@test "clean_dev_go refuses a module root that becomes a symlink after entry" {
+    # The entry check only proves the root was a real directory when the caller
+    # looked. Swap it for a link afterwards and the parent/target identity
+    # comparison still passes, so the owner command would run against whatever
+    # the link resolves to.
+    local module_root="$HOME/go-module-swap"
+    local outside_root="$HOME/go-outside-target"
+    local build_root="$HOME/go-build-swap"
+    local trace="$HOME/go-clean-swap.trace"
+    mkdir -p "$module_root" "$outside_root" "$build_root"
+    printf 'keep\n' > "$outside_root/victim.txt"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" \
+        GO_MODULE_ROOT="$module_root" GO_BUILD_ROOT="$build_root" GO_TRACE="$trace" \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+DRY_RUN=false
+go() { :; }
+run_with_timeout() {
+    shift
+    if [[ "$1" == "go" && "$2" == "env" ]]; then
+        case "$3" in
+            GOMODCACHE) printf '%s\n' "$GO_MODULE_ROOT" ;;
+            GOCACHE) printf '%s\n' "$GO_BUILD_ROOT" ;;
+        esac
+        return 0
+    fi
+    printf '%s\n' "$*" >> "$GO_TRACE"
+}
+is_path_whitelisted() { return 1; }
+should_protect_path() { return 1; }
+note_activity() { :; }
+# Fires inside the bound command, after the entry check has passed.
+swapped=0
+go_cache_process_state() {
+    if [[ "${1:-}" == "GOMODCACHE" && $swapped -eq 0 ]]; then
+        swapped=1
+        rmdir "$GO_MODULE_ROOT" 2> /dev/null || true
+        ln -s "$HOME/go-outside-target" "$GO_MODULE_ROOT"
+    fi
+    return 1
+}
+clean_dev_go
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"Go module cache · stopped (symlinked module root)"* ]] || {
+        echo "$output"
+        return 1
+    }
+    ! grep -q -- "-modcache" "$trace" || {
+        cat "$trace"
+        return 1
+    }
+    [[ -f "$outside_root/victim.txt" ]] || return 1
+    # The concurrency-safe build cache is unaffected by the module-root swap.
+    grep -qFx "env GOCACHE=$build_root go clean -cache" "$trace" || return 1
+    rm -f "$trace" "$module_root"
+    rm -rf "$outside_root" "$build_root"
+}
+
+@test "clean_dev_go uses owner dry-run for the same cache roots" {
+    local module_root="$HOME/go-module-dry"
+    local build_root="$HOME/go-build-dry"
+    local trace="$HOME/go-clean-dry.trace"
+    mkdir -p "$module_root" "$build_root"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" \
+        GO_MODULE_ROOT="$module_root" GO_BUILD_ROOT="$build_root" GO_TRACE="$trace" \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+DRY_RUN=true
+go() { :; }
+run_with_timeout() {
+    shift
+    if [[ "$1" == "go" && "$2" == "env" ]]; then
+        if [[ "$3" == "GOMODCACHE" ]]; then
+            printf '%s\n' "$GO_MODULE_ROOT"
+        else
+            printf '%s\n' "$GO_BUILD_ROOT"
+        fi
+        return 0
+    fi
+    printf '%s\n' "$*" >> "$GO_TRACE"
+}
+is_path_whitelisted() { return 1; }
+should_protect_path() { return 1; }
+go_cache_process_state() { return 1; }
+note_activity() { :; }
+clean_dev_go
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"Go module cache · would clean"* ]] || return 1
+    [[ "$output" == *"Go build cache · would clean"* ]] || return 1
+    grep -qFx "env GOMODCACHE=$module_root go clean -n -modcache" "$trace" || return 1
+    grep -qFx "env GOCACHE=$build_root go clean -n -cache" "$trace" || return 1
+    rm -f "$trace"
+    rm -rf "$module_root" "$build_root"
+}
+
+@test "clean_dev_go keeps module and build cache whitelist decisions independent" {
+    local module_root="$HOME/go-module-whitelist"
+    local build_root="$HOME/go-build-whitelist"
+    local trace="$HOME/go-clean-whitelist.trace"
+    mkdir -p "$module_root" "$build_root"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" \
+        GO_MODULE_ROOT="$module_root" GO_BUILD_ROOT="$build_root" GO_TRACE="$trace" \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+DRY_RUN=false
+go() { :; }
+run_with_timeout() {
+    shift
+    if [[ "$1" == "go" && "$2" == "env" ]]; then
+        if [[ "$3" == "GOMODCACHE" ]]; then
+            printf '%s\n' "$GO_MODULE_ROOT"
+        else
+            printf '%s\n' "$GO_BUILD_ROOT"
+        fi
+        return 0
+    fi
+    printf '%s\n' "$*" >> "$GO_TRACE"
+}
+is_path_whitelisted() { [[ "$1" == "$GO_MODULE_ROOT" ]]; }
+should_protect_path() { return 1; }
+go_cache_process_state() { return 1; }
+clean_tool_cache() { printf 'SKIP=%s|%s\n' "$1" "$2"; }
+note_activity() { :; }
+clean_dev_go
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"SKIP=Go module cache|$module_root"* ]] || return 1
+    grep -qFx "env GOCACHE=$build_root go clean -cache" "$trace" || return 1
+    [[ "$(cat "$trace")" != *"-modcache"* ]] || return 1
+    rm -f "$trace"
+    rm -rf "$module_root" "$build_root"
+}
+
+@test "Go process gating does not block the concurrency-safe build cache" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+mole_pgrep_any() {
+    printf 'PROBE=%s\n' "$*"
+    return 0
+}
+build_rc=0
+module_rc=0
+go_cache_process_state GOCACHE || build_rc=$?
+go_cache_process_state GOMODCACHE || module_rc=$?
+printf 'build=%s module=%s\n' "$build_rc" "$module_rc"
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"PROBE=-x go -x gopls"* ]] || return 1
+    [[ "$output" == *"build=1 module=0"* ]]
+}
+
+@test "clean_dev_go propagates owner cleanup cancellation" {
+    local module_root="$HOME/go-module-cancel"
+    mkdir -p "$module_root"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" \
+        GO_MODULE_ROOT="$module_root" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+DRY_RUN=false
+go() { :; }
+run_with_timeout() {
+    shift
+    if [[ "$1" == "go" && "$2" == "env" ]]; then
+        [[ "$3" == "GOMODCACHE" ]] && printf '%s\n' "$GO_MODULE_ROOT" || return 1
+        return 0
+    fi
+    return 124
+}
+is_path_whitelisted() { return 1; }
+should_protect_path() { return 1; }
+go_cache_process_state() { return 1; }
+note_activity() { :; }
+clean_rc=0
+clean_dev_go || clean_rc=$?
+printf 'rc=%s\n' "$clean_rc"
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"rc=124"* ]] || return 1
+    rm -rf "$module_root"
+}
+
+@test "clean_go_cache_root refuses a path replaced before the owner command" {
+    local cache_root="$HOME/go-cache-swap"
+    local outside_root="$HOME/go-cache-outside"
+    local trace="$HOME/go-clean-swap.trace"
+    mkdir -p "$cache_root" "$outside_root/private"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" \
+        GO_CACHE_ROOT="$cache_root" GO_OUTSIDE_ROOT="$outside_root" GO_TRACE="$trace" \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+DRY_RUN=false
+go() { :; }
+run_with_timeout() {
+    shift
+    printf '%s\n' "$*" >> "$GO_TRACE"
+}
+is_path_whitelisted() { return 1; }
+should_protect_path() { return 1; }
+go_cache_process_state() { return 1; }
+note_activity() { :; }
+eval "$(declare -f _run_go_cache_clean_bound | sed '1s/_run_go_cache_clean_bound/_original_run_go_cache_clean_bound/')"
+_run_go_cache_clean_bound() {
+    mv "$GO_CACHE_ROOT" "$GO_CACHE_ROOT-old"
+    ln -s "$GO_OUTSIDE_ROOT" "$GO_CACHE_ROOT"
+    _original_run_go_cache_clean_bound "$@"
+}
+clean_go_cache_root "$GO_CACHE_ROOT" GOCACHE -cache "Go build cache"
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"Go build cache · stopped (cache path state unknown)"* ]] || return 1
+    [ ! -e "$trace" ] || return 1
+    [ -d "$outside_root/private" ] || return 1
+    rm -f "$cache_root"
+    rm -rf "$cache_root-old" "$outside_root"
+}
+
+@test "clean_dev_jvm keeps the Ivy store and the sbt toolchain" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+mole_cleanup_targets_exist() { return 1; }
+safe_clean() { echo "$2|$1"; }
+clean_dev_jvm
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" != *"/.ivy2/"* ]] || return 1
+    [[ "$output" != *"/.sbt/"* ]]
+}
+
+@test "clean_dev_python clears Poetry package caches but keeps its virtualenvs" {
+    # virtualenvs is hard-safety whitelisted, and protecting a nested path
+    # protects its parent, so the whole pypoetry root drops out of the generic
+    # ~/Library/Caches sweep. Without naming the rebuildable siblings the
+    # protection silently costs all of Poetry's reclaimable space.
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+safe_clean() { echo "$2|$1"; }
+clean_tool_cache() { echo "$1|$2"; }
+clean_uv_cache() { :; }
+clean_pyinstaller_bincache() { :; }
+clean_conda_metadata_caches() { :; }
+note_activity() { :; }
+clean_dev_python
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"Poetry artifacts cache|$HOME/Library/Caches/pypoetry/artifacts/"* ]] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"Poetry package cache|$HOME/Library/Caches/pypoetry/cache/"* ]] || return 1
+    [[ "$output" != *"pypoetry/virtualenvs"* ]] || {
+        echo "$output"
+        return 1
+    }
+}
+
+@test "clean_dev_other_langs keeps the Deno module store" {
+    # DENO_DIR mixes remote imports with origin storage and runtime payloads;
+    # the owner clean command resets the whole root rather than a narrow leaf.
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+safe_clean() { echo "$2|$1"; }
+clean_clang_module_cache() { :; }
+clean_dev_other_langs
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" != *"Deno"* ]] || return 1
+    [[ "$output" != *"Caches/deno"* ]] || return 1
+    [[ "$output" == *"Zig cache"* ]]
+}
+
+@test "clean_dev_other_langs keeps the NuGet global packages folder" {
+    # ~/.nuget/packages is the restore target itself, the .NET counterpart of
+    # ~/.m2/repository, which clean_large_files only reports for review.
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+safe_clean() { echo "$2|$1"; }
+clean_clang_module_cache() { :; }
+clean_dev_other_langs
+EOF
+
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+    [[ "$output" != *".nuget"* ]] || return 1
+    [[ "$output" != *"NuGet"* ]] || return 1
+    [[ "$output" == *"Zig cache"* ]]
 }
 
 @test "clean_project_caches cleans flutter .dart_tool and build directories" {

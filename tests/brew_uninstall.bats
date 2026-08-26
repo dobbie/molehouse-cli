@@ -496,7 +496,7 @@ total_size_cleaned=0
 
 printf '\n' | batch_uninstall_applications > /dev/null 2>&1 || true
 
-[[ -d "$HOME/Applications/BrewBroken.app" ]]
+[[ -d "$HOME/Applications/BrewBroken.app" ]] || exit 1
 [[ ! -f "$HOME/remove.log" ]]
 EOF
 
@@ -555,7 +555,7 @@ total_size_cleaned=0
 
 printf '\n' | batch_uninstall_applications > /dev/null 2>&1
 
-[[ ! -d "$HOME/Applications/BrewCleanup.app" ]]
+[[ ! -d "$HOME/Applications/BrewCleanup.app" ]] || exit 1
 grep -q "SAFE_REMOVE:$HOME/Applications/BrewCleanup.app" "$HOME/remove.log"
 EOF
 
@@ -684,9 +684,36 @@ export -f brew
 cask_name='bad"; touch "$HOME/pwned"; #'
 brew_uninstall_cask "$cask_name"
 
-[[ ! -e "$HOME/pwned" ]]
+[[ ! -e "$HOME/pwned" ]] || exit 1
 grep -Fx '<bad"; touch "$HOME/pwned"; #>' "$HOME/brew_argv.log"
 EOF
 
     [ "$status" -eq 0 ]
+}
+
+@test "_detect_cask_via_caskroom_search handles empty uniq array expansion under set -u" {
+    mkdir -p "$BATS_TEST_TMPDIR/TestCaskApp.app"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" TEST_APP_PATH="$BATS_TEST_TMPDIR/TestCaskApp.app" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/uninstall/brew.sh"
+
+find() {
+    echo "/opt/homebrew/Caskroom/test-cask-app/1.0.0/TestCaskApp.app"
+}
+run_with_timeout() {
+    shift
+    "$@"
+}
+_mole_brew_probe() {
+    echo "test-cask-app"
+    return 0
+}
+
+_detect_cask_via_caskroom_search "$TEST_APP_PATH"
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == "test-cask-app" ]]
 }

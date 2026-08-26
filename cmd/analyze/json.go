@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -142,7 +143,7 @@ func performDirectoryScanForJSON(path string) jsonOutput {
 	currentPath := &atomic.Value{}
 	currentPath.Store("")
 
-	result, err := scanPathConcurrentAllEntries(path, &filesScanned, &dirsScanned, &bytesScanned, currentPath)
+	result, err := scanPathConcurrentAllEntries(context.Background(), path, &filesScanned, &dirsScanned, &bytesScanned, currentPath)
 	if err != nil {
 		// CONTRACT.md §4.6 (M1-T7): classify by errno, never by matching
 		// the message text, and emit the flat failed envelope instead of

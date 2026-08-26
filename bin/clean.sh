@@ -42,6 +42,8 @@ IS_M_SERIES=$([[ "$(uname -m)" == "arm64" ]] && echo "true" || echo "false")
 MOLE_USER_HOME="$(get_invoking_home)"
 [[ -n "$MOLE_USER_HOME" ]] || MOLE_USER_HOME="$HOME"
 
+load_mole_whitelist "$MOLE_USER_HOME"
+
 CLEAN_PREVIEW_FINAL_FILE="$MOLE_USER_HOME/.config/mole/clean-list.txt"
 CLEAN_PREVIEW_STAGING_FILE=""
 CLEAN_PREVIEW_LEDGER_FILE=""
@@ -71,81 +73,6 @@ readonly PROTECTED_SW_DOMAINS=(
     "linear.app"
     "excalidraw.com"
 )
-
-declare -a WHITELIST_PATTERNS=()
-WHITELIST_WARNINGS=()
-if [[ -f "$MOLE_USER_HOME/.config/mole/whitelist" ]]; then
-    while IFS= read -r line; do
-        # shellcheck disable=SC2295
-        line="${line#"${line%%[![:space:]]*}"}"
-        # shellcheck disable=SC2295
-        line="${line%"${line##*[![:space:]]}"}"
-        [[ -z "$line" || "$line" =~ ^# ]] && continue
-
-        [[ "$line" == ~* ]] && line="${line/#~/$MOLE_USER_HOME}"
-        line="${line//\$HOME/$MOLE_USER_HOME}"
-        line="${line//\$\{HOME\}/$MOLE_USER_HOME}"
-        if [[ "$line" =~ \.\. ]]; then
-            WHITELIST_WARNINGS+=("Path traversal not allowed: $line")
-            continue
-        fi
-
-        if [[ "$line" != "$FINDER_METADATA_SENTINEL" ]]; then
-            if [[ "$line" =~ [[:cntrl:]] ]]; then
-                WHITELIST_WARNINGS+=("Invalid path format: $line")
-                continue
-            fi
-
-            if [[ "$line" != /* ]]; then
-                WHITELIST_WARNINGS+=("Must be absolute path: $line")
-                continue
-            fi
-        fi
-
-        if [[ "$line" =~ // ]]; then
-            WHITELIST_WARNINGS+=("Consecutive slashes: $line")
-            continue
-        fi
-
-        case "$line" in
-            / | /System | /System/* | /bin | /bin/* | /sbin | /sbin/* | /usr/bin | /usr/bin/* | /usr/sbin | /usr/sbin/* | /etc | /etc/* | /var/db | /var/db/*)
-                WHITELIST_WARNINGS+=("Protected system path: $line")
-                continue
-                ;;
-        esac
-
-        duplicate="false"
-        if [[ ${#WHITELIST_PATTERNS[@]} -gt 0 ]]; then
-            for existing in "${WHITELIST_PATTERNS[@]}"; do
-                if [[ "$line" == "$existing" ]]; then
-                    duplicate="true"
-                    break
-                fi
-            done
-        fi
-        [[ "$duplicate" == "true" ]] && continue
-        WHITELIST_PATTERNS+=("$line")
-    done < "$MOLE_USER_HOME/.config/mole/whitelist"
-else
-    WHITELIST_PATTERNS=("${DEFAULT_WHITELIST_PATTERNS[@]}")
-fi
-
-# Expand whitelist patterns once to avoid repeated tilde expansion in hot loops.
-expand_whitelist_patterns() {
-    if [[ ${#WHITELIST_PATTERNS[@]} -gt 0 ]]; then
-        local -a EXPANDED_PATTERNS
-        EXPANDED_PATTERNS=()
-        for pattern in "${WHITELIST_PATTERNS[@]}"; do
-            local expanded="${pattern/#\~/$MOLE_USER_HOME}"
-            EXPANDED_PATTERNS+=("$expanded")
-        done
-        WHITELIST_PATTERNS=("${EXPANDED_PATTERNS[@]}")
-    fi
-}
-expand_whitelist_patterns
-# Existing user files replace defaults entirely; re-apply hard safety entries
-# (FINDER_METADATA and future SAFETY_WHITELIST_PATTERNS) so they still protect.
-ensure_safety_whitelist_patterns
 
 prepare_clean_preview_file() {
     EXPORT_LIST_FILE="$CLEAN_PREVIEW_FINAL_FILE"
@@ -1662,7 +1589,10 @@ perform_cleanup() {
 
         for pattern in "${WHITELIST_PATTERNS[@]}"; do
             local is_predefined=false
-            for default in "${DEFAULT_WHITELIST_PATTERNS[@]}"; do
+            # Hard safety entries are the most core protection Mole ships, so
+            # count them with the defaults. Attributing them to the user reads
+            # as "you added these" for rules nobody opted into.
+            for default in "${DEFAULT_WHITELIST_PATTERNS[@]}" "${SAFETY_WHITELIST_PATTERNS[@]}"; do
                 local expanded_default="${default/#\~/$HOME}"
                 if [[ "$pattern" == "$expanded_default" ]]; then
                     is_predefined=true

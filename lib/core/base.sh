@@ -148,27 +148,18 @@ readonly MOLE_ONE_GB_BYTES=1000000000
 readonly FINDER_METADATA_SENTINEL="FINDER_METADATA"
 declare -a DEFAULT_WHITELIST_PATTERNS=(
     "$HOME/Library/Caches/ms-playwright*"
-    "$HOME/.cache/huggingface*"
-    "$HOME/.m2/repository/*"
     "$HOME/.gradle/caches/*"
     "$HOME/.gradle/daemon/*"
     "$HOME/.ollama/models/*"
     "$HOME/Library/Caches/com.nssurge.surge-mac/*"
     "$HOME/Library/Application Support/com.nssurge.surge-mac/*"
     "$HOME/Library/Caches/org.R-project.R/R/renv/*"
-    "$HOME/Library/Caches/pypoetry/virtualenvs*"
     "$HOME/Library/Caches/JetBrains*"
     "$HOME/Library/Caches/com.jetbrains.toolbox*"
     "$HOME/Library/Caches/tealdeer/tldr-pages"
     "$HOME/Library/Application Support/JetBrains*"
     "$HOME/Library/Caches/com.apple.finder"
     "$HOME/Library/Mobile Documents*"
-    # System-critical caches that affect macOS functionality and stability
-    # CRITICAL: Removing these will cause system search and UI issues
-    "$HOME/Library/Caches/com.apple.FontRegistry*"
-    "$HOME/Library/Caches/com.apple.spotlight*"
-    "$HOME/Library/Caches/com.apple.Spotlight*"
-    "$HOME/Library/Caches/CloudKit*"
     "$FINDER_METADATA_SENTINEL"
 )
 
@@ -182,7 +173,129 @@ declare -a DEFAULT_OPTIMIZE_WHITELIST_PATTERNS=(
 # defaults stay in DEFAULT_WHITELIST_PATTERNS and remain fully replaceable.
 declare -a SAFETY_WHITELIST_PATTERNS=(
     "$FINDER_METADATA_SENTINEL"
+    # `clean_user_essentials` sweeps every child of ~/Library/Caches, so a row
+    # that only lives in DEFAULT_WHITELIST_PATTERNS stops protecting these the
+    # moment a user saves one custom entry. Removing them breaks macOS search,
+    # font rendering and iCloud sync rather than costing a rebuild, and
+    # pypoetry/virtualenvs holds live interpreters every Poetry project points
+    # at, not cached downloads. Hard safety, so they merge unconditionally.
+    "$HOME/Library/Caches/com.apple.FontRegistry*"
+    "$HOME/Library/Caches/com.apple.spotlight*"
+    "$HOME/Library/Caches/com.apple.Spotlight*"
+    "$HOME/Library/Caches/CloudKit*"
+    "$HOME/Library/Caches/pypoetry/virtualenvs*"
 )
+
+# Resolve the cache root used by GitHub CLI without following filesystem
+# links. Both cleanup and whitelist inventory consume this value so a custom
+# XDG_CACHE_HOME cannot make the saved protection point at a different path.
+mole_github_cli_cache_root() {
+    local cache_root
+    if [[ -n "${XDG_CACHE_HOME:-}" ]]; then
+        cache_root="$XDG_CACHE_HOME"
+    else
+        [[ "${HOME:-}" == /* ]] || return 1
+        cache_root="$HOME/.cache"
+    fi
+
+    [[ "$cache_root" == /* && ! "$cache_root" =~ [[:cntrl:]] ]] || return 1
+    case "$cache_root" in
+        *'/../'* | */.. | *'/./'* | */. | *'//'*) return 1 ;;
+    esac
+
+    cache_root="${cache_root%/}"
+    local home_root="${HOME:-}"
+    home_root="${home_root%/}"
+    case "$cache_root" in
+        "" | / | "$home_root") return 1 ;;
+    esac
+
+    printf '%s\n' "$cache_root"
+}
+
+# Resolve the per-user cache root reported by macOS. Keep the resolver shared
+# so cleanup and whitelist inventory always describe the same path.
+mole_darwin_user_cache_root() {
+    declare -f run_with_timeout > /dev/null 2>&1 || return 1
+
+    local cache_root=""
+    local resolver_rc=0
+    cache_root=$(run_with_timeout "${MOLE_TIMEOUT_QUICK_DETECT_SEC:-3}" \
+        /usr/bin/getconf DARWIN_USER_CACHE_DIR 2> /dev/null) || resolver_rc=$?
+    [[ $resolver_rc -eq 0 ]] || return "$resolver_rc"
+
+    [[ "$cache_root" == /* && ! "$cache_root" =~ [[:cntrl:]] ]] || return 1
+    case "$cache_root" in
+        *'/../'* | */.. | *'/./'* | */. | *'//'*) return 1 ;;
+    esac
+
+    cache_root="${cache_root%/}"
+    local home_root="${HOME:-}"
+    home_root="${home_root%/}"
+    case "$cache_root" in
+        "" | / | "$home_root") return 1 ;;
+    esac
+
+    printf '%s\n' "$cache_root"
+}
+
+# Resolve the effective Go cache roots through the Go tool itself. Cleanup and
+# whitelist inventory share this resolver so a relocated GOCACHE or
+# GOMODCACHE never falls back to a different hardcoded path.
+mole_go_cache_root() {
+    local cache_kind="$1"
+    case "$cache_kind" in
+        GOCACHE | GOMODCACHE) ;;
+        *) return 1 ;;
+    esac
+    declare -f run_with_timeout > /dev/null 2>&1 || return 1
+    command -v go > /dev/null 2>&1 || return 1
+
+    local cache_root=""
+    local resolver_rc=0
+    cache_root=$(run_with_timeout "${MOLE_TIMEOUT_QUICK_DETECT_SEC:-3}" \
+        go env "$cache_kind" 2> /dev/null) || resolver_rc=$?
+    [[ $resolver_rc -eq 0 ]] || return "$resolver_rc"
+
+    [[ "$cache_root" == /* && ! "$cache_root" =~ [[:cntrl:]] ]] || return 1
+    case "$cache_root" in
+        *'/../'* | */.. | *'/./'* | */. | *'//'*) return 1 ;;
+    esac
+
+    cache_root="${cache_root%/}"
+    local home_root="${HOME:-}"
+    home_root="${home_root%/}"
+    case "$cache_root" in
+        "" | / | "$home_root" | "$home_root/Library" | \
+            "$home_root/Library/Caches" | "$home_root/.cache" | "$home_root/go")
+            return 1
+            ;;
+    esac
+
+    printf '%s\n' "$cache_root"
+}
+
+# Deno's root is intentionally review-only, but the generic user-cache sweep
+# and the large-file hint still need to agree on which path must be preserved.
+mole_deno_cache_root() {
+    local cache_root="${DENO_DIR:-$HOME/Library/Caches/deno}"
+    [[ "$cache_root" == /* && ! "$cache_root" =~ [[:cntrl:]] ]] || return 1
+    case "$cache_root" in
+        *'/../'* | */.. | *'/./'* | */. | *'//'*) return 1 ;;
+    esac
+
+    cache_root="${cache_root%/}"
+    local home_root="${HOME:-}"
+    home_root="${home_root%/}"
+    case "$cache_root" in
+        "" | / | "$home_root" | "$home_root/Library" | \
+            "$home_root/Library/Caches" | "$home_root/.cache")
+            return 1
+            ;;
+    esac
+
+    printf '%s\n' "$cache_root"
+}
 
 # Append any missing SAFETY_WHITELIST_PATTERNS to WHITELIST_PATTERNS.
 # When CURRENT_WHITELIST_PATTERNS is declared (manage UI), keep it in sync.
@@ -219,6 +332,97 @@ ensure_safety_whitelist_patterns() {
             fi
         fi
     done
+}
+
+# Load and validate the invoking user's clean whitelist. Both `clean` and
+# `purge` use safe_remove as their final deletion sink, so they must share the
+# same source of WHITELIST_PATTERNS before either command starts scanning.
+# Keeping this here also makes the validation rules independent of a command
+# entrypoint, which prevents a new cleanup command from silently skipping the
+# whitelist initialization (see #1427).
+load_mole_whitelist() {
+    local whitelist_home="${1:-}"
+    if [[ -z "$whitelist_home" ]]; then
+        whitelist_home=$(get_invoking_home)
+    fi
+    [[ -n "$whitelist_home" ]] || whitelist_home="${HOME:-}"
+    MOLE_USER_HOME="$whitelist_home"
+
+    WHITELIST_PATTERNS=()
+    WHITELIST_WARNINGS=()
+
+    local whitelist_file="$MOLE_USER_HOME/.config/mole/whitelist"
+    if [[ -f "$whitelist_file" ]]; then
+        local line duplicate existing
+        while IFS= read -r line; do
+            # shellcheck disable=SC2295
+            line="${line#"${line%%[![:space:]]*}"}"
+            # shellcheck disable=SC2295
+            line="${line%"${line##*[![:space:]]}"}"
+            [[ -z "$line" || "$line" =~ ^# ]] && continue
+
+            [[ "$line" == ~* ]] && line="${line/#~/$MOLE_USER_HOME}"
+            line="${line//\$HOME/$MOLE_USER_HOME}"
+            line="${line//\$\{HOME\}/$MOLE_USER_HOME}"
+            if [[ "$line" =~ \.\. ]]; then
+                WHITELIST_WARNINGS+=("Path traversal not allowed: $line")
+                continue
+            fi
+
+            if [[ "$line" != "$FINDER_METADATA_SENTINEL" ]]; then
+                if [[ "$line" =~ [[:cntrl:]] ]]; then
+                    WHITELIST_WARNINGS+=("Invalid path format: $line")
+                    continue
+                fi
+
+                if [[ "$line" != /* ]]; then
+                    WHITELIST_WARNINGS+=("Must be absolute path: $line")
+                    continue
+                fi
+            fi
+
+            if [[ "$line" =~ // ]]; then
+                WHITELIST_WARNINGS+=("Consecutive slashes: $line")
+                continue
+            fi
+
+            case "$line" in
+                / | /System | /System/* | /bin | /bin/* | /sbin | /sbin/* | /usr/bin | /usr/bin/* | /usr/sbin | /usr/sbin/* | /etc | /etc/* | /var/db | /var/db/*)
+                    WHITELIST_WARNINGS+=("Protected system path: $line")
+                    continue
+                    ;;
+            esac
+
+            duplicate="false"
+            if [[ ${#WHITELIST_PATTERNS[@]} -gt 0 ]]; then
+                for existing in "${WHITELIST_PATTERNS[@]}"; do
+                    if [[ "$line" == "$existing" ]]; then
+                        duplicate="true"
+                        break
+                    fi
+                done
+            fi
+            [[ "$duplicate" == "true" ]] && continue
+            WHITELIST_PATTERNS+=("$line")
+        done < "$whitelist_file"
+    elif [[ ${#DEFAULT_WHITELIST_PATTERNS[@]} -gt 0 ]]; then
+        WHITELIST_PATTERNS=("${DEFAULT_WHITELIST_PATTERNS[@]}")
+    fi
+
+    # Expand patterns once, before hot cleanup loops call is_path_whitelisted.
+    if [[ ${#WHITELIST_PATTERNS[@]} -gt 0 ]]; then
+        local -a expanded_patterns=()
+        local pattern expanded
+        for pattern in "${WHITELIST_PATTERNS[@]}"; do
+            expanded="${pattern/#\~/$MOLE_USER_HOME}"
+            expanded_patterns+=("$expanded")
+        done
+        WHITELIST_PATTERNS=("${expanded_patterns[@]}")
+    fi
+
+    # Existing user files replace convenience defaults; hard safety entries
+    # remain enforced for every command that loads this shared policy.
+    ensure_safety_whitelist_patterns
 }
 
 # ============================================================================

@@ -50,7 +50,7 @@ save_whitelist_patterns() {
         header_text="# Mole Optimization Whitelist - These checks will be skipped during optimization"
     else
         config_file="$WHITELIST_CONFIG_CLEAN"
-        header_text="# Mole Whitelist - Protected paths won't be deleted\n# Default protections: Playwright browsers, HuggingFace models, Maven repo, Ollama models, Surge Mac, R renv, Finder metadata\n# Add one pattern per line to keep items safe."
+        header_text="# Mole Whitelist - Protected paths won't be deleted\n# Default protections: Playwright browsers, Ollama models, Surge Mac, R renv, Finder metadata\n# Add one pattern per line to keep items safe."
     fi
 
     ensure_user_file "$config_file"
@@ -98,7 +98,6 @@ Gradle worker cache|$HOME/.gradle/workers/*|ide_cache
 Xcode DerivedData (build outputs, indexes)|$HOME/Library/Developer/Xcode/DerivedData/*|ide_cache
 Xcode internal cache files|$HOME/Library/Caches/com.apple.dt.Xcode/*|ide_cache
 Xcode iOS device support symbols|$HOME/Library/Developer/Xcode/iOS DeviceSupport/*/Symbols/System/Library/Caches/*|ide_cache
-Maven local repository (Java dependencies)|$HOME/.m2/repository/*|ide_cache
 JetBrains IDEs data (IntelliJ, PyCharm, WebStorm, GoLand)|$HOME/Library/Application Support/JetBrains/*|ide_cache
 JetBrains IDEs cache|$HOME/Library/Caches/JetBrains/*|ide_cache
 Android Studio cache and indexes|$HOME/Library/Caches/Google/AndroidStudio*/*|ide_cache
@@ -112,15 +111,11 @@ Codex Desktop update staging|$HOME/Library/Caches/com.openai.codex/org.sparkle-p
 Chrome on-device AI models|$HOME/Library/Application Support/Google/Chrome/OptGuideOnDevice*/*|ai_ml_cache
 Chrome optimization guide models|$HOME/Library/Application Support/Google/Chrome/optimization_guide_model_store/*|ai_ml_cache
 Bazel build cache|$HOME/.cache/bazel/*|compiler_cache
-Go build cache|$HOME/Library/Caches/go-build/*|compiler_cache
-Go module cache|$HOME/go/pkg/mod/*|compiler_cache
 Rust Cargo registry cache|$HOME/.cargo/registry/cache/*|compiler_cache
 Rust documentation cache|$HOME/.rustup/toolchains/*/share/doc/*|compiler_cache
 Rustup toolchain downloads|$HOME/.rustup/downloads/*|compiler_cache
 ccache compiler cache|$HOME/.ccache/*|compiler_cache
 sccache distributed compiler cache|$HOME/.cache/sccache/*|compiler_cache
-SBT Scala build cache|$HOME/.sbt/*|compiler_cache
-Ivy dependency cache|$HOME/.ivy2/cache/*|compiler_cache
 Turbo monorepo build cache|$HOME/.turbo/*|compiler_cache
 Next.js build cache|$HOME/.next/*|compiler_cache
 Vite build cache|$HOME/.vite/*|compiler_cache
@@ -129,10 +124,10 @@ pre-commit hooks cache|$HOME/.cache/pre-commit/*|compiler_cache
 Ruff Python linter cache|$HOME/.cache/ruff/*|compiler_cache
 MyPy type checker cache|$HOME/.cache/mypy/*|compiler_cache
 Pytest test cache|$HOME/.pytest_cache/*|compiler_cache
+PyInstaller binary cache|$HOME/Library/Application Support/pyinstaller/bincache*|compiler_cache
 Flutter SDK cache|$HOME/.cache/flutter/*|compiler_cache
 Swift Package Manager cache|$HOME/.cache/swift-package-manager/*|compiler_cache
 Zig compiler cache|$HOME/.cache/zig/*|compiler_cache
-Deno cache|$HOME/Library/Caches/deno/*|compiler_cache
 CocoaPods cache (iOS dependencies)|$HOME/Library/Caches/CocoaPods/*|package_manager
 npm package cache|$HOME/.npm/_cacache/*|package_manager
 pip Python package cache|$HOME/.cache/pip/*|package_manager
@@ -147,13 +142,9 @@ Composer PHP dependencies cache|$HOME/Library/Caches/composer/*|package_manager
 RubyGems cache|$HOME/.gem/cache/*|package_manager
 Conda package metadata/tarball cache|$HOME/.conda/pkgs|package_manager
 Anaconda package metadata/tarball cache|$HOME/anaconda3/pkgs|package_manager
-PyTorch model cache|$HOME/.cache/torch/*|ai_ml_cache
-TensorFlow model and dataset cache|$HOME/.cache/tensorflow/*|ai_ml_cache
-HuggingFace models and datasets|$HOME/.cache/huggingface/*|ai_ml_cache
 Playwright browser binaries|$HOME/Library/Caches/ms-playwright*|ai_ml_cache
 Selenium WebDriver binaries|$HOME/.cache/selenium/*|ai_ml_cache
 Ollama local AI models|$HOME/.ollama/models/*|ai_ml_cache
-Weights & Biases ML experiments cache|$HOME/.cache/wandb/*|ai_ml_cache
 Safari web browser cache|$HOME/Library/Caches/com.apple.Safari/*|browser_cache
 Chrome browser cache|$HOME/Library/Caches/Google/Chrome/*|browser_cache
 Firefox browser cache|$HOME/Library/Caches/Firefox/*|browser_cache
@@ -170,6 +161,21 @@ Trash|$HOME/.Trash|system_cache
 iOS/iPadOS device firmware (.ipsw) from iTunes/Finder|$HOME/Library/iTunes/*Software Updates/*.ipsw|system_cache
 Apple Configurator 2 device firmware (.ipsw)|$HOME/Library/Group Containers/*.group.com.apple.configurator/**/*.ipsw|system_cache
 EOF
+    local go_cache_root
+    if go_cache_root=$(mole_go_cache_root GOCACHE); then
+        printf 'Go build cache|%s/*|compiler_cache\n' "$go_cache_root"
+    fi
+    if go_cache_root=$(mole_go_cache_root GOMODCACHE); then
+        printf 'Go module cache|%s/*|compiler_cache\n' "$go_cache_root"
+    fi
+    local github_cache_root
+    if github_cache_root=$(mole_github_cli_cache_root); then
+        printf 'GitHub CLI cache|%s/gh|network_tools\n' "$github_cache_root"
+    fi
+    local darwin_user_cache
+    if darwin_user_cache=$(mole_darwin_user_cache_root); then
+        printf 'Clang module cache|%s/clang/*|compiler_cache\n' "$darwin_user_cache"
+    fi
     # Add FINDER_METADATA with constant reference
     echo "Finder metadata, .DS_Store|$FINDER_METADATA_SENTINEL|system_cache"
 }
@@ -335,8 +341,12 @@ ${GRAY}Edit: ${display_config}${NC}"
         items_source=$(get_all_cache_items)
         active_config_file="$WHITELIST_CONFIG_CLEAN"
         local display_config="${active_config_file/#$HOME/~}"
+        # Naming the file was not enough: users read the category list as the
+        # whole feature and did not know the file also takes arbitrary paths,
+        # so a cache Mole cleans but does not list looked unprotectable
+        # (discussion #1436). Say what the file accepts, not just where it is.
         menu_title="Whitelist Manager, Select caches to protect
-${GRAY}Edit: ${display_config}${NC}"
+${GRAY}Edit: ${display_config}, any path added there is protected too${NC}"
     fi
 
     while IFS='|' read -r display_name pattern _; do
@@ -350,7 +360,13 @@ ${GRAY}Edit: ${display_config}${NC}"
         index=$((index + 1))
     done <<< "$items_source"
 
-    # Identify custom patterns (not in predefined list)
+    # Identify custom patterns (not in predefined list).
+    #
+    # Hard-safety entries have no inventory row on purpose: they are not
+    # opt-in protections the user picks from a menu. Without this check they
+    # fall through to custom_patterns, which both mislabels them as
+    # user-added and writes them into the saved file as if the user had chosen
+    # them, so a mandatory rule becomes an editable one on first save.
     local -a custom_patterns=()
     if [[ ${#CURRENT_WHITELIST_PATTERNS[@]} -gt 0 ]]; then
         for current_pattern in "${CURRENT_WHITELIST_PATTERNS[@]}"; do
@@ -361,6 +377,15 @@ ${GRAY}Edit: ${display_config}${NC}"
                     break
                 fi
             done
+            if [[ "$is_predefined" == "false" && ${#SAFETY_WHITELIST_PATTERNS[@]} -gt 0 ]]; then
+                local safety_pattern
+                for safety_pattern in "${SAFETY_WHITELIST_PATTERNS[@]}"; do
+                    if patterns_equivalent "$current_pattern" "$safety_pattern"; then
+                        is_predefined=true
+                        break
+                    fi
+                done
+            fi
             if [[ "$is_predefined" == "false" ]]; then
                 custom_patterns+=("$current_pattern")
             fi

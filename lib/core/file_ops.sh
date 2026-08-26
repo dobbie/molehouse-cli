@@ -409,35 +409,54 @@ _mole_user_cache_owner_process_state() {
 }
 
 # Is the database family live? 0 = in use, 1 = idle, 2 = could not tell.
-# WAL-mode -shm only exists while at least one connection is open (PR #1391).
+# WAL-mode -shm only exists while at least one connection is open (PR #1391),
+# but a stale -shm can remain after an unclean exit. When -shm exists we must
+# still verify a process holds it open; otherwise the guard refuses forever on
+# orphaned caches (#1439).
 _mole_sqlite_database_in_use() {
     local path="$1"
     local base
     base=$(_mole_sqlite_family_base_path "$path")
 
-    if [[ -f "${base}-shm" ]]; then
-        return 0
-    fi
-
     command -v lsof > /dev/null 2>&1 || return 2
 
+    # Check every family member, including a stale -shm. If any process has a
+    # handle open the database is live; if none do, the -shm is orphaned and
+    # deletion is safe. One lsof call covers the whole family: forking it per
+    # member tripled the live-cache gate's cost once the -shm fast path went
+    # away (#1439), and lsof already accepts several names at once.
     local candidate
+    local -a family=()
     for candidate in "$base" "${base}-wal" "${base}-shm"; do
         [[ -e "$candidate" ]] || continue
-        local lsof_rc=0
-        if declare -f run_with_timeout > /dev/null 2>&1; then
-            run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" lsof -F n -- "$candidate" \
-                > /dev/null 2>&1 || lsof_rc=$?
-        else
-            lsof -F n -- "$candidate" > /dev/null 2>&1 || lsof_rc=$?
-        fi
-        if [[ $lsof_rc -eq 0 ]]; then
-            return 0
-        fi
-        if [[ $lsof_rc -ne 1 ]]; then
-            return 2
-        fi
+        family[${#family[@]}]="$candidate"
     done
+    # Guard the empty expansion: macOS /bin/bash is 3.2, where "${a[@]}" on an
+    # empty array is an unbound-variable error under set -u.
+    [[ ${#family[@]} -gt 0 ]] || return 1
+
+    # Exit status cannot carry the answer here. lsof returns 1 whenever it fails
+    # to locate ANY requested name, so a family with one open member and one
+    # closed member still exits 1. Its stdout can: a record is printed only for
+    # a name some process holds open. Read the records, not the status.
+    local lsof_rc=0
+    local open_records=""
+    if declare -f run_with_timeout > /dev/null 2>&1; then
+        open_records=$(run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" lsof -F n -- \
+            "${family[@]}" 2> /dev/null) || lsof_rc=$?
+    else
+        open_records=$(lsof -F n -- "${family[@]}" 2> /dev/null) || lsof_rc=$?
+    fi
+    # Status 0 means lsof located every name it was given, which for this query
+    # can only happen when some process holds them. Take either signal: a record
+    # on stdout, or a clean exit. Requiring both would read a mocked or
+    # output-suppressed lsof as idle, and "idle" is the answer that deletes.
+    if [[ -n "$open_records" || $lsof_rc -eq 0 ]]; then
+        return 0
+    fi
+    # Exactly status 1 with no records means every member is idle. Anything else
+    # (timeout, signal, lsof error) is not evidence of idleness.
+    [[ $lsof_rc -eq 1 ]] || return 2
     return 1
 }
 
@@ -470,22 +489,66 @@ _mole_should_refuse_live_user_cache_path() {
     if _mole_is_user_cache_sqlite_family_path "$path"; then
         local open_state=0
         _mole_user_cache_sqlite_has_open_handle "$path" || open_state=$?
-        if [[ $open_state -eq 0 ]]; then
-            debug_log "Open SQLite user cache handle, keep: $path"
+        if [[ $open_state -eq 0 || $open_state -eq 2 ]]; then
+            debug_log "SQLite user cache handle not conclusively idle, keep: $path"
             return 0
         fi
-        # open_state 2 (lsof missing) with no -shm: process probe already idle.
     elif [[ -d "$path" ]]; then
-        local candidate open_state
-        for candidate in "$path/Cache.db" "$path"/*.db; do
-            [[ -f "$candidate" ]] || continue
-            open_state=0
-            _mole_user_cache_sqlite_has_open_handle "$candidate" || open_state=$?
-            if [[ $open_state -eq 0 ]]; then
-                debug_log "Open SQLite under user cache dir, keep: $path ($candidate)"
-                return 0
-            fi
-        done
+        # A caller's GLOBIGNORE would silently hide database files from this
+        # glob, which reads as "no SQLite here" and unblocks the delete. Shadow
+        # it with an empty local: bash restores the caller's value AND its
+        # attributes on return, so no manual save, `declare -p` parsing, or
+        # export-state replay is needed. An empty GLOBIGNORE also turns off the
+        # dotglob that bash auto-enables for a non-empty one, so dotglob is set
+        # explicitly below and restored by hand (shopt state is not scoped).
+        # failglob off keeps an empty cache directory yielding a literal that
+        # the -f test drops. Both shopt flags are saved because cleanup helpers
+        # elsewhere in the tree set them without restoring. nullglob is left
+        # alone: either state reaches the same -f filter.
+        local GLOBIGNORE=""
+        local candidate open_state family_base seen_base already_seen
+        local restore_dotglob=false
+        local restore_failglob=false
+        local -a sqlite_candidates=()
+        local -a sqlite_family_bases=()
+
+        if shopt -q dotglob; then
+            restore_dotglob=true
+        fi
+        if shopt -q failglob; then
+            restore_failglob=true
+        fi
+        shopt -s dotglob
+        shopt -u failglob
+        sqlite_candidates=("$path"/*)
+        if [[ "$restore_dotglob" != "true" ]]; then shopt -u dotglob; fi
+        if [[ "$restore_failglob" == "true" ]]; then shopt -s failglob; fi
+
+        if [[ ${#sqlite_candidates[@]} -gt 0 ]]; then
+            for candidate in "${sqlite_candidates[@]}"; do
+                [[ -f "$candidate" ]] || continue
+                _mole_is_user_cache_sqlite_family_path "$candidate" || continue
+                family_base=$(_mole_sqlite_family_base_path "$candidate")
+                already_seen=false
+                if [[ ${#sqlite_family_bases[@]} -gt 0 ]]; then
+                    for seen_base in "${sqlite_family_bases[@]}"; do
+                        if [[ "$seen_base" == "$family_base" ]]; then
+                            already_seen=true
+                            break
+                        fi
+                    done
+                fi
+                [[ "$already_seen" == "true" ]] && continue
+                sqlite_family_bases[${#sqlite_family_bases[@]}]="$family_base"
+
+                open_state=0
+                _mole_user_cache_sqlite_has_open_handle "$family_base" || open_state=$?
+                if [[ $open_state -eq 0 || $open_state -eq 2 ]]; then
+                    debug_log "SQLite under user cache dir not conclusively idle, keep: $path ($family_base)"
+                    return 0
+                fi
+            done
+        fi
     fi
 
     return 1
@@ -1013,6 +1076,28 @@ safe_remove() {
         debug_log "Refusing removal after final path identity changed: $path"
         log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "identity changed"
         return 1
+    fi
+
+    # Last hop before rm, for callers whose exclusion depends on state this
+    # function cannot express as a parent/target inode pair. A candidate list
+    # that skipped a live owner root only proves where that root pointed when
+    # the list was built; re-asking here closes the rest of the window rather
+    # than leaving it open from discovery all the way to the unlink. Set
+    # _MOLE_SAFE_REMOVE_FINAL_GUARD to a function name that takes the path and
+    # returns non-zero to refuse.
+    local final_sink_guard="${_MOLE_SAFE_REMOVE_FINAL_GUARD:-}"
+    if [[ -n "$final_sink_guard" ]] && declare -f "$final_sink_guard" > /dev/null 2>&1; then
+        local final_sink_guard_rc=0
+        "$final_sink_guard" "$path" || final_sink_guard_rc=$?
+        if [[ $final_sink_guard_rc -ne 0 ]]; then
+            debug_log "Refusing removal after the final sink guard denied: $path"
+            log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$path" "sink guard denied"
+            if [[ $final_sink_guard_rc -eq 124 || $final_sink_guard_rc -ge 128 ]]; then
+                _mole_record_clean_cancellation "$final_sink_guard_rc"
+                return "$final_sink_guard_rc"
+            fi
+            return 1
+        fi
     fi
 
     # Perform the deletion
@@ -2917,15 +3002,14 @@ safe_sudo_find_delete() {
 
 # Get path size in KB (returns 0 if not found)
 #
-# For regular files and symlinks, prefer 'stat' over 'du': it avoids the
-# fork+pipe cost of 'du | awk' on every call, which adds up in tight loops
-# (e.g. external-volume ._* sweeps, Application Support log scans). 'du -skP'
-# and 'stat -f%z' both report logical size without following symlinks on
-# macOS, and the 1KB-rounded outputs match for the file types we encounter
-# (logs, caches, leftovers). Directories still go through 'du' because 'stat'
+# For regular files and symlinks, prefer allocated blocks from 'stat' over
+# 'du': it avoids the fork+pipe cost of 'du | awk' on every call, which adds
+# up in tight loops (e.g. external-volume ._* sweeps, Application Support log
+# scans). macOS st_blocks and 'du -skP' use the same 512-byte allocation basis
+# without following symlinks. Directories still go through 'du' because 'stat'
 # only reports a single directory entry, not recursive content size. .app
-# bundles continue to go through mdls because APFS clones make 'du'
-# under-report large bundles like Xcode.
+# bundles use Spotlight's physical size when available so uninstall previews
+# do not add logical bundle bytes to physical leftover sizes.
 get_path_size_kb() {
     local path="$1"
     local size_timeout="${2:-$MOLE_TIMEOUT_DISK_VERIFY_SEC}"
@@ -2945,8 +3029,10 @@ get_path_size_kb() {
     [[ $timeout_budget -gt 0 ]] || timeout_budget=1
     local size_deadline=$((SECONDS + timeout_budget))
 
-    # For .app bundles, prefer mdls logical size as it matches Finder
-    # (APFS clone/sparse files make 'du' severely underreport apps like Xcode)
+    # Uninstall totals represent estimated disk occupancy. Keep .app bundles
+    # on the same physical-size basis as the directory fallback; logical size
+    # can be much larger for APFS-cloned bundles and must not be mixed into the
+    # same total as `du` results (#1404).
     if [[ "$path" == *.app || "$path" == *.app/ ]]; then
         local mdls_size
         local mdls_timeout=""
@@ -2956,30 +3042,29 @@ get_path_size_kb() {
         [[ $mdls_deadline_rc -eq 0 ]] || return "$mdls_deadline_rc"
         local mdls_rc=0
         mdls_size=$(run_with_timeout "$mdls_timeout" mdls \
-            -name kMDItemLogicalSize -raw "$path" < /dev/null 2> /dev/null) || mdls_rc=$?
+            -name kMDItemPhysicalSize -raw "$path" < /dev/null 2> /dev/null) || mdls_rc=$?
         [[ $mdls_rc -eq 124 || $mdls_rc -ge 128 ]] && return "$mdls_rc"
         if [[ "$mdls_size" =~ ^[0-9]+$ && "$mdls_size" -gt 0 ]]; then
-            # Return in KB
-            echo "$((mdls_size / 1024))"
+            echo $(((mdls_size + 1023) / 1024))
             return
         fi
     fi
 
-    # Fast path for regular files and symlinks: avoid forking 'du'.
+    # Fast path for regular files and symlinks: st_blocks is measured in
+    # 512-byte units and matches the physical basis of `du -skP`.
     if [[ -f "$path" || -L "$path" ]]; then
-        local bytes
+        local blocks
         local stat_timeout=""
         local stat_deadline_rc=0
         stat_timeout=$(_mole_timeout_with_deadline \
             "$size_timeout" "$size_deadline") || stat_deadline_rc=$?
         [[ $stat_deadline_rc -eq 0 ]] || return "$stat_deadline_rc"
         local stat_rc=0
-        bytes=$(run_with_timeout "$stat_timeout" stat \
-            -f%z "$path" < /dev/null 2> /dev/null) || stat_rc=$?
+        blocks=$(run_with_timeout "$stat_timeout" stat \
+            -f%b "$path" < /dev/null 2> /dev/null) || stat_rc=$?
         [[ $stat_rc -eq 124 || $stat_rc -ge 128 ]] && return "$stat_rc"
-        if [[ "$bytes" =~ ^[0-9]+$ ]]; then
-            # Round up to whole KB to match 'du -skP' semantics.
-            echo $(((bytes + 1023) / 1024))
+        if [[ "$blocks" =~ ^[0-9]+$ ]]; then
+            echo $(((blocks + 1) / 2))
             return
         fi
     fi
@@ -2997,7 +3082,10 @@ get_path_size_kb() {
     local du_rc=0
     size=$(run_with_timeout "$du_timeout" du -skP "$path" 2> /dev/null |
         awk 'NR==1 {print $1; exit}') || du_rc=$?
-    [[ $du_rc -eq 124 || $du_rc -ge 128 ]] && return "$du_rc"
+    # `du` may print a partial aggregate before reporting an unreadable child.
+    # Any nonzero status makes that number incomplete, so never return it as a
+    # successful size estimate (#1404).
+    [[ $du_rc -eq 0 ]] || return "$du_rc"
 
     if [[ "$size" =~ ^[0-9]+$ ]]; then
         echo "$size"

@@ -9,6 +9,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # Load Homebrew cask support (provides get_brew_cask_name, brew_uninstall_cask)
 [[ -f "$SCRIPT_DIR/lib/uninstall/brew.sh" ]] && source "$SCRIPT_DIR/lib/uninstall/brew.sh"
 
+# Load Steam launcher detection (identifies shortcut-only app bundles)
+[[ -f "$SCRIPT_DIR/lib/uninstall/steam.sh" ]] && source "$SCRIPT_DIR/lib/uninstall/steam.sh"
+
 # Batch uninstall with a single confirmation.
 
 is_uninstall_dry_run() {
@@ -1744,6 +1747,11 @@ _batch_preview_and_confirm() {
 
         local brew_tag=""
         [[ "$is_brew_cask" == "true" ]] && brew_tag=" ${CYAN}[Brew]${NC}"
+        local steam_managed=false
+        if uninstall_app_is_steam_launcher "$app_path"; then
+            steam_managed=true
+            app_size_display="N/A (Steam-managed)"
+        fi
         echo -e "${BLUE}${ICON_CONFIRM}${NC} ${app_name}${brew_tag} ${GRAY}, ${app_size_display}${NC}"
 
         # Show detailed file list for ALL apps (brew casks leave user data behind)
@@ -1757,6 +1765,10 @@ _batch_preview_and_confirm() {
             [[ -n "$system_files" ]] && echo "$system_files"
             echo "$diag_system_display"
         )
+
+        if [[ "$steam_managed" == "true" ]]; then
+            echo -e "  ${YELLOW}${ICON_WARNING}${NC} Steam launcher only; game files managed by Steam are not included"
+        fi
 
         local preview_path=""
         preview_path=$(format_uninstall_preview_path "$app_path") || return $?
@@ -2206,7 +2218,7 @@ _batch_execute_removals() {
                     _du_total=$(run_with_timeout "$MOLE_TIMEOUT_DISK_VERIFY_SEC" \
                         du -skcP "${leftover_paths[@]}" 2> /dev/null | awk 'END {print $1}') || _du_rc=$?
                     [[ $_du_rc -eq 124 || $_du_rc -ge 128 ]] && return "$_du_rc"
-                    if [[ "$_du_total" =~ ^[0-9]+$ ]]; then
+                    if [[ $_du_rc -eq 0 && "$_du_total" =~ ^[0-9]+$ ]]; then
                         leftover_kb=$_du_total
                     fi
                 fi

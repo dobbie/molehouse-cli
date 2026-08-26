@@ -1056,12 +1056,20 @@ EOF
     local test_home
     test_home="$(mktemp -d "${BATS_TEST_TMPDIR}/clean-1390-home.XXXXXX")"
     mkdir -p "$test_home/.config/mole" \
-        "$test_home/Library/Caches/com.autodesk.AcCoreConsole"
+        "$test_home/Library/Caches/com.autodesk.AcCoreConsole" \
+        "$test_home/toolchain-bin"
 
     local db="$test_home/Library/Caches/com.autodesk.AcCoreConsole/Cache.db"
     printf 'cache-db' > "$db"
     printf 'wal' > "$db-wal"
     printf 'shm' > "$db-shm"
+
+    cat > "$test_home/toolchain-bin/lsof" << 'MOCK'
+#!/bin/bash
+# Shim: pretend every SQLite family member is held open by a process.
+exit 0
+MOCK
+    chmod +x "$test_home/toolchain-bin/lsof"
 
     # Dry-run must not list the family even though the sweep reaches it: a
     # live WAL-mode database stays put, and the preview must agree with the
@@ -1070,7 +1078,7 @@ EOF
     # validate_path_for_deletion (tests/core_safe_functions.bats).
     set_mock_host_toolchains
     run env HOME="$test_home" MOLE_TEST_MODE=0 MOLE_TEST_NO_AUTH=1 \
-        PATH="$MOCK_TOOLCHAIN_BIN:$PATH" "$PROJECT_ROOT/mole" clean --dry-run
+        PATH="$test_home/toolchain-bin:$MOCK_TOOLCHAIN_BIN:$PATH" "$PROJECT_ROOT/mole" clean --dry-run
     [ "$status" -eq 0 ] || return 1
     [[ "$(grep -cF "Cache.db" "$test_home/.config/mole/clean-list.txt")" -eq 0 ]] || return 1
     [[ -f "$db" && -f "$db-wal" && -f "$db-shm" ]] || return 1
@@ -1108,13 +1116,33 @@ EOF
     mkdir -p "$HOME/.m2/repository/org/example"
     echo "dependency" > "$HOME/.m2/repository/org/example/lib.jar"
 
+    # A custom whitelist file replaces DEFAULT_WHITELIST_PATTERNS wholesale, so
+    # the old default row stopped protecting Maven for exactly the users most
+    # likely to have one. The repository is the store Maven resolves from, so
+    # the delete path is gone instead: there is nothing left to whitelist.
+    mkdir -p "$HOME/.config/mole"
+    printf '%s\n' "$HOME/.cache/unrelated-entry/*" > "$HOME/.config/mole/whitelist"
+
     run env HOME="$HOME" MOLE_TEST_MODE=1 "$PROJECT_ROOT/mole" clean --dry-run
     [ "$status" -eq 0 ] || return 1
-    # The jar must survive, and the dry-run must not offer the Maven repo as a
-    # cleanup target. The label is "Maven local repository" (maven.sh); the old
-    # assertion checked a string that never appears, so it passed vacuously.
     [ -f "$HOME/.m2/repository/org/example/lib.jar" ] || return 1
-    [[ "$output" != *"Maven local repository"* ]] || return 1
+
+    # Assert the behaviour, not the source text: the old delete path built the
+    # path into a variable one line above the safe_clean call, so a grep for
+    # the literal beside the sink name passed while the bug was live.
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+mole_cleanup_targets_exist() { return 1; }
+safe_clean() { printf 'TARGET=%s\n' "$*"; }
+clean_dev_jvm
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" != *".m2"* ]] || {
+        echo "$output"
+        return 1
+    }
 }
 
 @test "FINDER_METADATA_SENTINEL in whitelist protects .DS_Store files" {

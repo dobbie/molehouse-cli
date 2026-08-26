@@ -936,6 +936,9 @@ clean_orphaned_system_services() {
     local orphaned_count=0
     local -a orphaned_files=()
     local -a orphaned_identities=()
+    local -a orphaned_parents=()
+    local -a orphaned_parent_ids=()
+    local -a orphaned_target_ids=()
     # Force-protect list: if a plist's bundle ID matches one of these patterns AND
     # the associated app IS installed, skip removal even if the binary appears missing.
     # Format: "bundle_id_glob:pipe-separated app paths"
@@ -1091,6 +1094,23 @@ clean_orphaned_system_services() {
         printf '%s\n' "$binary"
     }
 
+    # Confirm that a plist can be parsed at all. `_plist_binary_path` returns 1
+    # both for a valid plist with no usable Program key and for an ordinary
+    # PlistBuddy read failure, which is sufficient for discovery but not for a
+    # sink-time proof that no registration references a helper.
+    _plist_document_is_readable() {
+        local plist="$1"
+        local plist_probe_timeout=""
+        local plist_probe_rc=0
+        plist_probe_timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" \
+            "$service_cleanup_deadline") || plist_probe_rc=$?
+        if [[ $plist_probe_rc -eq 0 ]]; then
+            _mole_bounded_sudo "$plist_probe_timeout" \
+                -n /usr/libexec/PlistBuddy -c "Print" "$plist" < /dev/null > /dev/null 2>&1 || plist_probe_rc=$?
+        fi
+        return "$plist_probe_rc"
+    }
+
     # Returns 0 if the binary path is managed by a package manager or lives in a
     # system directory; these should never be treated as orphans even when missing.
     _is_package_managed_binary() {
@@ -1124,6 +1144,18 @@ clean_orphaned_system_services() {
             return "$binary_path_rc"
         fi
         [[ $binary_path_rc -eq 0 ]] || return 1 # no Program key → skip
+
+        # A standalone helper app is an owned service unit even while its
+        # updater temporarily swaps the nested executable. Treat the verified
+        # absolute Program shape itself as protection: absence of the leaf is
+        # not proof that the registration is orphaned. This intentionally
+        # prefers a stale plist false negative over deleting a live updater's
+        # registration. See #1447.
+        case "$binary" in
+            /Library/PrivilegedHelperTools/*.app/Contents/MacOS/*)
+                return 1
+                ;;
+        esac
 
         # Self-protecting software (Intego and similar antivirus / endpoint
         # agents) makes its install directories root-only readable, so an
@@ -1238,13 +1270,135 @@ clean_orphaned_system_services() {
         printf '%s\n' "$identity"
     }
 
-    _record_orphan_service_candidate() {
+    _orphan_service_snapshot() {
         local candidate="$1"
+        _ORPHAN_SERVICE_IDENTITY=""
+        _ORPHAN_SERVICE_PARENT=""
+        _ORPHAN_SERVICE_PARENT_ID=""
+        _ORPHAN_SERVICE_TARGET_ID=""
+
+        _mole_snapshot_path_identity "$candidate" || return 1
+        local snapshot_parent="$_MOLE_PATH_SNAPSHOT_PARENT"
+        local snapshot_parent_id="$_MOLE_PATH_SNAPSHOT_PARENT_ID"
+        local snapshot_target_id="$_MOLE_PATH_SNAPSHOT_TARGET_ID"
         local identity=""
         identity=$(_orphan_service_identity "$candidate") || return $?
+        [[ "${identity%:*}" == "$snapshot_target_id" ]] || return 1
+
+        _ORPHAN_SERVICE_IDENTITY="$identity"
+        _ORPHAN_SERVICE_PARENT="$snapshot_parent"
+        _ORPHAN_SERVICE_PARENT_ID="$snapshot_parent_id"
+        _ORPHAN_SERVICE_TARGET_ID="$snapshot_target_id"
+    }
+
+    _record_orphan_service_candidate() {
+        local candidate="$1"
+        local _ORPHAN_SERVICE_IDENTITY=""
+        local _ORPHAN_SERVICE_PARENT=""
+        local _ORPHAN_SERVICE_PARENT_ID=""
+        local _ORPHAN_SERVICE_TARGET_ID=""
+        _orphan_service_snapshot "$candidate" || return $?
         orphaned_files+=("$candidate")
-        orphaned_identities+=("$identity")
+        orphaned_identities+=("$_ORPHAN_SERVICE_IDENTITY")
+        orphaned_parents+=("$_ORPHAN_SERVICE_PARENT")
+        orphaned_parent_ids+=("$_ORPHAN_SERVICE_PARENT_ID")
+        orphaned_target_ids+=("$_ORPHAN_SERVICE_TARGET_ID")
         orphaned_count=$((orphaned_count + 1))
+    }
+
+    # Returns 0 only after a complete, bounded scan proves that no surviving
+    # LaunchDaemon or LaunchAgent references this helper. A plist removal and
+    # its Program helper form one cleanup family: if the registration survives,
+    # is replaced, or cannot be read conclusively, the helper must survive too.
+    _orphan_service_helper_is_unreferenced() {
+        local helper="$1"
+        local deadline="$2"
+        local service_cleanup_deadline="$deadline"
+        local reference_scan_file=""
+
+        if ! reference_scan_file=$(create_temp_file 2> /dev/null); then
+            return 2
+        fi
+
+        local reference_scan_rc=0
+        local service_root=""
+        # Declared here on purpose: `plist` is also the read variable of the two
+        # discovery loops in this function's enclosing scope, and bash scoping
+        # is dynamic.
+        local plist=""
+        for service_root in /Library/LaunchDaemons /Library/LaunchAgents; do
+            [[ -d "$service_root" ]] || continue
+            if [[ $SECONDS -ge $service_cleanup_deadline ]]; then
+                reference_scan_rc=124
+                break
+            fi
+
+            local scan_timeout=""
+            local scan_rc=0
+            scan_timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" \
+                "$service_cleanup_deadline") || scan_rc=$?
+            if [[ $scan_rc -eq 0 ]]; then
+                _mole_materialize_bounded_sudo_find "$reference_scan_file" \
+                    "$scan_timeout" "$service_root" \
+                    -maxdepth 1 -name "*.plist" -print0 || scan_rc=$?
+            fi
+            if [[ $scan_rc -ne 0 ]]; then
+                reference_scan_rc=$scan_rc
+                break
+            fi
+
+            while IFS= read -r -d '' plist; do
+                if [[ $SECONDS -ge $service_cleanup_deadline ]]; then
+                    reference_scan_rc=124
+                    break
+                fi
+                local referenced_binary=""
+                local binary_rc=0
+                referenced_binary=$(_plist_binary_path "$plist") || binary_rc=$?
+                if [[ $binary_rc -eq 124 || $binary_rc -ge 128 ]]; then
+                    reference_scan_rc=$binary_rc
+                    break
+                fi
+                if [[ $binary_rc -ne 0 ]]; then
+                    # Distinguish a valid plist with no absolute Program from a
+                    # read failure. Re-read the key after proving the document
+                    # parses so a transient failed probe cannot become absence
+                    # evidence. Any still-inconclusive document keeps helpers.
+                    local readable_rc=0
+                    _plist_document_is_readable "$plist" || readable_rc=$?
+                    if [[ $readable_rc -eq 124 || $readable_rc -ge 128 ]]; then
+                        reference_scan_rc=$readable_rc
+                        break
+                    elif [[ $readable_rc -ne 0 ]]; then
+                        reference_scan_rc=2
+                        break
+                    fi
+
+                    binary_rc=0
+                    referenced_binary=$(_plist_binary_path "$plist") || binary_rc=$?
+                    if [[ $binary_rc -eq 124 || $binary_rc -ge 128 ]]; then
+                        reference_scan_rc=$binary_rc
+                        break
+                    elif [[ $binary_rc -ne 0 && $binary_rc -ne 1 ]]; then
+                        reference_scan_rc=2
+                        break
+                    elif [[ $binary_rc -eq 1 ]]; then
+                        continue
+                    fi
+                fi
+
+                if [[ "$referenced_binary" == "$helper" ]] ||
+                    [[ "$(mole_path_identity "$referenced_binary")" == "$(mole_path_identity "$helper")" ]]; then
+                    reference_scan_rc=1
+                    break
+                fi
+            done < "$reference_scan_file"
+
+            [[ $reference_scan_rc -eq 0 ]] || break
+        done
+
+        rm -f -- "$reference_scan_file" 2> /dev/null || true # SAFE: exact tracked temp file created above
+        return "$reference_scan_rc"
     }
 
     _orphan_service_candidate_still_eligible() {
@@ -1286,6 +1440,17 @@ clean_orphaned_system_services() {
                 return "$helper_resolver_rc"
             fi
             [[ $SECONDS -lt $service_cleanup_deadline ]] || return 124
+
+            if [[ "$candidate" == /Library/PrivilegedHelperTools/* ]]; then
+                local reference_rc=0
+                _orphan_service_helper_is_unreferenced "$candidate" \
+                    "$service_cleanup_deadline" || reference_rc=$?
+                if [[ $reference_rc -eq 124 || $reference_rc -ge 128 ]]; then
+                    return "$reference_rc"
+                elif [[ $reference_rc -ne 0 ]]; then
+                    return 1
+                fi
+            fi
         fi
 
         # Classification may touch Spotlight and application bundles. Reject a
@@ -1505,6 +1670,9 @@ clean_orphaned_system_services() {
     if [[ $orphaned_count -gt 0 && ${#WHITELIST_PATTERNS[@]} -gt 0 ]]; then
         local -a kept_files=()
         local -a kept_identities=()
+        local -a kept_parents=()
+        local -a kept_parent_ids=()
+        local -a kept_target_ids=()
         local whitelist_index=0
         for ((whitelist_index = 0; whitelist_index < orphaned_count; whitelist_index++)); do
             local orphan_file="${orphaned_files[$whitelist_index]}"
@@ -1514,6 +1682,9 @@ clean_orphaned_system_services() {
             fi
             kept_files+=("$orphan_file")
             kept_identities+=("${orphaned_identities[$whitelist_index]}")
+            kept_parents+=("${orphaned_parents[$whitelist_index]}")
+            kept_parent_ids+=("${orphaned_parent_ids[$whitelist_index]}")
+            kept_target_ids+=("${orphaned_target_ids[$whitelist_index]}")
         done
         orphaned_count=${#kept_files[@]}
         # Guard the empty-array expansion: macOS /bin/bash is 3.2, which treats
@@ -1523,9 +1694,15 @@ clean_orphaned_system_services() {
         if ((orphaned_count > 0)); then
             orphaned_files=("${kept_files[@]}")
             orphaned_identities=("${kept_identities[@]}")
+            orphaned_parents=("${kept_parents[@]}")
+            orphaned_parent_ids=("${kept_parent_ids[@]}")
+            orphaned_target_ids=("${kept_target_ids[@]}")
         else
             orphaned_files=()
             orphaned_identities=()
+            orphaned_parents=()
+            orphaned_parent_ids=()
+            orphaned_target_ids=()
         fi
     fi
 
@@ -1542,6 +1719,9 @@ clean_orphaned_system_services() {
         for ((orphan_index = 0; orphan_index < orphaned_count; orphan_index++)); do
             local orphan_file="${orphaned_files[$orphan_index]}"
             local expected_identity="${orphaned_identities[$orphan_index]}"
+            local expected_parent="${orphaned_parents[$orphan_index]}"
+            local expected_parent_id="${orphaned_parent_ids[$orphan_index]}"
+            local expected_target_id="${orphaned_target_ids[$orphan_index]}"
             local eligibility_rc=0
             _orphan_service_candidate_still_eligible "$orphan_file" "$expected_identity" || eligibility_rc=$?
             if [[ $eligibility_rc -eq 124 ]]; then
@@ -1578,7 +1758,7 @@ clean_orphaned_system_services() {
                 fi
                 if [[ $orphan_size_rc -eq 124 ]]; then
                     echo -e "  ${YELLOW}${ICON_WARNING}${NC} Orphaned system services · ${GRAY}time limit reached, stopped cleanup${NC}"
-                    debug_log "Orphaned services stopped by deadline at stage: launchctl bootout"
+                    debug_log "Orphaned services stopped by deadline at stage: dry-run sizing"
                     note_activity
                     return 0
                 fi
@@ -1613,38 +1793,12 @@ clean_orphaned_system_services() {
                 fi
                 [[ $file_size_rc -eq 0 && "$file_size_kb" =~ ^[0-9]+$ ]] || file_size_kb=0
 
-                # Unload if it's a LaunchDaemon/LaunchAgent
-                if [[ "$orphan_file" == *.plist ]]; then
-                    local pre_unload_rc=0
-                    _orphan_service_candidate_still_eligible "$orphan_file" \
-                        "$expected_identity" || pre_unload_rc=$?
-                    if [[ $pre_unload_rc -eq 124 ]]; then
-                        echo -e "  ${YELLOW}${ICON_WARNING}${NC} Orphaned system services · ${GRAY}time limit reached, stopped cleanup${NC}"
-                        debug_log "Orphaned services stopped by deadline at stage: privileged plist removal"
-                        note_activity
-                        return 0
-                    elif [[ $pre_unload_rc -ge 128 ]]; then
-                        return "$pre_unload_rc"
-                    elif [[ $pre_unload_rc -ne 0 ]]; then
-                        debug_log "Keeping changed or no-longer-orphaned service before unload: $orphan_file"
-                        continue
-                    fi
-                    local unload_rc=0
-                    local unload_timeout=""
-                    unload_timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" \
-                        "$service_cleanup_deadline") || unload_rc=$?
-                    if [[ $unload_rc -eq 0 ]]; then
-                        _mole_bounded_sudo "$unload_timeout" \
-                            -n launchctl unload "$orphan_file" < /dev/null 2> /dev/null || unload_rc=$?
-                    fi
-                    if [[ $unload_rc -eq 124 ]]; then
-                        echo -e "  ${YELLOW}${ICON_WARNING}${NC} Orphaned system services · ${GRAY}unload timed out, stopped cleanup${NC}"
-                        note_activity
-                        return 0
-                    elif [[ $unload_rc -ge 128 ]]; then
-                        return "$unload_rc"
-                    fi
-                fi
+                # Removing an orphaned registration is file cleanup, not launchd
+                # state management. Legacy load/unload does not report whether a
+                # job changed state and selects its domain from the invoking user,
+                # so a refused removal could otherwise leave a live service offline.
+                # Keep the running job untouched; launchd drops the absent plist on
+                # the next boot/login after a successful file removal. See #1447.
                 local final_eligibility_rc=0
                 _orphan_service_candidate_still_eligible "$orphan_file" \
                     "$expected_identity" || final_eligibility_rc=$?
@@ -1660,7 +1814,8 @@ clean_orphaned_system_services() {
                     continue
                 fi
                 local remove_rc=0
-                safe_sudo_remove "$orphan_file" "" "$service_cleanup_deadline" || remove_rc=$?
+                safe_sudo_remove "$orphan_file" "$file_size_kb" "$service_cleanup_deadline" \
+                    "$expected_parent" "$expected_parent_id" "$expected_target_id" || remove_rc=$?
                 if [[ $remove_rc -eq 0 ]]; then
                     debug_log "Removed orphaned service: $orphan_file"
                     removed_count=$((removed_count + 1))

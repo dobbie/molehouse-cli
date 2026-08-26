@@ -200,6 +200,40 @@ EOF
 	[[ "$output" == \~/www/app/node_modules ]]
 }
 
+@test "find_purge_project_root_for_artifact prefers the owning monorepo" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+
+artifact="$HOME/www/obelisk/apps/web/node_modules"
+mkdir -p "$artifact"
+touch "$HOME/www/obelisk/pnpm-workspace.yaml"
+touch "$HOME/www/obelisk/apps/web/package.json"
+
+find_purge_project_root_for_artifact "$artifact"
+EOF
+
+	[ "$status" -eq 0 ] || return 1
+	[ "$output" = "$HOME/www/obelisk" ] || return 1
+}
+
+@test "find_purge_project_root_for_artifact prefers a worktree over its nested package" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+
+artifact="$HOME/.codex/worktrees/obelisk/apps/web/node_modules"
+mkdir -p "$artifact"
+touch "$HOME/.codex/worktrees/obelisk/.git"
+touch "$HOME/.codex/worktrees/obelisk/apps/web/package.json"
+
+find_purge_project_root_for_artifact "$artifact"
+EOF
+
+	[ "$status" -eq 0 ] || return 1
+	[ "$output" = "$HOME/.codex/worktrees/obelisk" ] || return 1
+}
+
 @test "filter_nested_artifacts: removes nested node_modules" {
 	mkdir -p "$HOME/www/project/node_modules/package/node_modules"
 
@@ -364,6 +398,66 @@ EOF
 	[[ "$output" == *"yes"* ]]
 }
 
+@test "is_project_container rejects purge targets so artifacts are never scanned into (#1459)" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+
+# Every npm package ships package.json, the first project indicator, so a
+# stray ~/node_modules matches the container probe unless targets are rejected.
+mkdir -p "$HOME/node_modules/markdown-it/dist"
+printf '{"name":"markdown-it"}' > "$HOME/node_modules/markdown-it/package.json"
+mkdir -p "$HOME/vendor/acme/lib"
+printf '{"name":"acme/lib"}' > "$HOME/vendor/acme/composer.json"
+mkdir -p "$HOME/Pods/SomePod"
+printf 'x' > "$HOME/Pods/SomePod/Package.swift"
+
+for artifact in node_modules vendor Pods; do
+    if is_project_container "$HOME/$artifact" 2; then
+        echo "FAIL: $artifact classified as container"
+        exit 1
+    fi
+done
+
+# A directory that is not a purge target still works.
+mkdir -p "$HOME/Sources/app"
+touch "$HOME/Sources/app/package.json"
+is_project_container "$HOME/Sources" 2 || exit 1
+echo ok
+EOF
+
+	[ "$status" -eq 0 ] || {
+		echo "$output"
+		return 1
+	}
+	[[ "$output" == *"ok"* ]]
+}
+
+@test "purge emits no candidates inside a stray home-level node_modules (#1459)" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+
+mkdir -p "$HOME/node_modules/markdown-it/dist" "$HOME/node_modules/khroma/build"
+printf '{"name":"markdown-it"}' > "$HOME/node_modules/markdown-it/package.json"
+printf '{"name":"khroma"}' > "$HOME/node_modules/khroma/package.json"
+
+# Deleting node_modules/<pkg>/dist leaves the package half-installed and needs
+# a network restore, so the container must never be discovered as a scan root.
+if discover_project_dirs | grep -q "^$HOME/node_modules$"; then
+    echo "FAIL: stray node_modules discovered as a purge search path"
+    exit 1
+fi
+echo ok
+EOF
+
+	[ "$status" -eq 0 ] || {
+		echo "$output"
+		return 1
+	}
+	[[ "$output" == *"ok"* ]]
+}
+
 @test "discover_project_dirs includes detected containers" {
 	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
@@ -480,6 +574,100 @@ EOF
 
     [ "$status" -eq 0 ]
     [[ "$output" == *"PASS"* ]]
+}
+
+@test "select_purge_categories names the destructive choice and keeps project skip visible when narrow" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+
+tput() {
+	[[ "${1:-}" == "cols" ]] && printf '32\n'
+}
+PURGE_CATEGORY_SIZES="1"
+PURGE_RECENT_CATEGORIES="false"
+if select_purge_categories "~/work/obelisk 4KB | node_modules" <<< $'q\n'; then
+	exit 1
+fi
+EOF
+
+	[ "$status" -eq 0 ] || return 1
+	[[ "$output" == *"Select Artifacts to Purge"* ]] || return 1
+	[[ "$output" == *"X Skip"* ]] || return 1
+	[[ "$output" != *"Select Categories to Clean"* ]] || return 1
+}
+
+@test "select_purge_categories shows exact project boundaries and selection feedback" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+
+tput() {
+	case "${1:-}" in
+		cols) printf '100\n' ;;
+		lines) printf '24\n' ;;
+	esac
+}
+PURGE_CATEGORY_SIZES="100,50,25"
+PURGE_CATEGORY_PROJECT_IDS_ARRAY=("project-a" "project-a" "project-b")
+PURGE_CATEGORY_PROJECT_PATHS_ARRAY=("~/work/obelisk" "~/work/obelisk" "~/work/atlas")
+PURGE_CATEGORY_SIZE_UNKNOWN_FLAGS_ARRAY=("false" "false" "false")
+select_purge_categories "A node_modules" "A dist" "B target" <<< $'x\n'
+printf 'RESULT=%s\n' "$PURGE_SELECTION_RESULT"
+EOF
+
+	[ "$status" -eq 0 ] || return 1
+	[[ "$output" == *"┌ A node_modules"* ]] || return 1
+	[[ "$output" == *"└ A dist"* ]] || return 1
+	[[ "$output" == *"─ B target"* ]] || return 1
+	[[ "$output" == *"~/work/obelisk · 154KB · 2/2 selected"* ]] || return 1
+	[[ "$output" == *"~/work/obelisk · 154KB · 0/2 selected"* ]] || return 1
+	[[ "$output" == *"RESULT=2"* ]] || return 1
+}
+
+@test "select_purge_categories skips every artifact with the current project ID" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+
+PURGE_CATEGORY_SIZES="1,2,3"
+PURGE_CATEGORY_PROJECT_IDS_ARRAY=("project-a" "project-a" "project-b")
+select_purge_categories "A node_modules" "A dist" "B target" <<< $'x\n' > /dev/null
+printf 'RESULT=%s\n' "$PURGE_SELECTION_RESULT"
+EOF
+
+	[ "$status" -eq 0 ] || return 1
+	[[ "$output" == *"RESULT=2"* ]] || return 1
+}
+
+@test "select_purge_categories skips only the current row without a project ID" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+
+PURGE_CATEGORY_SIZES="1,2"
+PURGE_CATEGORY_PROJECT_IDS_ARRAY=("" "project-a")
+select_purge_categories "Unknown node_modules" "A dist" <<< $'x\n' > /dev/null
+printf 'RESULT=%s\n' "$PURGE_SELECTION_RESULT"
+EOF
+
+	[ "$status" -eq 0 ] || return 1
+	[[ "$output" == *"RESULT=1"* ]] || return 1
+}
+
+@test "select_purge_categories does not group same-named projects" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+
+PURGE_CATEGORY_SIZES="1,2"
+PURGE_CATEGORY_PROJECT_IDS_ARRAY=("inode:1:10" "inode:1:20")
+select_purge_categories "~/client-a/obelisk node_modules" "~/client-b/obelisk dist" <<< $'x\n' > /dev/null
+printf 'RESULT=%s\n' "$PURGE_SELECTION_RESULT"
+EOF
+
+	[ "$status" -eq 0 ] || return 1
+	[[ "$output" == *"RESULT=1"* ]] || return 1
 }
 
 @test "confirm_purge_cleanup accepts Enter" {
@@ -857,6 +1045,84 @@ EOF
 	[ "$status" -eq 0 ]
 }
 
+@test "scan_purge_targets: discards a failed find target scan prefix" {
+	mkdir -p "$HOME/.config/mole" "$HOME/www/test-project/node_modules"
+	printf '%s\n' "$HOME/www" > "$HOME/.config/mole/purge_paths"
+
+	local mock_bin="$HOME/mock-find-target-failure"
+	mkdir -p "$mock_bin"
+	cat > "$mock_bin/find" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$HOME/www/test-project/node_modules"
+exit 7
+EOF
+	chmod +x "$mock_bin/find"
+
+	local scan_output
+	scan_output="$(mktemp)"
+
+	run env HOME="$HOME" PATH="$mock_bin:$PATH" PROJECT_ROOT="$PROJECT_ROOT" SCAN_OUTPUT="$scan_output" \
+		/bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+
+scan_status=0
+MO_USE_FIND=1 scan_purge_targets "$HOME/www" "$SCAN_OUTPUT" || scan_status=$?
+printf 'STATUS=%s\n' "$scan_status"
+[[ ! -s "$SCAN_OUTPUT" ]] || exit 1
+EOF
+
+	rm -f "$scan_output"
+	[ "$status" -eq 0 ] || return 1
+	[[ "$output" == *"STATUS=7"* ]] || return 1
+}
+
+@test "scan_purge_targets: discards target results when the tag scan fails" {
+	mkdir -p "$HOME/.config/mole" "$HOME/www/test-project/node_modules"
+	printf '%s\n' "$HOME/www" > "$HOME/.config/mole/purge_paths"
+
+	local mock_bin="$HOME/mock-find-tag-failure"
+	mkdir -p "$mock_bin"
+	cat > "$mock_bin/find" <<'EOF'
+#!/bin/bash
+result_type=""
+while [[ $# -gt 0 ]]; do
+	if [[ "$1" == "-type" && $# -gt 1 ]]; then
+		result_type="$2"
+		break
+	fi
+	shift
+done
+
+if [[ "$result_type" == "d" ]]; then
+	printf '%s\n' "$HOME/www/test-project/node_modules"
+	exit 0
+fi
+
+printf '%s\n' "$HOME/www/test-project/.cache/CACHEDIR.TAG"
+exit 9
+EOF
+	chmod +x "$mock_bin/find"
+
+	local scan_output
+	scan_output="$(mktemp)"
+
+	run env HOME="$HOME" PATH="$mock_bin:$PATH" PROJECT_ROOT="$PROJECT_ROOT" SCAN_OUTPUT="$scan_output" \
+		/bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+
+scan_status=0
+MO_USE_FIND=1 scan_purge_targets "$HOME/www" "$SCAN_OUTPUT" || scan_status=$?
+printf 'STATUS=%s\n' "$scan_status"
+[[ ! -s "$SCAN_OUTPUT" ]] || exit 1
+EOF
+
+	rm -f "$scan_output"
+	[ "$status" -eq 0 ] || return 1
+	[[ "$output" == *"STATUS=9"* ]] || return 1
+}
+
 @test "is_recently_modified: detects recent projects" {
 	mkdir -p "$HOME/www/project/node_modules"
 	touch "$HOME/www/project/package.json"
@@ -1069,14 +1335,180 @@ EOF
 }
 
 @test "clean_project_artifacts: handles empty directory gracefully" {
-	run /bin/bash -c "
-        export HOME='$HOME'
-        source '$PROJECT_ROOT/lib/core/common.sh'
-        source '$PROJECT_ROOT/lib/clean/project.sh'
-        clean_project_artifacts
-    " </dev/null
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/project.sh"
+clean_project_artifacts </dev/null
+printf 'PURGE_OUTCOME=%s\n' "$PURGE_RUN_OUTCOME"
+EOF
 
-	[[ "$status" -eq 0 ]] || [[ "$status" -eq 2 ]]
+	[ "$status" -eq 0 ] || return 1
+	[[ "$output" == *"PURGE_OUTCOME=no_candidates"* ]] || return 1
+}
+
+@test "clean_project_artifacts: keeps completed roots and reports failed roots" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/project.sh"
+
+good_root="$HOME/www"
+failed_root="$HOME/dev"
+good_artifact="$good_root/good-project/node_modules"
+failed_artifact="$failed_root/failed-project/node_modules"
+mkdir -p "$good_artifact" "$failed_artifact" "$HOME/.cache/mole"
+touch "$good_root/good-project/package.json" "$failed_root/failed-project/package.json"
+
+PURGE_SEARCH_PATHS=("$good_root" "$failed_root")
+get_optimal_parallel_jobs() { echo 1; }
+scan_purge_targets() {
+	if [[ "$1" == "$good_root" ]]; then
+		printf '%s\n' "$good_artifact" > "$2"
+		return 0
+	fi
+	printf '%s\n' "$failed_artifact" > "$2"
+	return 7
+}
+get_dir_size_kb() { echo 4; }
+is_recently_modified() {
+	_PURGE_ACTIVITY_STATE=old
+	return 1
+}
+purge_target_activity_still_safe() { return 0; }
+safe_remove() {
+	printf 'REMOVE:%s\n' "$1"
+	return 0
+}
+
+export MOLE_DRY_RUN=1
+clean_project_artifacts </dev/null
+EOF
+
+	[ "$status" -eq 0 ] || return 1
+	[[ "$output" == *"Skipped 1 project scan root because scanning did not complete"* ]] || return 1
+	[[ "$output" == *"~/dev"* ]] || return 1
+	[[ "$output" == *"(status 7)"* ]] || return 1
+	[[ "$output" == *"REMOVE:$HOME/www/good-project/node_modules"* ]] || return 1
+	[[ "$output" != *"REMOVE:$HOME/dev/failed-project/node_modules"* ]] || return 1
+}
+
+@test "clean_project_artifacts: bounds concurrent root scans" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/project.sh"
+
+first_root="$HOME/www"
+second_root="$HOME/dev"
+first_artifact="$first_root/first-project/node_modules"
+second_artifact="$second_root/second-project/node_modules"
+scan_lock="$HOME/scan-active"
+mkdir -p "$first_artifact" "$second_artifact" "$HOME/.cache/mole"
+touch "$first_root/first-project/package.json" "$second_root/second-project/package.json"
+
+PURGE_SEARCH_PATHS=("$first_root" "$second_root")
+get_optimal_parallel_jobs() { echo 1; }
+scan_purge_targets() {
+	if ! mkdir "$scan_lock" 2>/dev/null; then
+		printf 'OVERLAPPING_SCAN\n'
+		return 7
+	fi
+	if [[ "$1" == "$first_root" ]]; then
+		printf '%s\n' "$first_artifact" > "$2"
+	else
+		printf '%s\n' "$second_artifact" > "$2"
+	fi
+	sleep 0.05
+	rmdir "$scan_lock"
+}
+get_dir_size_kb() { echo 4; }
+is_recently_modified() {
+	_PURGE_ACTIVITY_STATE=old
+	return 1
+}
+purge_target_activity_still_safe() { return 0; }
+safe_remove() { return 0; }
+
+export MOLE_DRY_RUN=1
+clean_project_artifacts </dev/null
+EOF
+
+	[ "$status" -eq 0 ] || return 1
+	[[ "$output" != *"OVERLAPPING_SCAN"* ]] || return 1
+	[[ "$output" != *"Skipped 1 project scan root"* ]] || return 1
+}
+
+@test "clean_project_artifacts: refuses when every configured root scan fails" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/project.sh"
+
+failed_root="$HOME/www"
+failed_artifact="$failed_root/failed-project/node_modules"
+mkdir -p "$failed_artifact" "$HOME/.cache/mole"
+touch "$failed_root/failed-project/package.json"
+
+PURGE_SEARCH_PATHS=("$failed_root")
+get_optimal_parallel_jobs() { echo 1; }
+scan_purge_targets() {
+	printf '%s\n' "$failed_artifact" > "$2"
+	return 7
+}
+safe_remove() {
+	printf 'UNEXPECTED_REMOVE:%s\n' "$1"
+	return 1
+}
+
+clean_project_artifacts </dev/null
+printf 'PURGE_OUTCOME=%s\n' "$PURGE_RUN_OUTCOME"
+EOF
+
+	[ "$status" -eq 0 ] || return 1
+	[[ "$output" == *"Skipped 1 project scan root because scanning did not complete"* ]] || return 1
+	[[ "$output" == *"~/www"* ]] || return 1
+	[[ "$output" == *"(status 7)"* ]] || return 1
+	[[ "$output" == *"PURGE_OUTCOME=scan_failed"* ]] || return 1
+	[[ "$output" != *"Great! No old project artifacts to clean"* ]] || return 1
+	[[ "$output" != *"UNEXPECTED_REMOVE:"* ]] || return 1
+}
+
+@test "perform_purge: suppresses completion summary for non-completed outcomes" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_SKIP_MAIN=1 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/purge.sh"
+
+clean_project_artifacts() {
+	PURGE_RUN_OUTCOME="cancelled"
+	return 0
+}
+print_summary_block() {
+	printf 'UNEXPECTED_SUMMARY\n'
+}
+
+perform_purge </dev/null
+printf 'PERFORM_RETURNED\n'
+EOF
+
+	[ "$status" -eq 0 ] || return 1
+	[[ "$output" == *"PERFORM_RETURNED"* ]] || return 1
+	[[ "$output" != *"UNEXPECTED_SUMMARY"* ]] || return 1
+}
+
+@test "perform_purge: preserves errexit for unexpected cleanup failures" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_SKIP_MAIN=1 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/bin/purge.sh"
+
+clean_project_artifacts() { return 7; }
+
+perform_purge </dev/null
+printf 'UNEXPECTED_CONTINUATION\n'
+EOF
+
+	[ "$status" -eq 7 ] || return 1
+	[[ "$output" != *"UNEXPECTED_CONTINUATION"* ]] || return 1
 }
 
 @test "clean_project_artifacts: handles empty menu options under set -u" {
@@ -1217,6 +1649,84 @@ EOF
 	[[ "$output" == *"REMOVE:$BATS_TEST_TMPDIR/var-www/site/node_modules"* ]]
 }
 
+@test "clean_project_artifacts refuses a candidate reached through a replaced configured root" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/project.sh"
+
+configured_root="$HOME/www"
+original_root="$HOME/www-original"
+redirected_root="$HOME/redirected"
+artifact="$configured_root/project/node_modules"
+redirected_artifact="$redirected_root/project/node_modules"
+mkdir -p "$artifact" "$redirected_artifact" "$HOME/.cache/mole"
+touch "$configured_root/project/package.json" "$redirected_root/project/package.json"
+
+PURGE_SEARCH_PATHS=("$configured_root")
+scan_purge_targets() { printf '%s\n' "$artifact" > "$2"; }
+get_dir_size_kb() { echo 1; }
+is_recently_modified() {
+	_PURGE_ACTIVITY_STATE=old
+	return 1
+}
+purge_target_activity_still_safe() {
+	mv "$configured_root" "$original_root"
+	ln -s "$redirected_root" "$configured_root"
+	return 0
+}
+
+clean_project_artifacts </dev/null
+
+original_preserved=false
+redirected_preserved=false
+[[ -d "$original_root/project/node_modules" ]] && original_preserved=true
+[[ -d "$redirected_artifact" ]] && redirected_preserved=true
+rm "$configured_root"
+mv "$original_root" "$configured_root"
+rm -rf "$redirected_root"
+[[ "$original_preserved" == "true" ]] || exit 1
+[[ "$redirected_preserved" == "true" ]] || exit 1
+EOF
+
+	[ "$status" -eq 0 ] || return 1
+}
+
+@test "clean_project_artifacts refuses a replacement at the selected artifact leaf" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/project.sh"
+
+configured_root="$HOME/www"
+artifact="$configured_root/project/node_modules"
+original_artifact="$configured_root/project/node_modules-original"
+replacement="$HOME/replacement-node-modules"
+mkdir -p "$artifact" "$replacement" "$HOME/.cache/mole"
+touch "$configured_root/project/package.json"
+
+PURGE_SEARCH_PATHS=("$configured_root")
+scan_purge_targets() { printf '%s\n' "$artifact" > "$2"; }
+get_dir_size_kb() { echo 1; }
+is_recently_modified() {
+	_PURGE_ACTIVITY_STATE=old
+	return 1
+}
+purge_target_activity_still_safe() {
+	mv "$artifact" "$original_artifact"
+	mv "$replacement" "$artifact"
+	return 0
+}
+
+clean_project_artifacts </dev/null
+
+[[ -d "$original_artifact" ]] || exit 1
+[[ -d "$artifact" ]] || exit 1
+EOF
+
+	[ "$status" -eq 0 ] || return 1
+}
+
 @test "clean_project_artifacts: non-interactive dry-run shows cloud marker and preserves artifact" {
 	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
@@ -1315,13 +1825,15 @@ EOF
 
 	run /bin/bash -c "
         export HOME='$HOME'
-        $timeout_cmd 5 '$PROJECT_ROOT/bin/purge.sh' 2>&1 < /dev/null || true
+        exec $timeout_cmd 5 '$PROJECT_ROOT/bin/purge.sh' 2>&1 < /dev/null
     "
 
-	[[ "$output" =~ "Scanning" ]] ||
-		[[ "$output" =~ "Purge complete" ]] ||
-		[[ "$output" =~ "No old" ]] ||
-		[[ "$output" =~ "Great" ]]
+	[ "$status" -eq 0 ] || return 1
+	[[ "$output" == *"Purge Project Artifacts"* ]] || return 1
+	[[ "$output" == *"No items selected"* ]] ||
+		[[ "$output" == *"Purge complete"* ]] ||
+		[[ "$output" == *"No old"* ]] ||
+		[[ "$output" == *"Great"* ]] || return 1
 }
 
 @test "mo purge: command exists and is executable" {
@@ -1404,6 +1916,51 @@ EOF
     "
 
 	[ -d "$HOME/.cache/mole" ] || [ -d "${XDG_CACHE_HOME:-$HOME/.cache}/mole" ]
+}
+
+@test "mo purge skips whitelisted project artifacts (#1427)" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+
+protected="$HOME/www/protected/node_modules"
+unprotected="$HOME/www/unprotected/node_modules"
+mkdir -p "$protected" "$unprotected" "$HOME/.config/mole" "$HOME/.cache/mole"
+printf 'keep\n' > "$protected/keep.js"
+printf 'remove\n' > "$unprotected/remove.js"
+touch "$HOME/www/protected/package.json" "$HOME/www/unprotected/package.json"
+touch -t 202001010101 \
+    "$protected/keep.js" "$protected" "$HOME/www/protected/package.json" "$HOME/www/protected" \
+    "$unprotected/remove.js" "$unprotected" "$HOME/www/unprotected/package.json" "$HOME/www/unprotected"
+printf '%s\n' "$protected" > "$HOME/.config/mole/whitelist"
+
+export MOLE_SKIP_MAIN=1
+export MOLE_TEST_NO_AUTH=1
+source "$PROJECT_ROOT/bin/purge.sh"
+PURGE_SEARCH_PATHS=("$HOME/www")
+scan_purge_targets() {
+    printf '%s\n' "$protected" "$unprotected" > "$2"
+}
+get_dir_size_kb() { echo 1; }
+get_file_mtime() { echo 1577836800; }
+is_recently_modified() { return 1; }
+purge_target_activity_still_safe() { return 0; }
+
+start_purge
+clean_project_artifacts </dev/null
+
+protected_loaded=false
+for pattern in "${WHITELIST_PATTERNS[@]}"; do
+    if [[ "$pattern" == "$protected" ]]; then
+        protected_loaded=true
+        break
+    fi
+done
+[[ "$protected_loaded" == "true" ]] || exit 1
+[[ -d "$protected" ]] || exit 1
+[[ ! -e "$unprotected" ]] || exit 1
+EOF
+
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
 }
 
 # .NET bin directory detection tests
@@ -1605,6 +2162,16 @@ select_purge_categories() {
 		echo "PATH[\$i]=\$p" >> "$capture_file"
 		i=\$((i + 1))
 	done
+	i=0
+	for project_id in "\${PURGE_CATEGORY_PROJECT_IDS_ARRAY[@]}"; do
+		echo "PROJECT_ID[\$i]=\$project_id" >> "$capture_file"
+		i=\$((i + 1))
+	done
+	i=0
+	for project_path in "\${PURGE_CATEGORY_PROJECT_PATHS_ARRAY[@]}"; do
+		echo "PROJECT_PATH[\$i]=\$project_path" >> "$capture_file"
+		i=\$((i + 1))
+	done
 	PURGE_SELECTION_RESULT=""
 	return 1
 }
@@ -1624,10 +2191,13 @@ SCRIPT
 	sizes_csv=$(grep '^SIZES=' "$capture_file" | cut -d= -f2-)
 	IFS=',' read -r -a sizes <<< "$sizes_csv"
 
-	local path0 path1
+	local path0 path1 project_id0 project_path0 expected_project_id0
 	path0=$(grep '^PATH\[0\]=' "$capture_file" | head -1 | cut -d= -f2-)
 	path1=$(grep '^PATH\[1\]=' "$capture_file" | head -1 | cut -d= -f2-)
+	project_id0=$(grep '^PROJECT_ID\[0\]=' "$capture_file" | head -1 | cut -d= -f2-)
+	project_path0=$(grep '^PROJECT_PATH\[0\]=' "$capture_file" | head -1 | cut -d= -f2-)
 	rm -f "$capture_file"
+	expected_project_id0=$(/bin/bash --noprofile --norc -c "source '$PROJECT_ROOT/lib/core/common.sh'; mole_path_identity '$HOME/www/beta'")
 
 	# PURGE_CATEGORY_SIZES must be sorted descending (largest first).
 	[ "${sizes[0]}" -gt "${sizes[1]}" ]
@@ -1635,9 +2205,114 @@ SCRIPT
 	# Index 0 → largest artifact → beta's path.
 	# With the bug path0 = alpha (discovery order) → [[ ... == *beta* ]] fails.
 	[[ "$path0" == *"beta"* ]] || return 1
+	[ "$project_id0" = "$expected_project_id0" ] || return 1
+	[[ "$project_path0" == *"beta"* ]] || return 1
 
 	# Index 1 → smaller artifact → alpha's path.
 	[[ "$path1" == *"alpha"* ]]
+}
+
+@test "sort: project groups use aggregate size before artifact size" {
+	mkdir -p "$HOME/www/alpha/node_modules" "$HOME/www/alpha/.venv"
+	mkdir -p "$HOME/www/beta/node_modules"
+	echo '{}' > "$HOME/www/alpha/package.json"
+	echo '{}' > "$HOME/www/beta/package.json"
+	dd if=/dev/zero of="$HOME/www/alpha/node_modules/data" bs=1024 count=130 2>/dev/null
+	dd if=/dev/zero of="$HOME/www/alpha/.venv/data" bs=1024 count=110 2>/dev/null
+	dd if=/dev/zero of="$HOME/www/beta/node_modules/data" bs=1024 count=200 2>/dev/null
+
+	local capture_file script_file
+	capture_file=$(mktemp "$HOME/group_sort_capture.XXXXXX")
+	script_file=$(mktemp "$HOME/group_sort_script.XXXXXX.sh")
+
+	cat > "$script_file" << SCRIPT
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+mkdir -p "$HOME/.cache/mole"
+export XDG_CACHE_HOME="$HOME/.cache"
+export TERM="dumb"
+PURGE_SEARCH_PATHS=("$HOME/www")
+
+select_purge_categories() {
+	local i=0
+	for path in "\${PURGE_CATEGORY_FULL_PATHS_ARRAY[@]}"; do
+		echo "PATH[\$i]=\$path" >> "$capture_file"
+		i=\$((i + 1))
+	done
+	PURGE_SELECTION_RESULT=""
+	return 1
+}
+
+clean_project_artifacts 2>/dev/null
+SCRIPT
+
+	_run_in_pty "$script_file"
+	rm -f "$script_file"
+
+	[ "$(grep -c '^PATH\[' "$capture_file")" -eq 3 ] || return 1
+	local path0 path1 path2
+	path0=$(grep '^PATH\[0\]=' "$capture_file" | cut -d= -f2-)
+	path1=$(grep '^PATH\[1\]=' "$capture_file" | cut -d= -f2-)
+	path2=$(grep '^PATH\[2\]=' "$capture_file" | cut -d= -f2-)
+	rm -f "$capture_file"
+
+	[[ "$path0" == *"alpha/node_modules"* ]] || return 1
+	[[ "$path1" == *"alpha/.venv"* ]] || return 1
+	[[ "$path2" == *"beta/node_modules"* ]] || return 1
+}
+
+@test "grouping: indicator-less sibling artifacts share their exact parent" {
+	mkdir -p "$HOME/www/unmarked/node_modules" "$HOME/www/unmarked/dist"
+	dd if=/dev/zero of="$HOME/www/unmarked/node_modules/data" bs=1024 count=5 2>/dev/null
+	dd if=/dev/zero of="$HOME/www/unmarked/dist/data" bs=1024 count=4 2>/dev/null
+
+	local capture_file script_file
+	capture_file=$(mktemp "$HOME/fallback_group_capture.XXXXXX")
+	script_file=$(mktemp "$HOME/fallback_group_script.XXXXXX.sh")
+
+	cat > "$script_file" << SCRIPT
+set -euo pipefail
+source "$PROJECT_ROOT/lib/clean/project.sh"
+mkdir -p "$HOME/.cache/mole"
+export XDG_CACHE_HOME="$HOME/.cache"
+export TERM="dumb"
+PURGE_SEARCH_PATHS=("$HOME/www")
+
+select_purge_categories() {
+	local i=0
+	for project_id in "\${PURGE_CATEGORY_PROJECT_IDS_ARRAY[@]}"; do
+		echo "PROJECT_ID[\$i]=\$project_id" >> "$capture_file"
+		i=\$((i + 1))
+	done
+	i=0
+	for project_path in "\${PURGE_CATEGORY_PROJECT_PATHS_ARRAY[@]}"; do
+		echo "PROJECT_PATH[\$i]=\$project_path" >> "$capture_file"
+		i=\$((i + 1))
+	done
+	PURGE_SELECTION_RESULT=""
+	return 1
+}
+
+clean_project_artifacts 2>/dev/null
+SCRIPT
+
+	_run_in_pty "$script_file"
+	rm -f "$script_file"
+
+	[ "$(grep -c '^PROJECT_ID\[' "$capture_file")" -eq 2 ] || return 1
+	local project_id0 project_id1 project_path0 project_path1 expected_project_id expected_project_path
+	project_id0=$(grep '^PROJECT_ID\[0\]=' "$capture_file" | cut -d= -f2-)
+	project_id1=$(grep '^PROJECT_ID\[1\]=' "$capture_file" | cut -d= -f2-)
+	project_path0=$(grep '^PROJECT_PATH\[0\]=' "$capture_file" | cut -d= -f2-)
+	project_path1=$(grep '^PROJECT_PATH\[1\]=' "$capture_file" | cut -d= -f2-)
+	rm -f "$capture_file"
+	expected_project_id=$(/bin/bash --noprofile --norc -c "source '$PROJECT_ROOT/lib/core/common.sh'; mole_path_identity '$HOME/www/unmarked'")
+	printf -v expected_project_path '~%s' '/www/unmarked'
+
+	[ "$project_id0" = "$expected_project_id" ] || return 1
+	[ "$project_id1" = "$expected_project_id" ] || return 1
+	[ "$project_path0" = "$expected_project_path" ] || return 1
+	[ "$project_path1" = "$expected_project_path" ] || return 1
 }
 
 @test "sort: cloud marker stays aligned across menu and full-path arrays" {

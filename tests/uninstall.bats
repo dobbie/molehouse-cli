@@ -317,6 +317,7 @@ EOF
 
 @test "format_uninstall_preview_path includes per-path size" {
     dd if=/dev/zero of="$HOME/preview-size-file" bs=1024 count=1 > /dev/null 2>&1
+    expected_size_kb="$(du -skP "$HOME/preview-size-file" | awk '{print $1}')"
 
     result="$(
         HOME="$HOME" /bin/bash --noprofile --norc << 'EOF'
@@ -328,7 +329,7 @@ EOF
     )"
 
     [[ "$result" == *"~/preview-size-file"* ]] || return 1
-    [[ "$result" == *"1KB"* ]]
+    [[ "$result" == *"${expected_size_kb}KB"* ]]
 }
 
 @test "format_uninstall_preview_path propagates timed out and interrupted size probes" {
@@ -633,8 +634,8 @@ cp "$APP_ROOT/Selected.app/Contents/Info.plist" \
     "$APP_ROOT/Utilities/AnotherSibling.app/Contents/Info.plist"
 uninstall_live_bundle_has_other_install \
     "com.example.live-shared" "$APP_ROOT/Selected.app"
-[[ ${#_MOLE_UNINSTALL_LIVE_SIBLING_PATHS[@]} -eq 2 ]]
-[[ "$first_fingerprint" != "$_MOLE_UNINSTALL_LIVE_SIBLING_FINGERPRINT" ]]
+[[ ${#_MOLE_UNINSTALL_LIVE_SIBLING_PATHS[@]} -eq 2 ]] || exit 1
+[[ "$first_fingerprint" != "$_MOLE_UNINSTALL_LIVE_SIBLING_FINGERPRINT" ]] || exit 1
 
 mkdir -p "$HOME/external/LinkedSibling.app/Contents"
 cp "$APP_ROOT/Selected.app/Contents/Info.plist" \
@@ -705,8 +706,8 @@ live_rc=0
 uninstall_live_bundle_has_other_install \
     "com.example.volume-root" "$HOME/Selected.app" || live_rc=$?
 printf 'LIVE_RC=%s PATHS=%s\n' "$live_rc" "${#_MOLE_UNINSTALL_LIVE_SIBLING_PATHS[@]}"
-[[ $live_rc -eq 0 ]]
-[[ ${#_MOLE_UNINSTALL_LIVE_SIBLING_PATHS[@]} -eq 1 ]]
+[[ $live_rc -eq 0 ]] || exit 1
+[[ ${#_MOLE_UNINSTALL_LIVE_SIBLING_PATHS[@]} -eq 1 ]] || exit 1
 [[ "${_MOLE_UNINSTALL_LIVE_SIBLING_PATHS[0]}" == "$SURVIVOR" ]]
 EOF
 
@@ -904,7 +905,7 @@ total_items=0
 
 _batch_execute_removals
 [[ $success_count -eq 0 && $failed_count -eq 1 ]]
-[[ "${failed_items[0]}" == *"app installation set changed after preview"* ]]
+[[ "${failed_items[0]}" == *"app installation set changed after preview"* ]] || exit 1
 [[ ! -e "$HOME/teardown-ran" ]]
 EOF
 
@@ -940,8 +941,8 @@ IFS="$old_ifs"
 
 printf 'new bundle metadata\n' > "$app_path/Contents/Info.plist"
 touch -t 202101010000 "$app_path/Contents/Info.plist"
-[[ "$(_batch_selected_app_identity "$app_path")" == "$expected_identity" ]]
-[[ "$(_batch_selected_app_info_identity "$app_path")" != "$expected_info_identity" ]]
+[[ "$(_batch_selected_app_identity "$app_path")" == "$expected_identity" ]] || exit 1
+[[ "$(_batch_selected_app_info_identity "$app_path")" != "$expected_info_identity" ]] || exit 1
 
 uninstall_live_bundle_has_other_install() {
     _MOLE_UNINSTALL_LIVE_SIBLING_FINGERPRINT=""
@@ -967,7 +968,7 @@ total_items=0
 
 _batch_execute_removals
 [[ $success_count -eq 0 && $failed_count -eq 1 ]]
-[[ "${failed_items[0]}" == *"selected app changed after preview"* ]]
+[[ "${failed_items[0]}" == *"selected app changed after preview"* ]] || exit 1
 [[ ! -e "$HOME/teardown-ran" ]]
 EOF
 
@@ -1027,10 +1028,10 @@ total_estimated_size=0
 _batch_scan_app_details
 IFS='|' read -r _ _ stored_bundle _ _ _ _ _ _ _ _ _ _ stored_guard _ \
     stored_original stored_fingerprint _ <<< "${app_details[0]}"
-[[ "$stored_bundle" == "unknown" ]]
-[[ "$stored_guard" == "guard_login" ]]
-[[ "$stored_original" == "com.example.shared" ]]
-[[ -n "$stored_fingerprint" ]]
+[[ "$stored_bundle" == "unknown" ]] || exit 1
+[[ "$stored_guard" == "guard_login" ]] || exit 1
+[[ "$stored_original" == "com.example.shared" ]] || exit 1
+[[ -n "$stored_fingerprint" ]] || exit 1
 [[ ! -e "$HOME/unexpected-discovery" ]]
 EOF
 
@@ -1092,8 +1093,8 @@ app_details=()
 total_estimated_size=0
 
 _batch_scan_app_details
-[[ ${#app_details[@]} -eq 2 ]]
-[[ ! -e "$HOME/unexpected-discovery" ]]
+[[ ${#app_details[@]} -eq 2 ]] || exit 1
+[[ ! -e "$HOME/unexpected-discovery" ]] || exit 1
 
 printf '%s\n' \
     '<?xml version="1.0" encoding="UTF-8"?>' \
@@ -1119,8 +1120,8 @@ total_items=0
 
 _batch_execute_removals
 [[ $success_count -eq 0 && $failed_count -eq 2 ]]
-[[ "${failed_items[0]}" == *"app installation set changed after preview"* ]]
-[[ "${failed_items[1]}" == *"selected app changed after preview"* ]]
+[[ "${failed_items[0]}" == *"app installation set changed after preview"* ]] || exit 1
+[[ "${failed_items[1]}" == *"selected app changed after preview"* ]] || exit 1
 [[ ! -e "$HOME/teardown-ran" ]]
 EOF
 
@@ -1183,8 +1184,8 @@ app_details=()
 total_estimated_size=0
 
 _batch_scan_app_details
-[[ ${#app_details[@]} -eq 2 ]]
-[[ ! -e "$HOME/unexpected-discovery" ]]
+[[ ${#app_details[@]} -eq 2 ]] || exit 1
+[[ ! -e "$HOME/unexpected-discovery" ]] || exit 1
 
 success_count=0
 failed_count=0
@@ -1234,8 +1235,8 @@ app_details=()
 total_estimated_size=0
 dry_scan_rc=0
 _batch_scan_app_details || dry_scan_rc=$?
-[[ $dry_scan_rc -eq 0 ]]
-[[ ${#app_details[@]} -eq 2 ]]
+[[ $dry_scan_rc -eq 0 ]] || exit 1
+[[ ${#app_details[@]} -eq 2 ]] || exit 1
 
 success_count=0
 failed_count=0
@@ -1252,7 +1253,7 @@ files_cleaned=0
 total_items=0
 dry_execute_rc=0
 _batch_execute_removals || dry_execute_rc=$?
-[[ $dry_execute_rc -eq 0 ]]
+[[ $dry_execute_rc -eq 0 ]] || exit 1
 [[ $success_count -eq 2 && $failed_count -eq 0 ]]
 [[ -e "$first" && -e "$second" ]]
 EOF
@@ -1540,7 +1541,7 @@ printf '\n' | batch_uninstall_applications > "$HOME/output.log" 2>&1
 grep -q "Review only: ~/system/com.example.review.helper" "$HOME/output.log"
 # The summary states the count, not the paths: they were already listed above
 # the confirmation prompt, so the path must appear exactly once in the run.
-[[ "$(grep -cF "~/system/com.example.review.helper" "$HOME/output.log")" -eq 1 ]]
+[[ "$(grep -cF "~/system/com.example.review.helper" "$HOME/output.log")" -eq 1 ]] || exit 1
 grep -q "Kept 1 system-level path, which Mole never removes" "$HOME/output.log"
 # Keeping system paths is the designed outcome, so the run is not "incomplete".
 ! grep -q "Uninstall incomplete" "$HOME/output.log"
@@ -2874,7 +2875,7 @@ trace_file="$HOME/scan-feedback-trace.log"
 scan_temp="$HOME/scan-feedback-temp"
 
 MOLE_UNINSTALL_META_CACHE_DIR="$HOME/.cache/mole"
-MOLE_UNINSTALL_META_CACHE_FILE="$MOLE_UNINSTALL_META_CACHE_DIR/uninstall_app_metadata_v1"
+MOLE_UNINSTALL_META_CACHE_FILE="$MOLE_UNINSTALL_META_CACHE_DIR/uninstall_app_metadata_v2"
 MOLE_UNINSTALL_META_CACHE_LOCK="${MOLE_UNINSTALL_META_CACHE_FILE}.lock"
 
 create_temp_file() { printf '%s\n' "$scan_temp"; }
@@ -2913,7 +2914,7 @@ actual=$(cat "$trace_file")
     exit 1
 }
 
-[[ ! -e "${scan_temp}.spinner_shown" ]]
+[[ ! -e "${scan_temp}.spinner_shown" ]] || exit 1
 [[ ! -e "${scan_temp}.scan_status" ]]
 INNER
 
@@ -2947,8 +2948,8 @@ paginated_multi_select() {
 }
 
 select_apps_for_uninstall
-[[ ${#selected_apps[@]} -eq 1 ]]
-[[ -z "${MOLE_MENU_IGNORE_INITIAL_ENTER:-}" ]]
+[[ ${#selected_apps[@]} -eq 1 ]] || exit 1
+[[ -z "${MOLE_MENU_IGNORE_INITIAL_ENTER:-}" ]] || exit 1
 
 expected=$(printf 'format\ndrain\nguard:1\npaginated\n')
 actual=$(cat "$trace_file")

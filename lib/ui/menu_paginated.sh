@@ -607,9 +607,13 @@ paginated_multi_select() {
                 [[ $i -lt $((seg_count - 1)) ]] && total_len=$((total_len + 3))
             done
 
-            # Level 1: Remove "Space Select" if too wide
+            # Level 1: drop the page and search hints. "Space Select" is the
+            # only footer entry that teaches the primary interaction, so it
+            # outranks paging, sorting and filtering, which a user finds by
+            # trying keys. Dropping it first made multi-select invisible below
+            # 76 columns and read as "uninstall has no multi-select" (#1382).
             if [[ $total_len -gt $term_width ]]; then
-                _segs=("$nav" "$page_ctrl" "$enter" "$sort_ctrl" "$order_ctrl" "$filter_ctrl" "$cancel_label")
+                _segs=("$nav" "$space_select" "$enter" "$sort_ctrl" "$order_ctrl" "$cancel_label")
 
                 total_len=0
                 seg_count=${#_segs[@]}
@@ -618,9 +622,9 @@ paginated_multi_select() {
                     [[ $i -lt $((seg_count - 1)) ]] && total_len=$((total_len + 3))
                 done
 
-                # Level 2: Remove sort label and page hint if still too wide
+                # Level 2: keep only selection, save and cancel.
                 if [[ $total_len -gt $term_width ]]; then
-                    _segs=("$nav" "$enter" "$order_ctrl" "$filter_ctrl" "$cancel_label")
+                    _segs=("$nav" "$space_select" "$enter" "$cancel_label")
                 fi
             fi
 

@@ -94,7 +94,7 @@ PLIST
 	mkdir -p "$cache_dir"
 	printf '%s|%s|4|0|0|com.test.TestApp|TestApp\n' \
 		"$apps_root/TestApp.app" "$app_mtime" \
-		> "$cache_dir/uninstall_app_metadata_v1"
+		> "$cache_dir/uninstall_app_metadata_v2"
 
 	done_marker="$HOME/scan.done"
 
@@ -163,7 +163,7 @@ EOF
 	[ "$status" -ne 0 ]
 }
 
-@test "scan_applications surfaces inline app size before deferred refresh (#1126)" {
+@test "scan_applications surfaces inline physical app size before deferred refresh (#1126)" {
 	src="$HOME/uninstall_source.sh"
 	sourceable_uninstall_sh "$src"
 
@@ -183,8 +183,8 @@ source "$SRC_PATH"
 
 uninstall_print_app_search_dirs() { printf '%s\n' "$APPS_ROOT"; }
 mdls() {
-    if [[ "${2:-}" == "kMDItemLogicalSize" ]]; then
-        printf '4096\n'
+    if [[ "${2:-}" == "kMDItemPhysicalSize" ]]; then
+        printf '4096000\n'
         return 0
     fi
     printf '(null)\n'
@@ -195,11 +195,26 @@ cat "$apps_file"
 EOF
 
 	[ "$status" -eq 0 ]
-	[[ "$output" == *"|$app_path|SizedApp|com.example.SizedApp|4KB|"* ]] || return 1
-	# final_size_kb=4, followed by real_used_epoch=0 (no use record on a
-	# fresh scan); apps_out also trails app_mtime and final_version
-	# (F-035 / F-038), which this does not pin since they are dynamic.
-	[[ "$output" == *"|4|0|"* ]]
+	[[ "$output" == *"|$app_path|SizedApp|com.example.SizedApp|4.1MB|"* ]] || return 1
+	# final_size_kb=4000 (physical size probe, upstream #1126), followed by
+	# real_used_epoch=0 (no use record on a fresh scan); apps_out also
+	# trails app_mtime and final_version (F-035 / F-038), which this does
+	# not pin since they are dynamic.
+	[[ "$output" == *"|4000|0|"* ]]
+}
+
+@test "uninstall metadata cache version invalidates logical-size snapshots" {
+	src="$HOME/uninstall_source.sh"
+	sourceable_uninstall_sh "$src"
+
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" SRC_PATH="$src" \
+		/bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$SRC_PATH"
+[[ "$MOLE_UNINSTALL_META_CACHE_FILE" == */uninstall_app_metadata_v2 ]]
+EOF
+
+	[ "$status" -eq 0 ]
 }
 
 @test "scan_applications falls back to bounded du when the quick mdls size probe misses" {

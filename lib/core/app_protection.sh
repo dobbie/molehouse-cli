@@ -323,6 +323,27 @@ holds_compiled_model_cache() {
     return 1
 }
 
+# Shared XDG and user-local roots contain state owned by many unrelated tools.
+# App display names such as "Local", "Config", or "Cache" can spell these
+# roots with different casing, which still resolves to the same directory on a
+# default case-insensitive APFS volume. Protect the shared roots themselves but
+# not app-specific children such as ~/.config/zed or ~/.local/share/firefox.
+_mole_is_shared_home_state_root() {
+    local path="${1%/}"
+    case "$path" in
+        "$HOME"/.[Cc][Aa][Cc][Hh][Ee] | \
+            "$HOME"/.[Cc][Oo][Nn][Ff][Ii][Gg] | \
+            "$HOME"/.[Ll][Oo][Cc][Aa][Ll] | \
+            "$HOME"/.[Ll][Oo][Cc][Aa][Ll]/[Bb][Ii][Nn] | \
+            "$HOME"/.[Ll][Oo][Cc][Aa][Ll]/[Ll][Ii][Bb] | \
+            "$HOME"/.[Ll][Oo][Cc][Aa][Ll]/[Ss][Hh][Aa][Rr][Ee] | \
+            "$HOME"/.[Ll][Oo][Cc][Aa][Ll]/[Ss][Tt][Aa][Tt][Ee])
+            return 0
+            ;;
+    esac
+    return 1
+}
+
 # Check if a path is protected from deletion
 # Centralized logic to protect system settings, control center, and critical apps
 #
@@ -334,6 +355,10 @@ holds_compiled_model_cache() {
 should_protect_path() {
     local path="$1"
     [[ -z "$path" ]] && return 1
+
+    if _mole_is_shared_home_state_root "$path"; then
+        return 0
+    fi
 
     local _container_cache_path=false
     local _known_rebuildable_cache_path=false
@@ -958,7 +983,10 @@ find_app_files() {
 
     # Standard path patterns for user-level files. App-name templates must never
     # be built from an empty display name, otherwise dotdir/XDG paths collapse to
-    # broad roots like "$HOME/." or "$HOME/.config/".
+    # broad roots like "$HOME/." or "$HOME/.config/". Do not derive a top-level
+    # dotdir (or dotfile ending in rc) from the display name: names such as Local
+    # and Docker collide with shared CLI/config roots on case-insensitive APFS.
+    # App-specific top-level dotdirs require an explicit product rule below.
     local -a user_patterns=()
     if [[ -n "$app_name" && ${#app_name} -ge 2 ]]; then
         user_patterns+=(
@@ -988,8 +1016,6 @@ find_app_files() {
             "$HOME/.cache/$app_name"
             "$HOME/.cache/$lowercase_name"
             "$HOME/.local/share/$app_name"
-            "$HOME/.$app_name"
-            "$HOME/.$app_name"rc
             "$HOME/Library/Address Book Plug-Ins/$app_name.bundle"
             "$HOME/Library/Accessibility/$app_name.bundle"
             "$HOME/Library/Mail/Bundles/$app_name.mailbundle"
@@ -1099,7 +1125,6 @@ find_app_files() {
             "$HOME/.config/$base_lowercase"
             "$HOME/.cache/$base_lowercase"
             "$HOME/.local/share/$base_lowercase"
-            "$HOME/.$base_lowercase"
         )
     fi
 
@@ -1151,6 +1176,11 @@ find_app_files() {
 
         # Skip XDG dotdirs that belong to independent CLI tools sharing a name
         # with the GUI app being uninstalled (issue #993).
+        if _mole_is_shared_home_state_root "$expanded_path"; then
+            debug_log "Skipping shared home state root: $expanded_path"
+            continue
+        fi
+
         if _path_belongs_to_independent_cli "$expanded_path"; then
             debug_log "Skipping independent CLI dotdir: $expanded_path"
             continue

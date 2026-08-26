@@ -1039,6 +1039,22 @@ EOF
 	}
 }
 
+@test "installer source-build guidance names the main branch explicitly" {
+	run awk '
+		/^[[:space:]]*#/ { next }
+		/piping from curl:/ {
+			seen = 1
+			if ($0 !~ /\| bash -s -- main/) bad = 1
+		}
+		END { exit (!seen || bad) }
+	' "$PROJECT_ROOT/install.sh"
+
+	[ "$status" -eq 0 ] || {
+		echo "$output"
+		return 1
+	}
+}
+
 @test "verify_release_attestation maps gh availability and result to 2/0/1" {
 	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail

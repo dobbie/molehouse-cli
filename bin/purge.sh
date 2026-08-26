@@ -23,6 +23,10 @@ trap 'trap - EXIT; cleanup; exit 130' INT TERM
 source "$SCRIPT_DIR/../lib/core/log.sh"
 source "$SCRIPT_DIR/../lib/clean/project.sh"
 
+# Purge ends at safe_remove just like clean, so initialize the invoking user's
+# whitelist before project discovery or the interactive selection begins.
+load_mole_whitelist
+
 # Configuration
 CURRENT_SECTION=""
 
@@ -224,17 +228,13 @@ perform_purge() {
     fi
 
     clean_project_artifacts
-    local exit_code=$?
+    local purge_outcome="${PURGE_RUN_OUTCOME:-scan_failed}"
 
     # Clean up
     trap - INT TERM
     cleanup_monitor
 
-    # Exit codes:
-    # 0 = success, show summary
-    # 1 = user cancelled
-    # 2 = nothing to clean
-    if [[ $exit_code -ne 0 ]]; then
+    if [[ "$purge_outcome" != "completed" ]]; then
         return 0
     fi
 

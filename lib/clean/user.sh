@@ -104,9 +104,102 @@ clean_trash() {
     fi
 }
 
+# Re-resolve the Deno root at the deletion boundary and refuse any candidate
+# that has become it, or that now contains it. Excluding the root while the
+# candidate list is built only proves where it pointed at that moment: a
+# symlinked DENO_DIR retargeted afterwards makes the sink delete whatever the
+# root points at now. Failing closed here costs one skipped cache directory;
+# guessing costs the user's Deno state.
+_user_cache_deno_delete_guard() {
+    local candidate="${1:-}"
+    [[ -n "$candidate" ]] || return 1
+
+    local deno_root=""
+    deno_root=$(mole_deno_cache_root 2> /dev/null) || return 1
+
+    local candidate_physical=""
+    if [[ -d "$candidate" ]]; then
+        candidate_physical=$(cd -P "$candidate" 2> /dev/null && pwd -P) || return 1
+    fi
+    local deno_physical=""
+    if [[ -d "$deno_root" ]]; then
+        deno_physical=$(cd -P "$deno_root" 2> /dev/null && pwd -P) || return 1
+    fi
+
+    local candidate_probe deno_probe
+    for candidate_probe in "$candidate" "$candidate_physical"; do
+        [[ -n "$candidate_probe" ]] || continue
+        for deno_probe in "$deno_root" "$deno_physical"; do
+            [[ -n "$deno_probe" ]] || continue
+            # The candidate is the root, sits inside it, or contains it.
+            case "$deno_probe" in
+                "$candidate_probe" | "$candidate_probe"/*) return 1 ;;
+            esac
+            case "$candidate_probe" in
+                "$deno_probe"/*) return 1 ;;
+            esac
+        done
+    done
+    return 0
+}
+
 clean_user_essentials() {
     start_section_spinner "Scanning caches..."
-    safe_clean ~/Library/Caches/* "User app cache"
+    # Deno's default root sits inside the otherwise broad user-cache sweep,
+    # but `deno clean` removes the entire DENO_DIR, including origin storage
+    # and downloaded runtime payloads. Keep the effective root for review and
+    # clean every sibling through the normal funnel.
+    local deno_cache_root=""
+    local deno_cache_root_valid=true
+    if ! deno_cache_root=$(mole_deno_cache_root 2> /dev/null); then
+        # An explicitly broad or malformed DENO_DIR is not safe to report as a
+        # cache root, but sweeping past an unresolved owner root is worse.
+        # Keep the generic cache batch empty and continue with the other user
+        # cleanup categories.
+        deno_cache_root_valid=false
+    fi
+    local deno_physical_root=""
+    if [[ "$deno_cache_root_valid" == "true" && -d "$deno_cache_root" ]]; then
+        deno_physical_root=$(cd -P "$deno_cache_root" 2> /dev/null && pwd -P) || deno_physical_root=""
+    fi
+    local -a user_cache_targets=()
+    local user_cache_target
+    if [[ "$deno_cache_root_valid" == "true" ]]; then
+        for user_cache_target in "$HOME/Library/Caches"/*; do
+            [[ -e "$user_cache_target" || -L "$user_cache_target" ]] || continue
+            case "$deno_cache_root" in
+                "$user_cache_target" | "$user_cache_target"/*) continue ;;
+            esac
+            if [[ -n "$deno_physical_root" && -d "$user_cache_target" ]]; then
+                local user_cache_physical_target=""
+                user_cache_physical_target=$(cd -P "$user_cache_target" 2> /dev/null && pwd -P) ||
+                    user_cache_physical_target=""
+                case "$deno_physical_root" in
+                    "$user_cache_physical_target" | "$user_cache_physical_target"/*) continue ;;
+                esac
+            fi
+            user_cache_targets+=("$user_cache_target")
+        done
+    fi
+    if [[ ${#user_cache_targets[@]} -gt 0 ]]; then
+        local user_cache_rc=0
+        # Ask twice on purpose: safe_clean_guarded filters the batch, and the
+        # sink guard re-asks after every other check, immediately before rm,
+        # because safe_remove does real work between the two.
+        local _MOLE_SAFE_REMOVE_FINAL_GUARD=_user_cache_deno_delete_guard
+        safe_clean_guarded _user_cache_deno_delete_guard \
+            "${user_cache_targets[@]}" "User app cache" || user_cache_rc=$?
+        if [[ $user_cache_rc -eq 75 ]]; then
+            echo -e "  ${GRAY}${ICON_WARNING}${NC} User app cache · stopped (Deno root changed during cleanup)"
+            note_activity
+        fi
+    elif [[ "$deno_cache_root_valid" != "true" ]]; then
+        # Refusing here is right, but staying silent about it is not: the whole
+        # category would just be missing from the section. Name the cause the
+        # way every other guard in this file does.
+        echo -e "  ${GRAY}${ICON_WARNING}${NC} User app cache · stopped (DENO_DIR unresolved)"
+        note_activity
+    fi
     stop_section_spinner
 
     safe_clean ~/Library/Logs/* "User app logs"
@@ -2578,6 +2671,12 @@ check_large_file_candidates() {
     done
     _report_large_review_dir "Lima data" "$HOME/.lima"
     _report_large_review_dir "Maven local repository" "$HOME/.m2/repository"
+    _report_large_review_dir "Ivy local repository" "$HOME/.ivy2/cache"
+    _report_large_review_dir "NuGet packages" "$HOME/.nuget/packages"
+    local deno_module_cache=""
+    if deno_module_cache=$(mole_deno_cache_root 2> /dev/null); then
+        _report_large_review_dir "Deno module cache" "$deno_module_cache"
+    fi
     _report_large_review_dir "pnpm store" "$HOME/Library/pnpm/store"
     _report_large_review_dir "Conda packages" "$HOME/.conda/pkgs"
     _report_large_review_dir "Anaconda packages" "$HOME/anaconda3/pkgs"
