@@ -129,6 +129,10 @@ source "$PROJECT_ROOT/lib/core/common.sh"
 source "$PROJECT_ROOT/lib/core/history.sh"
 source "$PROJECT_ROOT/lib/uninstall/batch.sh"
 SCRIPT_DIR="$PROJECT_ROOT/bin"
+# bin/uninstall.sh captures the repo root at startup and reads mole_version from
+# it, because lib/uninstall/batch.sh reassigns $SCRIPT_DIR (F-044). These
+# harnesses stand in for that startup, so they set it too.
+MOLE_UNINSTALL_REPO_ROOT="$PROJECT_ROOT"
 MOLE_UNINSTALL_EPOCH_FLOOR=978307200
 log_operation_session_start() { :; }
 log_operation_session_end() { :; }

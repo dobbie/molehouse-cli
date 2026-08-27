@@ -33,7 +33,12 @@
   "generated_at": "{GENERATED_AT}",
   "mode": "list",
   "mole_version": "{MOLE_VERSION}",
-  "scan_status": "complete",
+  "scan_status": "partial",
   "schema_version": 1,
-  "warnings": []
+  "warnings": [
+    {
+      "code": "size_unmeasured",
+      "message": "1 of 2 applications could not be measured; their sizes are unknown, not zero."
+    }
+  ]
 }

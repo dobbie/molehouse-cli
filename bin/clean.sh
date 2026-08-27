@@ -293,9 +293,35 @@ record_dry_run_cleanup_target() {
     append_dry_run_cleanup_target "$@"
 }
 
-# Emit the first complete ledger record for each path identity. Perl keeps the
-# normal path linear for large clean previews; the Bash fallback preserves the
-# same NUL-safe format on systems without Perl.
+# Emit the ledger records that represent distinct, non-overlapping bytes.
+#
+# Two kinds of duplication are removed, and both must be, or every consumer of
+# this ledger overstates what a clean would reclaim:
+#
+#   1. Repeated path identities — the same path registered more than once. The
+#      first complete record wins.
+#   2. **Nested paths (F-087).** A parent directory and its own children are
+#      registered as separate targets, and each carries the size of its whole
+#      subtree: `~/Library/Caches/Comet` and `~/Library/Caches/Comet/Default`
+#      both measured 672,985,088 bytes, and both were emitted. Summing them
+#      counts the same bytes twice. Measured 2026-08-27 on this machine: 116
+#      nested entries, 2,726,526,976 bytes of a declared 12,801,752,064 — 21%
+#      of a figure printed next to a button that deletes files.
+#
+# The nesting rule: a *measured* record is dropped when some other measured
+# record that survived is one of its ancestor directories. Only measured
+# records can be ancestors — an unmeasured parent contributes no bytes, so
+# there is nothing to double-count and dropping its child would lose real
+# ones. Unmeasured records are never dropped. This is deliberately the same
+# rule as Molehouse's `CleanNesting.dedupe`, so running that over this output
+# now removes nothing: the correction happens once, here, not twice.
+#
+# Output order is the input order minus the dropped records. Do not sort the
+# output — render_clean_preview_from_ledger groups by *consecutive* section
+# and would print repeated headings.
+#
+# Perl keeps the normal path linear for large clean previews; the Bash
+# fallback preserves the same NUL-safe format on systems without Perl.
 emit_deduplicated_dry_run_ledger() {
     if [[ -z "${CLEAN_PREVIEW_LEDGER_FILE:-}" || ! -f "$CLEAN_PREVIEW_LEDGER_FILE" ]]; then
         return 0
@@ -312,23 +338,45 @@ emit_deduplicated_dry_run_ledger() {
             binmode STDOUT;
             local $/ = "\0";
             my %seen;
+            my @records;
             while (defined(my $identity = <STDIN>)) {
                 chomp $identity;
                 my @record = ($identity);
                 for (1 .. 5) {
                     my $field = <STDIN>;
-                    exit 0 unless defined $field;
+                    last unless defined $field;
                     chomp $field;
                     push @record, $field;
                 }
+                last unless @record == 6;
                 next if $seen{$identity}++;
-                print join("\0", @record), "\0";
+                push @records, [@record, 0];
+            }
+            # Nesting pass (F-087). Shortest path first, so every path kept so
+            # far is a valid candidate ancestor for everything after it.
+            my @sorted = sort { length($a->[5]) <=> length($b->[5]) }
+                         grep { $_->[3] eq "true" } @records;
+            my @kept;
+            for my $r (@sorted) {
+                my $path = $r->[5];
+                for my $ancestor (@kept) {
+                    if (index($path, $ancestor . "/") == 0) { $r->[6] = 1; last; }
+                }
+                push @kept, $path unless $r->[6];
+            }
+            for my $r (@records) {
+                next if $r->[6];
+                print join("\0", @{$r}[0 .. 5]), "\0";
             }
         ' < "$CLEAN_PREVIEW_LEDGER_FILE"
         return 0
     fi
 
+    # Pure-bash fallback. Must stay behaviourally identical to the Perl branch
+    # above — tests/clean_json.bats runs both over the same ledger and
+    # byte-compares them.
     local identity size_kb count size_known section path
+    local -a rec_identity=() rec_size_kb=() rec_count=() rec_known=() rec_section=() rec_path=() rec_nested=()
     local -a seen_identities=()
     while IFS= read -r -d '' identity &&
         IFS= read -r -d '' size_kb &&
@@ -340,9 +388,55 @@ emit_deduplicated_dry_run_ledger() {
             continue
         fi
         seen_identities+=("$identity")
-        printf '%s\0%s\0%s\0%s\0%s\0%s\0' \
-            "$identity" "$size_kb" "$count" "$size_known" "$section" "$path"
+        rec_identity+=("$identity")
+        rec_size_kb+=("$size_kb")
+        rec_count+=("$count")
+        rec_known+=("$size_known")
+        rec_section+=("$section")
+        rec_path+=("$path")
+        rec_nested+=(0)
     done < "$CLEAN_PREVIEW_LEDGER_FILE"
+
+    local total=${#rec_identity[@]}
+    [[ "$total" -gt 0 ]] || return 0
+
+    # Indices of measured records, ordered by path length ascending — the same
+    # order the Perl branch sorts into. `sort -n` on "<length> <index>" keeps
+    # ties in ascending index order, matching Perl's stable sort.
+    local -a measured_order=()
+    local i
+    while IFS= read -r i; do
+        measured_order+=("$i")
+    done < <(
+        for ((i = 0; i < total; i++)); do
+            [[ "${rec_known[$i]}" == "true" ]] || continue
+            printf '%s %s\n' "${#rec_path[$i]}" "$i"
+        done | LC_ALL=C sort -n -k1,1 -k2,2 | awk '{print $2}'
+    )
+
+    local -a kept_paths=()
+    local idx ancestor
+    if [[ ${#measured_order[@]} -gt 0 ]]; then
+        for idx in "${measured_order[@]}"; do
+            path="${rec_path[$idx]}"
+            if [[ ${#kept_paths[@]} -gt 0 ]]; then
+                for ancestor in "${kept_paths[@]}"; do
+                    if [[ "$path" == "$ancestor/"* ]]; then
+                        rec_nested[idx]=1
+                        break
+                    fi
+                done
+            fi
+            [[ "${rec_nested[$idx]}" == "1" ]] || kept_paths+=("$path")
+        done
+    fi
+
+    for ((i = 0; i < total; i++)); do
+        [[ "${rec_nested[$i]}" == "0" ]] || continue
+        printf '%s\0%s\0%s\0%s\0%s\0%s\0' \
+            "${rec_identity[$i]}" "${rec_size_kb[$i]}" "${rec_count[$i]}" \
+            "${rec_known[$i]}" "${rec_section[$i]}" "${rec_path[$i]}"
+    done
 }
 
 write_clean_preview_header() {

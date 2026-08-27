@@ -15,6 +15,17 @@ export LANG=C
 
 # Load shared helpers.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The repository root, captured here and never reassigned (F-044). $SCRIPT_DIR
+# is this file's own bin/ directory at this point, but lib/uninstall/batch.sh —
+# sourced below, not subshelled — reassigns the global $SCRIPT_DIR to the repo
+# root, so any function that reads $SCRIPT_DIR after startup gets whichever
+# value won last. uninstall_list_mole_version did exactly that and resolved
+# "$SCRIPT_DIR/../mole" to a path outside the repository, reporting
+# "mole_version":"unknown" for all three uninstall JSON modes. This variable is
+# the one stable handle on the repo root; use it, not $SCRIPT_DIR, for any path
+# resolved after sourcing.
+MOLE_UNINSTALL_REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+readonly MOLE_UNINSTALL_REPO_ROOT
 source "$SCRIPT_DIR/../lib/core/common.sh"
 # history_json_escape / history_json_string back the --list --json envelope
 # (CONTRACT.md §6) instead of a fourth JSON escaper — see
@@ -1486,7 +1497,7 @@ match_apps_by_name() {
 # gate behaviour on it).
 uninstall_list_mole_version() {
     local version
-    version=$(sed -n 's/^VERSION="\(.*\)"$/\1/p' "$SCRIPT_DIR/../mole" 2> /dev/null | head -1)
+    version=$(sed -n 's/^VERSION="\(.*\)"$/\1/p' "$MOLE_UNINSTALL_REPO_ROOT/mole" 2> /dev/null | head -1)
     [[ -n "$version" ]] || version="unknown"
     printf '%s' "$version"
 }
@@ -1530,6 +1541,30 @@ uninstall_list_emit_failed() {
     printf '},"data":null}\n'
 }
 
+# The single predicate deciding whether an app's measured size is real
+# (CONTRACT.md §1.1/§6.4: `size_known: false` and no `size_bytes`, never
+# `size_bytes: 0`). Both the per-entry `size_known` flag and the envelope's
+# degradation warning below read this one function, so the summary can never
+# disagree with the entries it summarises — F-089 was exactly that
+# disagreement: 65 apps with `size_known: false` under `scan_status:
+# "complete"` and `warnings: []`.
+uninstall_list_size_is_known() {
+    local size_kb="${1:-0}"
+    [[ "$size_kb" =~ ^[0-9]+$ ]] && [[ "$size_kb" -gt 0 ]]
+}
+
+# How many apps in apps_data have no real size. Reads field 7 (size_kb) of the
+# same 7-field tuple uninstall_list_emit_json destructures.
+uninstall_list_unmeasured_count() {
+    local total=${#apps_data[@]}
+    local i count=0 size_kb
+    for ((i = 0; i < total; i++)); do
+        IFS='|' read -r _ _ _ _ _ _ size_kb <<< "${apps_data[$i]}"
+        uninstall_list_size_is_known "$size_kb" || count=$((count + 1))
+    done
+    printf '%s' "$count"
+}
+
 # §6.3/§6.4 envelope: `mode: "list"`, `data.apps` (always an array). Reads
 # apps_data (unchanged 7-field shape) and the index-aligned apps_meta_data
 # (real_used_epoch|app_mtime|version — see load_applications) that
@@ -1540,10 +1575,24 @@ uninstall_list_emit_failed() {
 # than silently relabelling its modification time.
 uninstall_list_emit_json() {
     local mole_version="$1"
-    uninstall_list_envelope_open "$mole_version" "complete"
-    printf ',"warnings":[],"error":null,"data":{"apps":['
 
+    # §1.4: a listing in which some size could not be measured is `partial`,
+    # not `complete` — the per-app sizes are a floor, and an app reporting no
+    # size at all is a unit of work that did not finish. `uninstall --plan`
+    # has always declared this (`size_unmeasured`, bin/uninstall.sh:2242);
+    # `--list` asserted `complete` over the same condition. Same command, one
+    # standard now.
     local total=${#apps_data[@]}
+    local unmeasured warnings_json="[]" scan_status="complete"
+    unmeasured=$(uninstall_list_unmeasured_count)
+    if [[ "$unmeasured" -gt 0 ]]; then
+        scan_status="partial"
+        warnings_json="[{\"code\":\"size_unmeasured\",\"message\":$(history_json_string "$unmeasured of $total applications could not be measured; their sizes are unknown, not zero.")}]"
+    fi
+
+    uninstall_list_envelope_open "$mole_version" "$scan_status"
+    printf ',"warnings":%s,"error":null,"data":{"apps":[' "$warnings_json"
+
     local i first=1
     for ((i = 0; i < total; i++)); do
         local app_data="${apps_data[$i]}"
@@ -1563,7 +1612,6 @@ uninstall_list_emit_json() {
         local size_display
         size_display=$(uninstall_normalize_size_display "$size" "$app_path")
 
-        [[ "$size_kb" =~ ^[0-9]+$ ]] || size_kb=0
         # §1.1: size_known false + size_bytes absent, never size_bytes: 0.
         # human_size() in the scan awk returns "--" for kb <= 0 — F-022's
         # sentinel at its source — so kb > 0 is the same test this emitter
@@ -1574,7 +1622,7 @@ uninstall_list_emit_json() {
         # string "size" is replaced with the Steam-managed label, matching
         # uninstall_normalize_size_display's existing text-mode behaviour.
         local size_known="false" size_bytes=""
-        if [[ "$size_kb" -gt 0 ]]; then
+        if uninstall_list_size_is_known "$size_kb"; then
             size_known="true"
             size_bytes=$((size_kb * 1024))
         fi

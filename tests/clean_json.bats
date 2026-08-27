@@ -227,3 +227,180 @@ MOCK
     [[ "$output" != *'"schema_version"'* ]] || return 1
     [[ "$output" != *'"scan_status"'* ]] || return 1
 }
+
+
+# ---------------------------------------------------------------------------
+# F-087 — nested entries must not be counted twice
+#
+# Every test here runs the emitter in a child bash rather than sourcing
+# bin/clean.sh into the bats process: that file sets `set -euo pipefail`, so
+# sourcing it makes any non-zero command abort the whole test FILE silently
+# ("Executed 0 instead of expected N") instead of failing one test with a
+# message. A guard that vanishes rather than failing is no guard at all.
+# ---------------------------------------------------------------------------
+
+# Run a snippet with bin/clean.sh sourced and CLEAN_PREVIEW_LEDGER_FILE
+# pointing at a ledger built from "identity|size_kb|count|size_known|section|path"
+# rows. Args: rows..., then the snippet as the last argument.
+_run_ledger_case() {
+    local snippet="${!#}"
+    local rows=("${@:1:$(($# - 1))}")
+    local ledger="$BATS_TEST_TMPDIR/ledger.bin"
+    : > "$ledger"
+    local row identity size_kb count size_known section path
+    for row in "${rows[@]}"; do
+        IFS='|' read -r identity size_kb count size_known section path <<< "$row"
+        printf '%s\0%s\0%s\0%s\0%s\0%s\0' \
+            "$identity" "$size_kb" "$count" "$size_known" "$section" "$path" >> "$ledger"
+    done
+
+    run env PROJECT_ROOT="$PROJECT_ROOT" LEDGER="$ledger" SNIPPET="$snippet" \
+        /bin/bash --noprofile --norc -c '
+            set -uo pipefail
+            source "$PROJECT_ROOT/bin/clean.sh"
+            CLEAN_PREVIEW_LEDGER_FILE="$LEDGER"
+            # The `path` field of every emitted record, one per line.
+            ledger_paths() {
+                local i=0 field
+                while IFS= read -r -d "" field; do
+                    [[ $((i % 6)) -eq 5 ]] && printf "%s\n" "$field"
+                    i=$((i + 1))
+                done
+            }
+            eval "$SNIPPET"
+        '
+}
+
+@test "F-087: a measured child of a measured parent is dropped from the ledger" {
+    _run_ledger_case \
+        'a|1000|1|true|Caches|/tmp/x/Comet' \
+        'b|1000|1|true|Caches|/tmp/x/Comet/Default' \
+        'c|50|1|true|Caches|/tmp/x/Other' \
+        'emit_deduplicated_dry_run_ledger | ledger_paths'
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == "/tmp/x/Comet
+/tmp/x/Other" ]] || {
+        printf 'the nested child was not dropped; the ledger emitted:\n%s\n' "$output" >&2
+        return 1
+    }
+}
+
+@test "F-087: a measured child of an *unmeasured* parent is kept" {
+    # An unmeasured parent contributes no bytes, so there is nothing to
+    # double-count and dropping its child would lose real ones. Same rule as
+    # Molehouse's CleanNesting.dedupe.
+    _run_ledger_case \
+        'a|0|1|false|Caches|/tmp/x/Parent' \
+        'b|500|1|true|Caches|/tmp/x/Parent/Child' \
+        'emit_deduplicated_dry_run_ledger | ledger_paths'
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == "/tmp/x/Parent
+/tmp/x/Parent/Child" ]] || {
+        printf 'a child under an unmeasured parent must survive; got:\n%s\n' "$output" >&2
+        return 1
+    }
+}
+
+@test "F-087: a sibling with a shared name prefix is not mistaken for a child" {
+    # /tmp/x/Comet2 is not inside /tmp/x/Comet. Only a "/"-terminated prefix
+    # is containment.
+    _run_ledger_case \
+        'a|100|1|true|Caches|/tmp/x/Comet' \
+        'b|100|1|true|Caches|/tmp/x/Comet2' \
+        'emit_deduplicated_dry_run_ledger | ledger_paths'
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == "/tmp/x/Comet
+/tmp/x/Comet2" ]] || {
+        printf 'a name-prefix sibling was wrongly dropped; got:\n%s\n' "$output" >&2
+        return 1
+    }
+}
+
+@test "F-087: the Bash fallback and the Perl branch produce identical bytes" {
+    # The two branches are separate implementations of one rule. A divergence
+    # between them is silent wrong output, so it is asserted, not assumed.
+    command -v perl > /dev/null 2>&1 || skip "perl not installed; only one branch is reachable"
+
+    _run_ledger_case \
+        'a|1000|1|true|Caches|/tmp/x/Comet' \
+        'b|1000|1|true|Caches|/tmp/x/Comet/Default' \
+        'c|7|1|true|Caches|/tmp/x/Comet/Default/Deeper' \
+        'd|0|1|false|Caches|/tmp/x/Parent' \
+        'e|500|1|true|Caches|/tmp/x/Parent/Child' \
+        'f|100|1|true|Caches|/tmp/x/Comet2' \
+        'a|1000|1|true|Caches|/tmp/x/Comet' \
+        '
+        emit_deduplicated_dry_run_ledger > "$BATS_TEST_TMPDIR/with-perl.bin"
+        # A PATH carrying the fallback own tools (sort, awk) and no perl.
+        nopath="$BATS_TEST_TMPDIR/nopath-bin"
+        mkdir -p "$nopath"
+        for tool in sort awk; do ln -sf "$(command -v "$tool")" "$nopath/$tool"; done
+        PATH="$nopath" emit_deduplicated_dry_run_ledger > "$BATS_TEST_TMPDIR/without-perl.bin"
+        if ! cmp -s "$BATS_TEST_TMPDIR/with-perl.bin" "$BATS_TEST_TMPDIR/without-perl.bin"; then
+            echo "BRANCHES_DISAGREE"
+            exit 1
+        fi
+        ledger_paths < "$BATS_TEST_TMPDIR/with-perl.bin" | tr "\n" " "
+        '
+
+    [ "$status" -eq 0 ] || {
+        printf 'the Bash fallback disagrees with the Perl branch: %s\n' "$output" >&2
+        return 1
+    }
+    [[ "$output" == "/tmp/x/Comet /tmp/x/Parent /tmp/x/Parent/Child /tmp/x/Comet2 " ]] || {
+        printf 'unexpected surviving set: %s\n' "$output" >&2
+        return 1
+    }
+}
+
+@test "F-087: total_bytes counts a nested subtree once, not twice" {
+    # **The number on the screen.** This drives the real emitter chain —
+    # clean_json_collect_ledger, which is what computes total_bytes and the
+    # per-category figures — over a ledger reproducing the machine-measured
+    # Comet pair (parent and child both 672,985,088 bytes; `du -sk` agrees with
+    # both, so the child is the parent's entire content). Naively summing every
+    # entry gives 1,024 KiB. The honest reclaim figure is 512 KiB.
+    _run_ledger_case \
+        'a|512|1|true|Caches|/tmp/x/Comet' \
+        'b|512|1|true|Caches|/tmp/x/Comet/Default' \
+        '
+        clean_json_collect_ledger false
+        printf "%s %s\n" "$CLEAN_JSON_TOTAL_BYTES" "$CLEAN_JSON_TOTAL_ITEMS"
+        '
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    local expected_bytes=$((512 * 1024))
+    [[ "$output" == "$expected_bytes 1" ]] || {
+        printf 'total_bytes/total_items are %s; the same %s bytes must be counted once, as "%s 1"\n' \
+            "$output" "$expected_bytes" "$expected_bytes" >&2
+        return 1
+    }
+}
+
+@test "F-087: no entry in a real payload is nested inside another measured entry" {
+    # The invariant asserted against a real run of the shipped command. It
+    # cannot, on its own, prove the rule works — this sandbox's HOME need not
+    # contain a nested pair at all — so it is a live tripwire, not the guard.
+    # The guard is the five tests above, which supply their own nesting.
+    set_mock_sudo_uncached
+    set_mock_host_toolchains
+    mkdir -p "$HOME/Library/Caches/TestApp/Inner"
+    dd if=/dev/zero of="$HOME/Library/Caches/TestApp/Inner/cache.bin" bs=1024 count=256 2> /dev/null
+
+    run env HOME="$HOME" PATH="$TEST_MOCK_BIN:$MOCK_TOOLCHAIN_BIN:$PATH" MOLE_TEST_MODE=0 \
+        MOLE_TEST_NO_AUTH=1 "$PROJECT_ROOT/mole" clean --dry-run --json
+    [ "$status" -eq 0 ] || return 1
+
+    local nested
+    nested=$(echo "$output" | jq -r '
+        [.data.categories[].entries[] | select(.size_known == true) | .path] as $p
+        | [ $p[] as $child | select( any($p[]; . != $child and ($child | startswith(. + "/"))) ) | $child ]
+        | .[]')
+    [[ -z "$nested" ]] || {
+        printf 'these measured entries are nested inside another measured entry:\n%s\n' "$nested" >&2
+        return 1
+    }
+}

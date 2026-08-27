@@ -3609,6 +3609,10 @@ uninstall_normalize_size_display() { local s="${1:-}"; [[ -z "$s" || "$s" == "0"
 
 eval "$(sed -n '/^uninstall_list_mole_version()/,/main "\$@"/p' "$PROJECT_ROOT/bin/uninstall.sh" | sed '$d')"
 SCRIPT_DIR="$PROJECT_ROOT/bin"
+# bin/uninstall.sh captures the repo root at startup and reads mole_version from
+# it, because lib/uninstall/batch.sh reassigns $SCRIPT_DIR (F-044). These
+# harnesses stand in for that startup, so they set it too.
+MOLE_UNINSTALL_REPO_ROOT="$PROJECT_ROOT"
 # Force text mode by simulating a TTY for stdout via /dev/tty redirect not
 # available in bats; instead pipe through a wrapper that fakes -t 1. Simplest:
 # call the function directly so [[ -t 1 ]] uses bash's stdout (the bats pipe).
@@ -3661,6 +3665,10 @@ uninstall_normalize_size_display() { local s="${1:-}"; [[ -z "$s" || "$s" == "0"
 
 eval "$(sed -n '/^uninstall_list_mole_version()/,/main "\$@"/p' "$PROJECT_ROOT/bin/uninstall.sh" | sed '$d')"
 SCRIPT_DIR="$PROJECT_ROOT/bin"
+# bin/uninstall.sh captures the repo root at startup and reads mole_version from
+# it, because lib/uninstall/batch.sh reassigns $SCRIPT_DIR (F-044). These
+# harnesses stand in for that startup, so they set it too.
+MOLE_UNINSTALL_REPO_ROOT="$PROJECT_ROOT"
 # --list --json must emit JSON even when main's own stdout is a real bats
 # pipe (already non-TTY) *and* even if it were a TTY — exercise the flag
 # explicitly rather than relying on the legacy auto-switch.
@@ -3722,6 +3730,10 @@ uninstall_normalize_size_display() { local s="${1:-}"; [[ -z "$s" || "$s" == "0"
 
 eval "$(sed -n '/^uninstall_list_mole_version()/,/main "\$@"/p' "$PROJECT_ROOT/bin/uninstall.sh" | sed '$d')"
 SCRIPT_DIR="$PROJECT_ROOT/bin"
+# bin/uninstall.sh captures the repo root at startup and reads mole_version from
+# it, because lib/uninstall/batch.sh reassigns $SCRIPT_DIR (F-044). These
+# harnesses stand in for that startup, so they set it too.
+MOLE_UNINSTALL_REPO_ROOT="$PROJECT_ROOT"
 main --list --json
 INNER
 
@@ -3771,6 +3783,10 @@ uninstall_normalize_size_display() { local s="${1:-}"; [[ -z "$s" || "$s" == "0"
 
 eval "$(sed -n '/^uninstall_list_mole_version()/,/main "\$@"/p' "$PROJECT_ROOT/bin/uninstall.sh" | sed '$d')"
 SCRIPT_DIR="$PROJECT_ROOT/bin"
+# bin/uninstall.sh captures the repo root at startup and reads mole_version from
+# it, because lib/uninstall/batch.sh reassigns $SCRIPT_DIR (F-044). These
+# harnesses stand in for that startup, so they set it too.
+MOLE_UNINSTALL_REPO_ROOT="$PROJECT_ROOT"
 main --list --json
 INNER
 
@@ -3827,6 +3843,10 @@ uninstall_normalize_size_display() { local s="${1:-}"; [[ -z "$s" || "$s" == "0"
 
 eval "$(sed -n '/^uninstall_list_mole_version()/,/main "\$@"/p' "$PROJECT_ROOT/bin/uninstall.sh" | sed '$d')"
 SCRIPT_DIR="$PROJECT_ROOT/bin"
+# bin/uninstall.sh captures the repo root at startup and reads mole_version from
+# it, because lib/uninstall/batch.sh reassigns $SCRIPT_DIR (F-044). These
+# harnesses stand in for that startup, so they set it too.
+MOLE_UNINSTALL_REPO_ROOT="$PROJECT_ROOT"
 main --list --json
 INNER
 
@@ -3877,6 +3897,10 @@ uninstall_normalize_size_display() { local s="${1:-}"; [[ -z "$s" || "$s" == "0"
 
 eval "$(sed -n '/^uninstall_list_mole_version()/,/main "\$@"/p' "$PROJECT_ROOT/bin/uninstall.sh" | sed '$d')"
 SCRIPT_DIR="$PROJECT_ROOT/bin"
+# bin/uninstall.sh captures the repo root at startup and reads mole_version from
+# it, because lib/uninstall/batch.sh reassigns $SCRIPT_DIR (F-044). These
+# harnesses stand in for that startup, so they set it too.
+MOLE_UNINSTALL_REPO_ROOT="$PROJECT_ROOT"
 main --list
 INNER
 
@@ -3920,6 +3944,10 @@ uninstall_normalize_size_display() { local s="${1:-}"; [[ -z "$s" || "$s" == "0"
 
 eval "$(sed -n '/^uninstall_list_mole_version()/,/main "\$@"/p' "$PROJECT_ROOT/bin/uninstall.sh" | sed '$d')"
 SCRIPT_DIR="$PROJECT_ROOT/bin"
+# bin/uninstall.sh captures the repo root at startup and reads mole_version from
+# it, because lib/uninstall/batch.sh reassigns $SCRIPT_DIR (F-044). These
+# harnesses stand in for that startup, so they set it too.
+MOLE_UNINSTALL_REPO_ROOT="$PROJECT_ROOT"
 main --list
 INNER
 
@@ -4112,4 +4140,159 @@ EOF
     [[ "$output" == *"|Foo|"* ]] || return 1
     [[ "$output" == *"|Bar|"* ]] || return 1
     [[ "$output" != *"Foo Bar"* ]] || return 1
+}
+
+# ---------------------------------------------------------------------------
+# F-089 — a degraded listing must not report itself as complete
+# F-044 — mole_version must survive batch.sh's SCRIPT_DIR reassignment
+# ---------------------------------------------------------------------------
+
+# Run `main --list --json` over a fixed apps cache, the same harness the
+# envelope tests above use. Arg: the apps-cache file.
+_run_list_json() {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 \
+        APPS_CACHE_FILE="$1" /bin/bash --noprofile --norc << 'INNER'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/core/history.sh"
+
+MOLE_UNINSTALL_EPOCH_FLOOR=978307200
+log_operation_session_start() { :; }
+show_uninstall_help() { :; }
+hide_cursor() { :; }
+show_cursor() { :; }
+clear_screen() { :; }
+scan_applications() { printf '%s\n' "$APPS_CACHE_FILE"; }
+load_applications() {
+    apps_data=()
+    apps_meta_data=()
+    while IFS='|' read -r epoch app_path app_name bundle_id size last_used size_kb real_used_epoch app_mtime version; do
+        apps_data+=("$epoch|$app_path|$app_name|$bundle_id|$size|$last_used|${size_kb:-0}")
+        apps_meta_data+=("${real_used_epoch:-}|${app_mtime:-}|${version:-}")
+    done < "$1"
+}
+is_homebrew_available() { return 1; }
+get_brew_cask_name() { return 1; }
+uninstall_normalize_size_display() { local s="${1:-}"; [[ -z "$s" || "$s" == "0" || "$s" == "Unknown" ]] && echo "N/A" || echo "$s"; }
+
+eval "$(sed -n '/^uninstall_list_mole_version()/,/main "\$@"/p' "$PROJECT_ROOT/bin/uninstall.sh" | sed '$d')"
+SCRIPT_DIR="$PROJECT_ROOT/bin"
+MOLE_UNINSTALL_REPO_ROOT="$PROJECT_ROOT"
+main --list --json
+INNER
+}
+
+@test "F-089: a listing where no size is real declares itself partial, with a warning" {
+    # F-089's exact shape: every app degraded to size_kb 0, which is the "--"
+    # display sentinel. The envelope used to say scan_status "complete" and
+    # warnings [] over precisely this.
+    local apps_cache
+    apps_cache="$(mktemp "${BATS_TEST_TMPDIR:-$BATS_RUN_TMPDIR:-$HOME}/tmp-list-degraded.XXXXXX")"
+    cat > "$apps_cache" << 'CACHE'
+1700000000|/Applications/One.app|One|com.example.one|--|Unknown|0||1690000000|
+1700000000|/Applications/Two.app|Two|com.example.two|--|Unknown|0||1690000000|
+CACHE
+
+    _run_list_json "$apps_cache"
+    rm -f "$apps_cache"
+    [ "$status" -eq 0 ] || return 1
+
+    # Assert what a reader of this payload is told about the listing, not the
+    # per-app flag they would have to compute it from themselves.
+    local status_field
+    status_field=$(printf '%s\n' "$output" | jq -r '.scan_status')
+    [[ "$status_field" == "partial" ]] || {
+        printf 'a listing with no real sizes reported scan_status %s\n' "$status_field" >&2
+        return 1
+    }
+    printf '%s\n' "$output" | jq -e '.warnings | any(.code == "size_unmeasured")' > /dev/null || {
+        printf 'no size_unmeasured warning: %s\n' "$(printf '%s\n' "$output" | jq -c '.warnings')" >&2
+        return 1
+    }
+    # The warning must name the real scale of the degradation, not just exist.
+    printf '%s\n' "$output" | jq -e '.warnings[] | select(.code == "size_unmeasured") | .message | test("2 of 2")' > /dev/null || {
+        printf 'the warning does not say how many apps are unmeasured: %s\n' "$(printf '%s\n' "$output" | jq -c '.warnings')" >&2
+        return 1
+    }
+}
+
+@test "F-089: one unmeasured app among measured ones is still declared" {
+    local apps_cache
+    apps_cache="$(mktemp "${BATS_TEST_TMPDIR:-$BATS_RUN_TMPDIR:-$HOME}/tmp-list-mixed.XXXXXX")"
+    cat > "$apps_cache" << 'CACHE'
+1700000000|/Applications/Good.app|Good|com.example.good|180MB|Today|184320|1700000000|1690000000|1.0
+1700000000|/Applications/Bad.app|Bad|com.example.bad|--|Unknown|0||1690000000|
+CACHE
+
+    _run_list_json "$apps_cache"
+    rm -f "$apps_cache"
+    [ "$status" -eq 0 ] || return 1
+
+    [[ "$(printf '%s\n' "$output" | jq -r '.scan_status')" == "partial" ]] || {
+        printf 'a listing whose sizes are a floor must not claim complete\n' >&2
+        return 1
+    }
+    printf '%s\n' "$output" | jq -e '.warnings[] | select(.code == "size_unmeasured") | .message | test("1 of 2")' > /dev/null || return 1
+}
+
+@test "F-089: a listing where every size is real stays complete, with no warnings" {
+    # The other half of the guard: a warning that always fires tells nobody
+    # anything.
+    local apps_cache
+    apps_cache="$(mktemp "${BATS_TEST_TMPDIR:-$BATS_RUN_TMPDIR:-$HOME}/tmp-list-clean.XXXXXX")"
+    cat > "$apps_cache" << 'CACHE'
+1700000000|/Applications/Good.app|Good|com.example.good|180MB|Today|184320|1700000000|1690000000|1.0
+CACHE
+
+    _run_list_json "$apps_cache"
+    rm -f "$apps_cache"
+    [ "$status" -eq 0 ] || return 1
+
+    [[ "$(printf '%s\n' "$output" | jq -r '.scan_status')" == "complete" ]] || return 1
+    [[ "$(printf '%s\n' "$output" | jq -r '.warnings | length')" == "0" ]] || return 1
+}
+
+@test "F-089: the envelope's verdict agrees with the entries it summarises" {
+    # The divergence F-091 named: a summary field asserting one thing while the
+    # rows assert another. Derived here from the rows, and compared.
+    local apps_cache
+    apps_cache="$(mktemp "${BATS_TEST_TMPDIR:-$BATS_RUN_TMPDIR:-$HOME}/tmp-list-agree.XXXXXX")"
+    cat > "$apps_cache" << 'CACHE'
+1700000000|/Applications/Good.app|Good|com.example.good|180MB|Today|184320|1700000000|1690000000|1.0
+1700000000|/Applications/Bad.app|Bad|com.example.bad|--|Unknown|0||1690000000|
+CACHE
+
+    _run_list_json "$apps_cache"
+    rm -f "$apps_cache"
+    [ "$status" -eq 0 ] || return 1
+
+    printf '%s\n' "$output" | jq -e '
+        ([.data.apps[] | select(.size_known == false)] | length) as $unmeasured
+        | if $unmeasured > 0
+          then .scan_status == "partial" and (.warnings | any(.code == "size_unmeasured"))
+          else .scan_status == "complete" and (.warnings | length == 0)
+          end' > /dev/null || {
+        printf 'the envelope and the entries disagree: %s\n' \
+            "$(printf '%s\n' "$output" | jq -c '{scan_status, warnings, unmeasured: [.data.apps[] | select(.size_known == false)] | length}')" >&2
+        return 1
+    }
+}
+
+@test "F-044: uninstall --list --json reports the real mole_version, not \"unknown\"" {
+    # The defect was that lib/uninstall/batch.sh reassigns $SCRIPT_DIR after
+    # startup, so "$SCRIPT_DIR/../mole" resolved outside the repository. This
+    # asserts the value a reader sees, against the router's own VERSION line.
+    local expected
+    expected=$(sed -n 's/^VERSION="\(.*\)"$/\1/p' "$PROJECT_ROOT/mole" | head -1)
+    [[ -n "$expected" ]] || return 1
+
+    run env HOME="$HOME" MOLE_TEST_NO_AUTH=1 "$PROJECT_ROOT/mole" uninstall --list --json
+    [ "$status" -eq 0 ] || return 1
+
+    local reported
+    reported=$(printf '%s\n' "$output" | jq -r '.mole_version')
+    [[ "$reported" == "$expected" ]] || {
+        printf 'mole_version is %s; the router says %s\n' "$reported" "$expected" >&2
+        return 1
+    }
 }

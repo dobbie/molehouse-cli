@@ -251,3 +251,40 @@ EOF
     [[ "$output" != *'"schema_version"'* ]] || return 1
     [[ "$output" != *'"scan_status"'* ]] || return 1
 }
+
+@test "F-083: no task in a preview payload reports a completed action" {
+    # The screen this feeds is the one where a misreading means an unrequested
+    # change to the user's machine. Asserted over the payload a reader sees,
+    # not over the ledger variable the emitter consults.
+    run env HOME="$HOME" MOLE_TEST_NO_AUTH=1 MOLE_ASSUME_VPN_ACTIVE=0 \
+        "$PROJECT_ROOT/mole" optimize --dry-run --json
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+
+    [[ "$(echo "$output" | jq -r '.mode')" == "preview" ]] || return 1
+
+    local offenders
+    offenders=$(echo "$output" | jq -c '[.data.tasks[] | select(.outcome == "applied" and has("detail"))]')
+    [[ "$offenders" == "[]" ]] || {
+        printf 'a preview described changes it did not make: %s\n' "$offenders" >&2
+        return 1
+    }
+}
+
+@test "F-083: a preview still reports why a task failed" {
+    # The other half: suppressing every detail would suppress the §8.5
+    # task_failed warning messages with them. Whenever a preview reports a
+    # failure, that failure keeps its text.
+    run env HOME="$HOME" MOLE_TEST_NO_AUTH=1 MOLE_ASSUME_VPN_ACTIVE=0 \
+        "$PROJECT_ROOT/mole" optimize --dry-run --json
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+
+    local failed
+    failed=$(echo "$output" | jq -r '.data.counts.failed')
+    if [[ "$failed" -gt 0 ]]; then
+        echo "$output" | jq -e '.warnings | any(.code == "task_failed")' > /dev/null || return 1
+        echo "$output" | jq -e '[.warnings[] | select(.code == "task_failed") | .message | select(length > 0)] | length > 0' > /dev/null || {
+            printf 'a failed task in a preview lost its message\n' >&2
+            return 1
+        }
+    fi
+}

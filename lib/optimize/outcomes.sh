@@ -9,7 +9,13 @@ fi
 readonly MOLE_OPTIMIZE_OUTCOMES_LOADED=1
 
 # A task reports exactly one of these outcomes during a dispatched run:
-# applied: a change completed, or would complete in dry-run mode.
+# applied: a change completed. In preview mode (MOLE_DRY_RUN=1) it means the
+#   change *would* be made — one word for two meanings, which CONTRACT.md
+#   §8.5 documents ("In preview mode `applied` means would apply") and F-083
+#   objects to. Splitting it into a distinct preview value would change a
+#   closed enum, so it is a contract change, not a fork-side one; what this
+#   file can and does guarantee is that preview mode carries no past-tense
+#   `detail` prose alongside it (see optimize_task_result).
 # unchanged: inspection completed and no change was needed.
 # skipped: policy or run context intentionally prevented execution.
 # unavailable: the host does not provide the required capability.
@@ -84,6 +90,27 @@ optimize_task_result() {
         echo "Optimize task outcome is already set: $MOLE_OPTIMIZE_TASK_OUTCOME" >&2
         return 1
     fi
+    # F-083: a preview must never carry completed-action prose. Every
+    # `applied` detail is written in the past tense by the handler that
+    # *would* have made the change ("DNS cache flushed", "LaunchServices
+    # repaired", ".DS_Store prevention enabled on network & USB volumes") —
+    # true after a real run, false after a dry run, and the string has no
+    # grammatical room to say "would". `detail` is C (CONTRACT.md §8.5), so
+    # omitting it asserts nothing instead of asserting something untrue.
+    #
+    # Only `applied` is suppressed, and deliberately so: a preview's
+    # `failed`, `attention`, `unchanged`, `skipped` and `unavailable`
+    # details all describe inspection that really did happen during the dry
+    # run, and the `failed` ones additionally carry the §8.5 `task_failed`
+    # warning messages. Suppressing those would hide real signal.
+    #
+    # This is the one choke point — optimize_task_result_from_counts routes
+    # every one of its four branches through here — so no individual task
+    # handler can reintroduce the defect by writing its own past tense.
+    if [[ "${MOLE_DRY_RUN:-0}" == "1" && "$outcome" == "$MOLE_OPTIMIZE_OUTCOME_APPLIED" ]]; then
+        detail=""
+    fi
+
     MOLE_OPTIMIZE_TASK_OUTCOME="$outcome"
     MOLE_OPTIMIZE_TASK_DETAIL="$detail"
 }
