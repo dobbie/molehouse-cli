@@ -1062,9 +1062,22 @@ func measureOverviewSize(path string) (int64, error) {
 		excludePath = filepath.Join(home, "Library")
 	}
 
-	if duSize, err := getDirectorySizeFromDuWithExcludeAndIgnores(context.Background(), path, excludePath, overviewIgnoreNamesForPath(path)); err == nil {
-		_ = storeOverviewSize(path, duSize)
-		return duSize, nil
+	cloudPlaceholderTrees := overviewCloudPlaceholderTreesForPath(path)
+	ignoreNames := make([]string, 0, len(cloudPlaceholderTrees))
+	for _, dir := range cloudPlaceholderTrees {
+		ignoreNames = append(ignoreNames, dir.Name())
+	}
+
+	if duSize, err := getDirectorySizeFromDuWithExcludeAndIgnores(context.Background(), path, excludePath, ignoreNames); err == nil {
+		total := duSize
+		// F-100: `du` was told to skip these trees entirely (they can block on
+		// FileProvider readdir); add back what is actually hydrated inside them
+		// instead of silently under-reporting.
+		for _, dir := range cloudPlaceholderTrees {
+			total += measureCloudPlaceholderTreeSize(filepath.Join(path, dir.Name()))
+		}
+		_ = storeOverviewSize(path, total)
+		return total, nil
 	}
 
 	if logicalSize, err := getDirectoryLogicalSizeWithExclude(path, excludePath); err == nil {
@@ -1193,20 +1206,67 @@ func validateDuIgnoreName(name string) error {
 	return nil
 }
 
-func overviewIgnoreNamesForPath(path string) []string {
+// overviewCloudPlaceholderTreesForPath returns path's immediate children whose
+// name marks a FileProvider-backed tree (see overviewCloudPlaceholderTreeNames).
+func overviewCloudPlaceholderTreesForPath(path string) []fs.DirEntry {
 	entries, err := os.ReadDir(path)
 	if err != nil {
 		return nil
 	}
 
-	ignoreNames := make([]string, 0, len(overviewDuIgnoreNames))
+	var trees []fs.DirEntry
 	for _, entry := range entries {
-		name := entry.Name()
-		if overviewDuIgnoreNames[name] && entry.IsDir() {
-			ignoreNames = append(ignoreNames, name)
+		if overviewCloudPlaceholderTreeNames[entry.Name()] && entry.IsDir() {
+			trees = append(trees, entry)
 		}
 	}
-	return ignoreNames
+	return trees
+}
+
+// isDatalessPlaceholder reports whether path's inode carries SF_DATALESS —
+// macOS's on-disk marker for a FileProvider placeholder that has not been
+// hydrated. Checked via Lstat, which never touches the entry's contents, so
+// this can run ahead of any read without risking the hang F-096 hit reading
+// through one (F-100: the check must precede the read).
+func isDatalessPlaceholder(path string) bool {
+	var st syscall.Stat_t
+	if err := syscall.Lstat(path, &st); err != nil {
+		return false
+	}
+	const sfDataless = 0x40000000 // SF_DATALESS, <sys/stat.h>
+	return st.Flags&sfDataless != 0
+}
+
+// measureCloudPlaceholderTreeSize walks a FileProvider-backed tree (iCloud's
+// Mobile Documents, OneDrive's CloudStorage) and sums only entries that are
+// NOT dataless placeholders — i.e. files the user chose to keep on this
+// device, or that are already downloaded. It never opens or reads a file; it
+// only Lstats each entry, so a placeholder is skipped, not hydrated by the
+// scan itself. Best-effort: any walk error just stops that subtree early
+// rather than failing the whole overview measurement.
+func measureCloudPlaceholderTreeSize(root string) int64 {
+	var total int64
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil //nolint:nilerr // best-effort: skip the unreadable entry, keep walking
+		}
+		if isDatalessPlaceholder(path) {
+			if d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil //nolint:nilerr
+		}
+		total += info.Size()
+		return nil
+	})
+	return total
 }
 
 func getDirectorySizeFromDuSkippingImmediateChild(path string, excludePath string, runDuSize func(string) (int64, error)) (int64, error) {

@@ -190,6 +190,24 @@ func TestOverviewMeasurementThatNeverReturnsYieldsPartialEnvelope(t *testing.T) 
 	}
 }
 
+// TestOverviewMeasureTimeoutConstantIsSane is F-099's regression test.
+// TestOverviewMeasurementThatNeverReturnsYieldsPartialEnvelope above
+// overwrites the package var overviewMeasureTimeout with 50ms inside itself,
+// so a passing suite proves the partial-envelope *mechanism* works but says
+// nothing about the value actually shipped in constants.go -- an orchestrator
+// sabotage run set it to 24*time.Hour and every guard test still passed.
+// This asserts the live, un-overridden shipped constant directly.
+func TestOverviewMeasureTimeoutConstantIsSane(t *testing.T) {
+	if overviewMeasureTimeout <= 0 {
+		t.Fatalf("overviewMeasureTimeout = %v, want a positive duration", overviewMeasureTimeout)
+	}
+	const maxSaneTimeout = 5 * time.Minute
+	if overviewMeasureTimeout > maxSaneTimeout {
+		t.Fatalf("overviewMeasureTimeout = %v, want <= %v -- a user waiting on one stuck overview "+
+			"entry for longer than that reads as a hang, not a slow folder", overviewMeasureTimeout, maxSaneTimeout)
+	}
+}
+
 // TestDirectoryScanTimeoutIsReportedNotWaitedOn covers the sibling path,
 // `analyze --json <path>`: the deadline must win over a scan that cannot
 // finish, so the caller sees an error rather than silence.

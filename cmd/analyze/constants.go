@@ -87,11 +87,23 @@ var (
 	directoryScanTimeout = 10 * time.Minute
 )
 
-var overviewDuIgnoreNames = map[string]bool{
-	// iCloud Drive's FileProvider tree can block `du` for tens of seconds even
-	// when most entries are cloud placeholders. Keep the overview responsive;
-	// users can still drill into the folder explicitly when they need it.
+// overviewCloudPlaceholderTreeNames names the direct children of a scanned
+// directory that are FileProvider-backed trees (iCloud Drive's "Mobile
+// Documents", OneDrive/other cloud-storage's "CloudStorage") whose readdir
+// can block `du` for tens of seconds when most entries are unhydrated
+// placeholders (F-096).
+//
+// F-100, user decision 2026-08-27: a placeholder is not excluded from the
+// reported size — hydrated ("always keep on this device") files under these
+// trees are real, on-disk space Molehouse exists to report, and dropping the
+// whole tree by name would under-report exactly like F-087 did. Instead
+// `du` is told to skip these names (keeping it fast and non-blocking), and
+// `measureCloudPlaceholderTreeSize` below walks the same tree itself,
+// checking each entry's dataless flag (`st_flags & SF_DATALESS`) *before*
+// touching its contents, and adds back only what is actually hydrated.
+var overviewCloudPlaceholderTreeNames = map[string]bool{
 	"Mobile Documents": true,
+	"CloudStorage":     true,
 }
 
 var foldDirs = map[string]bool{
