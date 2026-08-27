@@ -138,12 +138,44 @@ func performScanForJSON(path string, isOverview bool) jsonOutput {
 	return performDirectoryScanForJSON(path)
 }
 
+// scanDirectoryWithDeadline runs the full-entry scan and gives up when ctx
+// expires, returning ctx.Err() so the caller emits §4.6's failed envelope
+// (scan_failed) instead of blocking on a scan goroutine that will never
+// finish. See measureWithDeadline for why abandoning is the only option.
+func scanDirectoryWithDeadline(ctx context.Context, path string, filesScanned, dirsScanned, bytesScanned *int64, currentPath *atomic.Value) (scanResult, error) {
+	type outcome struct {
+		result scanResult
+		err    error
+	}
+
+	done := make(chan outcome, 1)
+	go func() {
+		result, err := scanPathConcurrentAllEntries(ctx, path, filesScanned, dirsScanned, bytesScanned, currentPath)
+		done <- outcome{result: result, err: err}
+	}()
+
+	select {
+	case res := <-done:
+		return res.result, res.err
+	case <-ctx.Done():
+		return scanResult{}, fmt.Errorf("scan of %s timed out after %s: %w", path, directoryScanTimeout, ctx.Err())
+	}
+}
+
 func performDirectoryScanForJSON(path string) jsonOutput {
 	var filesScanned, dirsScanned, bytesScanned int64
 	currentPath := &atomic.Value{}
 	currentPath.Store("")
 
-	result, err := scanPathConcurrentAllEntries(context.Background(), path, &filesScanned, &dirsScanned, &bytesScanned, currentPath)
+	// F-096: the same unresponsive-directory hazard as the overview path, with
+	// no per-entry seam to hang a deadline on -- the fan-out lives inside the
+	// scanner -- so the whole scan is bounded instead. The context is honoured
+	// by every cooperative wait in the scanner; the deadline below is what
+	// guarantees a return when a worker is wedged in a syscall that ignores it.
+	ctx, cancel := context.WithTimeout(context.Background(), directoryScanTimeout)
+	defer cancel()
+
+	result, err := scanDirectoryWithDeadline(ctx, path, &filesScanned, &dirsScanned, &bytesScanned, currentPath)
 	if err != nil {
 		// CONTRACT.md §4.6 (M1-T7): classify by errno, never by matching
 		// the message text, and emit the flat failed envelope instead of
@@ -256,6 +288,56 @@ type overviewMeasureFailure struct {
 	err  error
 }
 
+// The two measurement strategies are reached through vars so a test can
+// substitute a measurement that never returns -- the F-096 failure mode -- and
+// assert on the envelope the user actually receives. Same seam as
+// spotlightQueryRunner in scanner.go.
+var (
+	measureOverviewSizeFn = measureOverviewSize
+	measureInsightSizeFn  = measureInsightSize
+)
+
+// measureWithDeadline runs one overview measurement, abandoning it if it does
+// not answer in time.
+//
+// F-096: the analyzer hung here indefinitely on this machine -- 0% CPU, zero
+// bytes written -- with one goroutine parked in
+// os.ReadDir -> fdopendir -> getdirentries64 inside filepath.WalkDir, walking a
+// OneDrive ~/Library/CloudStorage placeholder tree, and main blocked forever in
+// this function's wg.Wait(). No context fixes that: a syscall already in the
+// kernel is not cancellable, and du (the strategy tried first) blocks in a
+// subprocess for the same reason. Abandoning the measurement is the only way
+// back, so a timed-out entry is reported as measure_failed rather than waited
+// on. A tool that says it could not measure a folder is worth more than one
+// that never returns.
+//
+// The abandoned goroutine stays blocked until the process exits. It holds no
+// semaphore -- the caller's slot is released when this returns -- and `done` is
+// buffered, so a late answer is delivered into the buffer and dropped rather
+// than leaking a second block.
+func measureWithDeadline(measure func() (int64, error), timeout time.Duration) (int64, error) {
+	type outcome struct {
+		size int64
+		err  error
+	}
+
+	done := make(chan outcome, 1)
+	go func() {
+		size, measureErr := measure()
+		done <- outcome{size: size, err: measureErr}
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case result := <-done:
+		return result.size, result.err
+	case <-timer.C:
+		return 0, fmt.Errorf("measurement timed out after %s; the folder stopped responding (an unresponsive cloud-storage folder does this)", timeout)
+	}
+}
+
 func measureOverviewEntriesForJSON(overviewEntries []dirEntry, insightPaths map[string]bool) ([]dirEntry, []overviewMeasureFailure) {
 	if len(overviewEntries) == 0 {
 		return nil, nil
@@ -286,13 +368,24 @@ func measureOverviewEntriesForJSON(overviewEntries []dirEntry, insightPaths map[
 			if cached, cacheErr := loadOverviewCachedSize(item.Path); cacheErr == nil && cached > 0 {
 				size = cached
 			} else if insightPaths[item.Path] {
-				size, err = measureInsightSize(item.Path)
+				size, err = measureWithDeadline(func() (int64, error) {
+					return measureInsightSizeFn(item.Path)
+				}, overviewMeasureTimeout)
 			} else {
-				size, err = measureOverviewSize(item.Path)
+				size, err = measureWithDeadline(func() (int64, error) {
+					return measureOverviewSizeFn(item.Path)
+				}, overviewMeasureTimeout)
 			}
 
 			if err == nil {
 				item.Size = size
+			} else {
+				// A failed measurement has no size. Leaving whatever the
+				// entry was seeded with would publish that seed as a real
+				// measurement and skip the failure branch downstream, which
+				// keys on Size == 0 -- silent wrong output rather than the
+				// measure_failed warning the caller is owed.
+				item.Size = 0
 			}
 			results <- measurement{index: index, entry: item, err: err}
 		})

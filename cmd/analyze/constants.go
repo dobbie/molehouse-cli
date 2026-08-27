@@ -67,6 +67,26 @@ const (
 	uiTickInterval     = 100 * time.Millisecond
 )
 
+// F-096: hard deadlines for the `analyze --json` scan.
+//
+// Every sizing strategy the analyzer has -- `du`, filepath.WalkDir, os.ReadDir
+// -- ends in a directory-read syscall, and a macOS FileProvider tree (OneDrive's
+// ~/Library/CloudStorage, iCloud's Mobile Documents) can park getdirentries64 in
+// the kernel indefinitely. A context cannot cancel a syscall that has already
+// entered the kernel, so the only way back is to abandon the measurement and
+// report it. These are package vars, not consts, so tests can shorten them.
+var (
+	// overviewMeasureTimeout bounds one overview entry's measurement. Per
+	// entry, not per scan, so one unresponsive folder does not spend the
+	// whole budget and cost the other entries their real sizes.
+	overviewMeasureTimeout = 60 * time.Second
+
+	// directoryScanTimeout bounds a whole `analyze --json <path>` scan. That
+	// path has no per-entry seam to hang the deadline on -- the fan-out is
+	// inside the scanner -- so the bound is the scan as a whole.
+	directoryScanTimeout = 10 * time.Minute
+)
+
 var overviewDuIgnoreNames = map[string]bool{
 	// iCloud Drive's FileProvider tree can block `du` for tens of seconds even
 	// when most entries are cloud placeholders. Keep the overview responsive;

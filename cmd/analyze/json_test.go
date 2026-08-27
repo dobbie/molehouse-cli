@@ -3,11 +3,16 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/tw93/mole/internal/contract"
 )
 
 func TestPerformScanForJSONIncludesAllEntriesAndLargeFiles(t *testing.T) {
@@ -122,5 +127,97 @@ func TestPerformOverviewScanForJSONSchemaWithInjectedEntries(t *testing.T) {
 	}
 	if result.TotalSize <= 0 {
 		t.Fatalf("expected measured overview size, got %d", result.TotalSize)
+	}
+}
+
+// TestOverviewMeasurementThatNeverReturnsYieldsPartialEnvelope is F-096's
+// regression test. Before the fix, an overview entry whose measurement blocked
+// in an uninterruptible directory read left main parked in
+// measureOverviewEntriesForJSON's wg.Wait() forever and the command wrote zero
+// bytes. The assertion is on what the user receives -- a returned envelope,
+// scan_status "partial", and a measure_failed warning naming the folder -- not
+// on any internal plumbing.
+func TestOverviewMeasurementThatNeverReturnsYieldsPartialEnvelope(t *testing.T) {
+	blocked := make(chan struct{})
+	t.Cleanup(func() { close(blocked) })
+
+	restoreMeasure := measureOverviewSizeFn
+	restoreTimeout := overviewMeasureTimeout
+	measureOverviewSizeFn = func(string) (int64, error) {
+		<-blocked
+		return 0, nil
+	}
+	overviewMeasureTimeout = 50 * time.Millisecond
+	t.Cleanup(func() {
+		measureOverviewSizeFn = restoreMeasure
+		overviewMeasureTimeout = restoreTimeout
+	})
+
+	stuck := t.TempDir()
+	done := make(chan jsonOutput, 1)
+	go func() {
+		done <- performOverviewScanForJSONWithEntries("/", nil, []dirEntry{{
+			Name:  "Stuck",
+			Path:  stuck,
+			IsDir: true,
+			Size:  -1,
+		}})
+	}()
+
+	var result jsonOutput
+	select {
+	case result = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("analyze --json never returned: an unresponsive folder must not hang the command")
+	}
+
+	if result.ScanStatus != contract.ScanPartial {
+		t.Fatalf("scan_status = %q, want %q", result.ScanStatus, contract.ScanPartial)
+	}
+
+	var found *contract.Warning
+	for i := range result.Warnings {
+		if result.Warnings[i].Code == contract.WarnMeasureFailed && result.Warnings[i].Scope == stuck {
+			found = &result.Warnings[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("no %s warning naming %q; warnings = %+v", contract.WarnMeasureFailed, stuck, result.Warnings)
+	}
+	if !strings.Contains(found.Message, "timed out") {
+		t.Fatalf("warning message does not tell the user it timed out: %q", found.Message)
+	}
+}
+
+// TestDirectoryScanTimeoutIsReportedNotWaitedOn covers the sibling path,
+// `analyze --json <path>`: the deadline must win over a scan that cannot
+// finish, so the caller sees an error rather than silence.
+func TestDirectoryScanTimeoutIsReportedNotWaitedOn(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	var files, dirs, bytes int64
+	current := &atomic.Value{}
+	current.Store("")
+
+	returned := make(chan error, 1)
+	go func() {
+		_, err := scanDirectoryWithDeadline(ctx, "/", &files, &dirs, &bytes, current)
+		returned <- err
+	}()
+
+	select {
+	case err := <-returned:
+		if err == nil {
+			// A tiny deadline can still be beaten on a fast machine; the
+			// claim under test is only that the call returns.
+			return
+		}
+		if classifyScanError(err) != contract.ErrScanFailed {
+			t.Fatalf("timed-out scan classified as %q, want %q", classifyScanError(err), contract.ErrScanFailed)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("scanDirectoryWithDeadline ignored its deadline and blocked")
 	}
 }
