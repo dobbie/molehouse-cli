@@ -1945,11 +1945,27 @@ uninstall_plan_build_records() {
 
     : > "$out_file"
 
+    # F-104: one root timing out (a macOS privacy prompt blocking a folder)
+    # must not cancel every other root. Discovery records such roots here and
+    # skips them; each becomes a scoped `discovery_incomplete` warning and the
+    # build returns 1, which the plan reports as partial and apply refuses.
+    local _MOLE_UNINSTALL_DISCOVERY_SKIP_FILE=""
+    _MOLE_UNINSTALL_DISCOVERY_SKIP_FILE=$(create_temp_file) || return 1
+
     local discovered="" discovery_rc=0
     discovered=$(find_app_files "$bundle_id" "$app_name" "$app_path" 2> /dev/null) || discovery_rc=$?
     if [[ $discovery_rc -eq 124 || $discovery_rc -ge 128 ]]; then
+        rm -f "$_MOLE_UNINSTALL_DISCOVERY_SKIP_FILE" 2> /dev/null || true # SAFE: exact tracked temp file created above
         return "$discovery_rc"
     fi
+    if [[ -s "$_MOLE_UNINSTALL_DISCOVERY_SKIP_FILE" ]]; then
+        local skipped_root
+        while IFS= read -r skipped_root; do
+            printf 'discovery_incomplete%s%s\n' "$us" "$skipped_root" >> "$warn_file"
+        done < "$_MOLE_UNINSTALL_DISCOVERY_SKIP_FILE"
+        [[ $discovery_rc -ne 0 ]] || discovery_rc=1
+    fi
+    rm -f "$_MOLE_UNINSTALL_DISCOVERY_SKIP_FILE" 2> /dev/null || true # SAFE: exact tracked temp file created above
 
     local raw_file unsorted_file
     raw_file=$(create_temp_file) || return 1
@@ -2114,15 +2130,22 @@ uninstall_plan_emit_failed() {
 uninstall_plan_emit_warnings() {
     local warn_file="$1"
     printf '['
-    local first=1 code message
-    while IFS= read -r code; do
-        [[ -n "$code" ]] || continue
+    local first=1 line code scope message
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        # A line is `code` or `code<US>scope`; only discovery_incomplete has a
+        # scope today, naming the root whose scan timed out (F-104).
+        IFS=$'\x1f' read -r code scope <<< "$line"
         case "$code" in
             size_unmeasured)
                 message="One or more paths could not be measured; total_bytes is a lower bound."
                 ;;
             discovery_incomplete)
-                message="Leftover discovery did not complete; the plan may be missing entries."
+                if [[ "$line" == *$'\x1f'* ]]; then
+                    message="Leftover discovery timed out in this folder; the plan may be missing entries from it."
+                else
+                    message="Leftover discovery did not complete; the plan may be missing entries."
+                fi
                 ;;
             path_unrepresentable)
                 message="A discovered path contains control characters and was excluded; it cannot be deleted."
@@ -2133,6 +2156,10 @@ uninstall_plan_emit_warnings() {
         first=0
         printf '{"code":'
         history_json_string "$code"
+        if [[ -n "$scope" ]]; then
+            printf ',"scope":'
+            history_json_string "$scope"
+        fi
         printf ',"message":'
         history_json_string "$message"
         printf '}'
@@ -2285,7 +2312,11 @@ uninstall_plan_command() {
         rm -f "$records_file" "$warn_file" 2> /dev/null || true # SAFE: exact tracked temp files created above
         return "$build_rc"
     fi
-    [[ $build_rc -eq 0 ]] || printf 'discovery_incomplete\n' >> "$warn_file"
+    # A timed-out root already wrote its own scoped discovery_incomplete; add
+    # the run-wide one only when discovery failed for some other reason.
+    if [[ $build_rc -ne 0 ]] && ! grep -q '^discovery_incomplete' "$warn_file"; then
+        printf 'discovery_incomplete\n' >> "$warn_file"
+    fi
 
     uninstall_plan_has_unmeasured "$records_file" && printf 'size_unmeasured\n' >> "$warn_file"
 

@@ -1086,3 +1086,208 @@ PY
     }
     [[ ! -d "$MOLE_TEST_TRASH_DIR" ]] || [[ -z "$(ls -A "$MOLE_TEST_TRASH_DIR")" ]]
 }
+
+# --- F-104: one timed-out discovery root must not abort the plan -------------
+#
+# A macOS privacy (TCC) prompt can block one discovery `find` past its per-root
+# cap. The hook below makes `run_with_timeout` report that for exactly one
+# root, the way a blocked folder does, and runs every other `find` for real.
+# The fixture adds vendor-nested leftovers so sibling roots contribute entries
+# that only a `find` (not a literal path check) can discover.
+make_vendor_nested_leftovers() {
+    mkdir -p "$HOME/Library/Application Support/Example/Fixture"
+    printf 'v\n' > "$HOME/Library/Application Support/Example/Fixture/v.bin"
+    mkdir -p "$HOME/Library/Logs/Example/Fixture"
+    printf 'l\n' > "$HOME/Library/Logs/Example/Fixture/l.log"
+}
+
+# $1: the status the blocked root's `find` reports (124 timeout, 143 SIGTERM).
+write_blocked_root_hook() {
+    local blocked_status="$1"
+    cat > "$SANDBOX/hook.sh" << HOOK
+run_with_timeout() {
+    if [[ "\$2" == "find" && "\$3" == "$HOME/Library/Caches" ]]; then
+        return $blocked_status
+    fi
+    shift
+    "\$@"
+}
+HOOK
+}
+
+@test "F-104 uninstall --plan skips a timed-out discovery root and reports discovery_incomplete" {
+    make_fixture_app
+    make_vendor_nested_leftovers
+    write_blocked_root_hook 124
+
+    MOLE_TEST_HOOK="$SANDBOX/hook.sh" run_mole --plan Fixture --json
+    [ "$status" -eq 0 ] || {
+        echo "status=$status stdout=$output stderr=$stderr"
+        return 1
+    }
+    printf '%s\n' "$output" > "$SANDBOX/plan.json"
+    python3 "$PROJECT_ROOT/tests/schemas/validate.py" \
+        "$PROJECT_ROOT/tests/schemas/uninstall_plan.schema.json" "$SANDBOX/plan.json"
+
+    python3 - "$SANDBOX/plan.json" "$HOME" << 'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+home = sys.argv[2]
+assert d["scan_status"] == "partial", d["scan_status"]
+incomplete = [w for w in d["warnings"] if w["code"] == "discovery_incomplete"]
+# One warning, naming the root that timed out -- not a run-wide guess.
+assert incomplete == [w for w in incomplete if w.get("scope") == home + "/Library/Caches"], d["warnings"]
+assert len(incomplete) == 1, d["warnings"]
+paths = {e["path"] for e in d["data"]["entries"]}
+for expected in (
+    home + "/Applications/Fixture.app",
+    home + "/Library/Caches/com.example.fixture",
+    home + "/Library/Preferences/com.example.fixture.plist",
+    home + "/Library/Application Support/Fixture",
+    # Found only by the sibling roots' finds, which must survive the timeout.
+    home + "/Library/Application Support/Example/Fixture",
+    home + "/Library/Logs/Example/Fixture",
+):
+    assert expected in paths, (expected, sorted(paths))
+PY
+}
+
+@test "F-104 a clean uninstall --plan still reports complete with no discovery_incomplete" {
+    make_fixture_app
+    make_vendor_nested_leftovers
+
+    run_mole --plan Fixture --json
+    [ "$status" -eq 0 ] || return 1
+    printf '%s\n' "$output" > "$SANDBOX/plan.json"
+    python3 - "$SANDBOX/plan.json" << 'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["scan_status"] == "complete", d
+assert d["warnings"] == [], d["warnings"]
+PY
+}
+
+@test "F-104 uninstall --plan still aborts when a discovery find dies by signal" {
+    make_fixture_app
+    make_vendor_nested_leftovers
+    write_blocked_root_hook 143
+
+    MOLE_TEST_HOOK="$SANDBOX/hook.sh" run_mole --plan Fixture --json
+    [ "$status" -eq 143 ] || {
+        echo "status=$status stdout=$output"
+        return 1
+    }
+    [ -z "$output" ] || return 1
+}
+
+@test "F-104 uninstall --plan records every remaining root when the discovery deadline is spent" {
+    make_fixture_app
+    make_vendor_nested_leftovers
+    # The overall 30s budget already exhausted before the first find.
+    printf '_MOLE_UNINSTALL_DISCOVERY_DEADLINE=$((SECONDS - 1))\n' > "$SANDBOX/hook.sh"
+
+    MOLE_TEST_HOOK="$SANDBOX/hook.sh" run_mole --plan Fixture --json
+    [ "$status" -eq 0 ] || {
+        echo "status=$status stdout=$output"
+        return 1
+    }
+    printf '%s\n' "$output" > "$SANDBOX/plan.json"
+    python3 - "$SANDBOX/plan.json" "$HOME" << 'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+home = sys.argv[2]
+assert d["scan_status"] == "partial", d
+scopes = {w.get("scope") for w in d["warnings"] if w["code"] == "discovery_incomplete"}
+for root in ("/Library/Application Support", "/Library/Caches", "/Library/Logs"):
+    assert home + root in scopes, (root, scopes)
+paths = {e["path"] for e in d["data"]["entries"]}
+# Literal-path leftovers need no find and are still reported.
+assert home + "/Library/Caches/com.example.fixture" in paths, paths
+assert home + "/Library/Logs/Example/Fixture" not in paths, paths
+PY
+}
+
+@test "F-104 apply refuses with scan_failed, deleting nothing, while the root still times out" {
+    make_fixture_app
+    make_vendor_nested_leftovers
+    write_blocked_root_hook 124
+    MOLE_TEST_HOOK="$SANDBOX/hook.sh" run_mole --plan Fixture --json
+    [ "$status" -eq 0 ] || return 1
+    printf '%s\n' "$output" > "$SANDBOX/plan.json"
+    add_selection "$SANDBOX/plan.json" "$SANDBOX/sel.json"
+
+    local before
+    before=$(find "$HOME" | LC_ALL=C sort)
+    MOLE_TEST_HOOK="$SANDBOX/hook.sh" run_mole_stdin "$SANDBOX/sel.json" --apply-plan --json
+    [ "$status" -eq 1 ] || {
+        echo "status=$status $output"
+        return 1
+    }
+    printf '%s\n' "$output" > "$SANDBOX/apply.json"
+    python3 - "$SANDBOX/apply.json" << 'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["scan_status"] == "failed", d
+assert d["error"]["code"] == "scan_failed", d["error"]
+assert d["data"] is None
+PY
+    [ "$before" = "$(find "$HOME" | LC_ALL=C sort)" ] || return 1
+    [[ ! -d "$MOLE_TEST_TRASH_DIR" ]] || [ -z "$(ls -A "$MOLE_TEST_TRASH_DIR")" ]
+}
+
+@test "F-104 apply refuses as plan_stale when the skipped root turns out to hold leftovers" {
+    make_fixture_app
+    make_vendor_nested_leftovers
+    mkdir -p "$HOME/Library/Caches/Example/Fixture"
+    printf 'c\n' > "$HOME/Library/Caches/Example/Fixture/c.bin"
+    write_blocked_root_hook 124
+    MOLE_TEST_HOOK="$SANDBOX/hook.sh" run_mole --plan Fixture --json
+    [ "$status" -eq 0 ] || return 1
+    printf '%s\n' "$output" > "$SANDBOX/plan.json"
+    [[ "$output" != *"/Library/Caches/Example/Fixture"* ]] || return 1
+    add_selection "$SANDBOX/plan.json" "$SANDBOX/sel.json"
+
+    # The prompt was answered: apply's re-discovery now reads the root, finds
+    # a path the user never saw, and must refuse rather than delete it.
+    local before
+    before=$(find "$HOME" | LC_ALL=C sort)
+    run_mole_stdin "$SANDBOX/sel.json" --apply-plan --json
+    [ "$status" -eq 4 ] || {
+        echo "status=$status $output"
+        return 1
+    }
+    [[ "$output" == *'"plan_stale"'* ]] || return 1
+    [ "$before" = "$(find "$HOME" | LC_ALL=C sort)" ] || return 1
+    [[ ! -d "$MOLE_TEST_TRASH_DIR" ]] || [ -z "$(ls -A "$MOLE_TEST_TRASH_DIR")" ]
+}
+
+@test "F-104 a plan with a skipped root applies once the root reads and adds nothing" {
+    make_fixture_app
+    make_vendor_nested_leftovers
+    write_blocked_root_hook 124
+    MOLE_TEST_HOOK="$SANDBOX/hook.sh" run_mole --plan Fixture --json
+    [ "$status" -eq 0 ] || return 1
+    printf '%s\n' "$output" > "$SANDBOX/plan.json"
+    add_selection "$SANDBOX/plan.json" "$SANDBOX/sel.json" \
+        "$HOME/Library/Logs/Example/Fixture"
+
+    run_mole_stdin "$SANDBOX/sel.json" --apply-plan --json
+    [ "$status" -eq 0 ] || {
+        echo "status=$status $output"
+        return 1
+    }
+    printf '%s\n' "$output" > "$SANDBOX/apply.json"
+    python3 - "$SANDBOX/apply.json" "$SANDBOX/plan.json" "$HOME" << 'PY'
+import json, sys
+res = json.load(open(sys.argv[1]))
+plan = json.load(open(sys.argv[2]))
+home = sys.argv[3]
+results = res["data"]["results"]
+assert len(results) == len(plan["data"]["entries"]), results
+done = [r["path"] for r in results if r["outcome"] == "trashed"]
+assert done == [home + "/Library/Logs/Example/Fixture"], results
+PY
+    [[ ! -e "$HOME/Library/Logs/Example/Fixture" ]] || return 1
+    [[ -e "$HOME/Library/Application Support/Example/Fixture/v.bin" ]] || return 1
+    [ "$(find "$MOLE_TEST_TRASH_DIR" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" -eq 1 ] || return 1
+}

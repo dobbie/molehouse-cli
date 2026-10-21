@@ -701,9 +701,15 @@ _mole_uninstall_name_variant_matches() {
 # Process substitution hides the producer status and can expose a partial
 # prefix after timeout. A failed ordinary find therefore contributes no
 # candidates for that root, while timeout/signal cancellation still aborts the
-# whole plan. This keeps an unreadable best-effort leftovers root from blocking
+# whole plan (see F-104 below for the one opt-in exception). This keeps an unreadable best-effort leftovers root from blocking
 # removal of the exact app the user selected without ever consuming partial
 # discovery output.
+#
+# F-104: a caller that can report incomplete discovery (the JSON plan/apply
+# path) sets _MOLE_UNINSTALL_DISCOVERY_SKIP_FILE. A timeout of one root -- a
+# macOS privacy prompt blocking one folder, or the overall discovery deadline
+# already spent -- is then recorded there and that root contributes nothing,
+# instead of cancelling every sibling's results. Signal deaths still abort.
 _mole_uninstall_materialize_find0() {
     local output_file="$1"
     shift
@@ -711,20 +717,44 @@ _mole_uninstall_materialize_find0() {
     : > "$output_file" || return 1
     local scan_timeout="$MOLE_TIMEOUT_MEDIUM_PROBE_SEC"
     if [[ -n "${_MOLE_UNINSTALL_DISCOVERY_DEADLINE:-}" ]]; then
+        local deadline_rc=0
         scan_timeout=$(_mole_timeout_with_deadline "$scan_timeout" \
-            "$_MOLE_UNINSTALL_DISCOVERY_DEADLINE") || return $?
+            "$_MOLE_UNINSTALL_DISCOVERY_DEADLINE") || deadline_rc=$?
+        if [[ $deadline_rc -ne 0 ]]; then
+            _mole_uninstall_record_timed_out_root "${1:-}" "$deadline_rc" && return 0
+            return "$deadline_rc"
+        fi
     fi
     local scan_rc=0
     run_with_timeout "$scan_timeout" find \
         "$@" < /dev/null > "$output_file" 2> /dev/null || scan_rc=$?
     if [[ $scan_rc -ne 0 ]]; then
         : > "$output_file" || true
+        if [[ $scan_rc -eq 124 ]] &&
+            _mole_uninstall_record_timed_out_root "${1:-}" "$scan_rc"; then
+            debug_log "Skipping timed-out uninstall discovery root: ${1:-unknown}"
+            return 0
+        fi
         if [[ $scan_rc -eq 124 || $scan_rc -ge 128 ]]; then
             return "$scan_rc"
         fi
         debug_log "Skipping incomplete uninstall discovery root: ${1:-unknown}"
         return 0
     fi
+    return 0
+}
+
+# Record a timed-out discovery root for the caller's discovery_incomplete
+# warning. Succeeds only for a timeout (124) when a caller opted in; anything
+# else, including a signal status, is left for the caller to propagate. A root
+# containing control characters is recorded as an empty line so a newline in
+# an app name cannot forge a second record.
+_mole_uninstall_record_timed_out_root() {
+    local root="$1"
+    local rc="$2"
+    [[ $rc -eq 124 && -n "${_MOLE_UNINSTALL_DISCOVERY_SKIP_FILE:-}" ]] || return 1
+    [[ "$root" =~ [[:cntrl:]] ]] && root=""
+    printf '%s\n' "$root" >> "$_MOLE_UNINSTALL_DISCOVERY_SKIP_FILE" || return 1
     return 0
 }
 
