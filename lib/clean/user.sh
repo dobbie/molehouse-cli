@@ -1900,6 +1900,11 @@ clean_tart_caches() {
         return 0
     fi
 
+    # `tart prune` deletes by its own age policy; no selection can narrow it.
+    if mole_selection_refuses "Tart caches" "$cache_root"; then
+        return 0
+    fi
+
     if [[ -t 1 ]]; then
         start_section_spinner "Pruning Tart caches..."
     fi

@@ -1943,6 +1943,13 @@ _remove_verified_container_stub() {
     # the exact containermanagerd metadata plist, i.e. a stub with no Data/ dir
     # and no user content. rmdir (not rm -r) means a container that gains any
     # file between the check and the removal survives untouched.
+    #
+    # Under --apply-selection this carve-out does not run: it is permanent and
+    # outside the shared sinks' selection gate. A selected stub is reported as
+    # refused; an unselected one is left alone.
+    if mole_selection_refuses "Orphaned container stub" "$container_dir"; then
+        return 1
+    fi
     command rm -f -- "$metadata_plist" || return 1
     command rmdir -- "$container_dir"
 }
@@ -2021,6 +2028,11 @@ clean_orphaned_container_stubs() {
                 # These directories have already passed the narrow stub-only
                 # checks above. Remove only the exact metadata file, then rmdir,
                 # so any new content that appears before deletion is preserved.
+                # Under --apply-selection the stub is left in place (see
+                # _remove_verified_container_stub) and is not a failure.
+                if mole_selection_refuses "Orphaned container stub" "$container_dir"; then
+                    continue
+                fi
                 local stub_remove_rc=0
                 _remove_verified_container_stub \
                     "$container_dir" "$metadata_plist" > /dev/null 2>&1 || stub_remove_rc=$?

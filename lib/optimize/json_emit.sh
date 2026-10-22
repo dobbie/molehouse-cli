@@ -114,6 +114,9 @@ optimize_json_emit_result() {
     local first_task=true first_warning=true
     for ((index = 0; index < count; index++)); do
         action="${MOLE_OPTIMIZE_ACTIONS[$index]}"
+        # --only: a task outside the selection did not run and is omitted,
+        # not reported with an invented outcome.
+        optimize_task_selected "$action" || continue
         label="${MOLE_OPTIMIZE_HEALTH_NAMES[$index]}"
         outcome=""
         detail=""
@@ -155,7 +158,20 @@ optimize_json_emit_result() {
         fi
     done
 
-    printf '{"schema_version":1,"mole_version":"%s","command":"optimize","mode":"%s","generated_at":"%s","scan_status":"%s","warnings":[%s],"error":null,"data":{"counts":{"applied":%s,"unchanged":%s,"skipped":%s,"unavailable":%s,"attention":%s,"failed":%s},"tasks":[%s]}}\n' \
+    # data.selection: the ids --only requested, or null when every task ran.
+    local selection_json="null" selected_id
+    if [[ ${#MOLE_OPTIMIZE_ONLY_IDS[@]} -gt 0 ]]; then
+        selection_json="["
+        local first_selected=true
+        for selected_id in "${MOLE_OPTIMIZE_ONLY_IDS[@]}"; do
+            [[ "$first_selected" == "true" ]] || selection_json+=","
+            first_selected=false
+            selection_json+=$(_optimize_json_string "$selected_id")
+        done
+        selection_json+="]"
+    fi
+
+    printf '{"schema_version":1,"mole_version":"%s","command":"optimize","mode":"%s","generated_at":"%s","scan_status":"%s","warnings":[%s],"error":null,"data":{"counts":{"applied":%s,"unchanged":%s,"skipped":%s,"unavailable":%s,"attention":%s,"failed":%s},"selection":%s,"tasks":[%s]}}\n' \
         "$mole_version" "$mode" "$generated_at" "$scan_status" "$warnings_json" \
-        "$applied" "$unchanged" "$skipped" "$unavailable" "$attention" "$failed" "$tasks_json"
+        "$applied" "$unchanged" "$skipped" "$unavailable" "$attention" "$failed" "$selection_json" "$tasks_json"
 }

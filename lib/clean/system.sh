@@ -1192,6 +1192,11 @@ clean_time_machine_failed_backups() {
                     debug_log "Keeping changed or active Time Machine candidate: $inprogress_file"
                     continue
                 fi
+                # `tmutil delete` is permanent and cannot go through Trash; it never
+                # runs under --apply-selection.
+                if mole_selection_refuses "Time Machine incomplete backup" "$inprogress_file"; then
+                    continue
+                fi
                 local tm_delete_timeout=""
                 local tm_delete_rc=0
                 tm_delete_timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_DISK_VERIFY_SEC" \
@@ -1344,6 +1349,11 @@ clean_time_machine_failed_backups() {
                         break
                     elif [[ $eligibility_rc -ne 0 ]]; then
                         debug_log "Keeping changed or active Time Machine candidate: $inprogress_file"
+                        continue
+                    fi
+                    # `tmutil delete` is permanent and cannot go through Trash; it never
+                    # runs under --apply-selection.
+                    if mole_selection_refuses "Time Machine incomplete backup" "$inprogress_file"; then
                         continue
                     fi
                     local tm_delete_timeout=""

@@ -228,6 +228,12 @@ clean_homebrew() {
         note_activity
         return 0
     fi
+    # `brew cleanup` prunes Homebrew's own tree, which no selection can narrow
+    # and which is not recoverable from Trash. It never runs under
+    # --apply-selection.
+    if mole_selection_refuses "Homebrew cleanup" "$HOME/Library/Caches/Homebrew"; then
+        return 0
+    fi
     # Skip if cleaned recently to avoid repeated heavy operations.
     local brew_cache_file="${HOME}/.cache/mole/brew_last_cleanup"
     local cache_valid_days=7

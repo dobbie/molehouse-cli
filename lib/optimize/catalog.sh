@@ -130,6 +130,71 @@ optimize_catalog_requires_sudo_for() {
     printf '%s\n' "${MOLE_OPTIMIZE_REQUIRES_SUDO[$index]}"
 }
 
+# Per-run task selection for `mo optimize --only <id>[,<id>...]` (Molehouse
+# SEL-M, CONTRACT.md §8). Empty means "no --only": every catalog task runs.
+# The user's persistent whitelist is never read or written here; a whitelisted
+# id that is also selected still reports `skipped` from execute_optimization.
+MOLE_OPTIMIZE_ONLY_IDS=()
+
+# Parse and validate an --only value. Every id must be a current catalog
+# action; an unknown or retired id (dock_refresh, memory_pressure_relief)
+# refuses the whole run before any task starts. Duplicates collapse.
+# Returns 0, or 2 with the reason on stderr.
+optimize_parse_only() {
+    local value="$1"
+    MOLE_OPTIMIZE_ONLY_IDS=()
+    local -a requested=()
+    local IFS=','
+    # shellcheck disable=SC2206  # Deliberate comma split of a validated id list.
+    requested=($value)
+    unset IFS
+
+    local id existing duplicate
+    if [[ ${#requested[@]} -gt 0 ]]; then
+        for id in "${requested[@]}"; do
+            id="${id// /}"
+            [[ -n "$id" ]] || continue
+            if ! optimize_catalog_index_for "$id" > /dev/null; then
+                echo "mo optimize --only: unknown task id '$id'. Nothing was run." >&2
+                echo "List current ids with: mo optimize --list --json" >&2
+                return 2
+            fi
+            duplicate=false
+            if [[ ${#MOLE_OPTIMIZE_ONLY_IDS[@]} -gt 0 ]]; then
+                for existing in "${MOLE_OPTIMIZE_ONLY_IDS[@]}"; do
+                    [[ "$existing" == "$id" ]] && duplicate=true && break
+                done
+            fi
+            [[ "$duplicate" == "true" ]] || MOLE_OPTIMIZE_ONLY_IDS+=("$id")
+        done
+    fi
+    if [[ ${#MOLE_OPTIMIZE_ONLY_IDS[@]} -eq 0 ]]; then
+        echo "mo optimize --only needs at least one task id. Nothing was run." >&2
+        echo "List current ids with: mo optimize --list --json" >&2
+        return 2
+    fi
+    return 0
+}
+
+# Does this run include the given catalog action?
+optimize_task_selected() {
+    local action="$1" id
+    [[ ${#MOLE_OPTIMIZE_ONLY_IDS[@]} -gt 0 ]] || return 0
+    for id in "${MOLE_OPTIMIZE_ONLY_IDS[@]}"; do
+        [[ "$id" == "$action" ]] && return 0
+    done
+    return 1
+}
+
+# How many catalog tasks this run executes.
+optimize_selected_task_count() {
+    if [[ ${#MOLE_OPTIMIZE_ONLY_IDS[@]} -gt 0 ]]; then
+        printf '%s\n' "${#MOLE_OPTIMIZE_ONLY_IDS[@]}"
+    else
+        printf '%s\n' "${#MOLE_OPTIMIZE_ACTIONS[@]}"
+    fi
+}
+
 optimize_catalog_validate() {
     local count=${#MOLE_OPTIMIZE_ACTIONS[@]}
     if [[ $count -eq 0 ]]; then

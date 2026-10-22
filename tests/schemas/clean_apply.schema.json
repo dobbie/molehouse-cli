@@ -1,0 +1,103 @@
+{
+  "title": "mole clean --apply-selection --json (CONTRACT.md §5.5, NEW SEL-M)",
+  "description": "Successful runs only. A refused selection is the §1.5 failed envelope with data null and is checked against envelope.schema.json instead.",
+  "allOf": [
+    { "$ref": "envelope.schema.json" },
+    {
+      "type": "object",
+      "properties": {
+        "command": { "const": "clean" },
+        "mode": { "const": "apply" },
+        "data": {
+          "type": "object",
+          "required": [
+            "delete_mode",
+            "freed_bytes",
+            "removed_items",
+            "failed_items",
+            "skipped_items",
+            "selection",
+            "categories"
+          ],
+          "properties": {
+            "delete_mode": {
+              "const": "trash",
+              "description": "Trash is the only mode --apply-selection has."
+            },
+            "freed_bytes": { "type": "integer", "minimum": 0 },
+            "removed_items": { "type": "integer", "minimum": 0 },
+            "failed_items": { "type": "integer", "minimum": 0 },
+            "skipped_items": { "type": "integer", "minimum": 0 },
+            "selection": {
+              "type": "object",
+              "required": ["requested", "removed_or_partial", "not_proposed", "not_selected_items"],
+              "properties": {
+                "requested": { "type": "integer", "minimum": 1 },
+                "removed_or_partial": { "type": "integer", "minimum": 0 },
+                "not_proposed": {
+                  "type": "array",
+                  "items": { "type": "string", "pattern": "^/" }
+                },
+                "not_selected_items": { "type": "integer", "minimum": 0 }
+              }
+            },
+            "categories": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "id",
+                  "label",
+                  "freed_bytes",
+                  "removed_items",
+                  "failed_items",
+                  "skipped_items",
+                  "failures",
+                  "skipped"
+                ],
+                "properties": {
+                  "id": { "type": "string", "pattern": "^[a-z0-9_]+$" },
+                  "label": { "type": "string" },
+                  "freed_bytes": { "type": "integer", "minimum": 0 },
+                  "removed_items": { "type": "integer", "minimum": 0 },
+                  "failed_items": { "type": "integer", "minimum": 0 },
+                  "skipped_items": { "type": "integer", "minimum": 0 },
+                  "failures": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": ["path", "code", "message"],
+                      "properties": {
+                        "path": { "type": "string", "pattern": "^/" },
+                        "code": {
+                          "type": "string",
+                          "enum": ["trash_failed", "permission_denied", "interrupted", "still_present"]
+                        },
+                        "message": { "type": "string" }
+                      }
+                    }
+                  },
+                  "skipped": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": ["path", "code", "message"],
+                      "properties": {
+                        "path": { "type": "string", "pattern": "^/" },
+                        "code": {
+                          "type": "string",
+                          "enum": ["already_in_trash", "refused_by_policy", "unsupported_in_selection"]
+                        },
+                        "message": { "type": "string" }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}
