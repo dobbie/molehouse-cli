@@ -22,8 +22,14 @@ load_quick_purge_hint_paths() {
         paths=("${MOLE_PURGE_DEFAULT_SEARCH_PATHS[@]}")
     fi
 
+    # Never hand back a cloud-provider tree: listing it raises the File
+    # Provider consent prompt and can park in opendir for minutes (F-105).
+    local path
     if [[ ${#paths[@]} -gt 0 ]]; then
-        printf '%s\n' "${paths[@]}"
+        for path in "${paths[@]}"; do
+            mole_purge_path_enters_cloud_tree "$path" && continue
+            printf '%s\n' "$path"
+        done
     fi
 }
 
@@ -295,6 +301,7 @@ probe_project_artifact_hints() {
                 break
             fi
             [[ -d "$project_dir" ]] || continue
+            mole_purge_path_enters_cloud_tree "$project_dir" && continue
 
             local project_name
             project_name=$(basename "$project_dir")
@@ -349,6 +356,7 @@ probe_project_artifact_hints() {
                     break
                 fi
                 [[ -d "$nested_dir" ]] || continue
+                mole_purge_path_enters_cloud_tree "$nested_dir" && continue
 
                 local nested_name
                 nested_name=$(basename "$nested_dir")

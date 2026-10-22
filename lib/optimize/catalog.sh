@@ -186,6 +186,18 @@ optimize_task_selected() {
     return 1
 }
 
+# Does at least one task this run will execute require admin (requires_sudo)?
+# The apply path asks for a sudo session only when this is true (F-117), so a
+# run of non-admin tasks never touches the user's sudo state or /dev/tty.
+optimize_selected_requires_sudo() {
+    local index
+    for ((index = 0; index < ${#MOLE_OPTIMIZE_ACTIONS[@]}; index++)); do
+        optimize_task_selected "${MOLE_OPTIMIZE_ACTIONS[$index]}" || continue
+        [[ "${MOLE_OPTIMIZE_REQUIRES_SUDO[$index]}" == "true" ]] && return 0
+    done
+    return 1
+}
+
 # How many catalog tasks this run executes.
 optimize_selected_task_count() {
     if [[ ${#MOLE_OPTIMIZE_ONLY_IDS[@]} -gt 0 ]]; then

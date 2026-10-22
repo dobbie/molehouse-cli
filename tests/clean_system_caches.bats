@@ -600,6 +600,57 @@ EOF
     rm -rf "$HOME/.config/mole" "$HOME/SlowProjects" "$fake_bin"
 }
 
+@test "clean_project_caches never lists a cloud-provider tree or a link into one (F-105)" {
+    mkdir -p "$HOME/Library/CloudStorage/OneDrive-Test/proj/.next/cache"
+    touch "$HOME/Library/CloudStorage/OneDrive-Test/proj/package.json"
+    ln -s "$HOME/Library/CloudStorage/OneDrive-Test" "$HOME/OneDrive"
+    mkdir -p "$HOME/Projects/app/.next/cache"
+    touch "$HOME/Projects/app/package.json"
+    mkdir -p "$HOME/.config/mole"
+    printf '%s\n' "$HOME/OneDrive" > "$HOME/.config/mole/purge_paths"
+
+    local fake_bin find_log
+    fake_bin="$(mktemp -d "$HOME/find-log.XXXXXX")"
+    find_log="$fake_bin/find.log"
+    printf '#!/bin/bash\necho "$*" >> "%s"\nexec /usr/bin/find "$@"\n' "$find_log" > "$fake_bin/find"
+    chmod +x "$fake_bin/find"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" PATH="$fake_bin:$PATH" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/caches.sh"
+export DRY_RUN=true
+clean_project_caches
+EOF
+    [ "$status" -eq 0 ]
+    # Positive control: the ordinary project root really was scanned.
+    grep -q "$HOME/Projects" "$find_log" || { echo "control root not scanned: $(cat "$find_log")"; return 1; }
+    if grep -E 'CloudStorage|OneDrive' "$find_log"; then
+        echo "the clean scan listed a cloud-provider tree (opendir there raises the OneDrive consent prompt and can hang)"
+        return 1
+    fi
+
+    rm -rf "$HOME/.config/mole" "$HOME/Library/CloudStorage" "$HOME/OneDrive" "$HOME/Projects" "$fake_bin"
+}
+
+@test "mole_purge_path_enters_cloud_tree matches cloud roots and links into them only (F-105)" {
+    mkdir -p "$HOME/Library/CloudStorage/OneDrive-Test" "$HOME/Library/Mobile Documents" "$HOME/Projects"
+    ln -s "$HOME/Library/CloudStorage/OneDrive-Test" "$HOME/OneDrive"
+    ln -s "$HOME/Projects" "$HOME/ProjectsLink"
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+source "$PROJECT_ROOT/lib/clean/purge_shared.sh"
+for p in "$HOME/Library/CloudStorage" "$HOME/Library/CloudStorage/OneDrive-Test/x" "$HOME/Library/Mobile Documents" "$HOME/OneDrive"; do
+    mole_purge_path_enters_cloud_tree "$p" && echo "cloud:${p#$HOME/}" || echo "MISSED:${p#$HOME/}"
+done
+for p in "$HOME/Projects" "$HOME/ProjectsLink"; do
+    mole_purge_path_enters_cloud_tree "$p" && echo "WRONG:${p#$HOME/}" || echo "ok:${p#$HOME/}"
+done
+EOF
+    [[ "$output" != *MISSED* && "$output" != *WRONG* ]] || { echo "$output"; return 1; }
+    [[ "$(grep -c '^cloud:' <<< "$output")" == "4" ]] || { echo "$output"; return 1; }
+    rm -rf "$HOME/Library/CloudStorage" "$HOME/Library/Mobile Documents" "$HOME/OneDrive" "$HOME/Projects" "$HOME/ProjectsLink"
+}
+
 @test "scan_project_cache_root prunes conda and site-packages" {
     mkdir -p "$HOME/Projects/miniconda3/lib/python3.11/site-packages/pkg1/__pycache__"
     mkdir -p "$HOME/Projects/miniconda3/lib/python3.11/site-packages/pkg2/__pycache__"

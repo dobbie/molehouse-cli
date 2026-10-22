@@ -35,6 +35,29 @@ teardown() {
     rm -rf "$HOME/Library/LaunchAgents"
 }
 
+@test "project artifact hints never list a cloud-provider tree (F-105)" {
+    mkdir -p "$HOME/Library/CloudStorage/OneDrive-Test/proj/node_modules"
+    touch "$HOME/Library/CloudStorage/OneDrive-Test/proj/package.json"
+    mkdir -p "$HOME/Projects/app/node_modules"
+    touch "$HOME/Projects/app/package.json"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOT0'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/hints.sh"
+run_with_timeout() { shift; "$@"; }
+load_quick_purge_hint_paths | sed "s#^$HOME/##" | sed 's/^/root=/'
+probe_project_artifact_hints
+printf 'count=%s\n' "$PROJECT_ARTIFACT_HINT_COUNT"
+printf 'examples=%s\n' "${PROJECT_ARTIFACT_HINT_EXAMPLES[*]}"
+EOT0
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"root=Projects"* ]] || { echo "$output"; return 1; }
+    [[ "$output" != *"CloudStorage"* ]] || { echo "the hint probe would list a cloud-provider tree: $output"; return 1; }
+    [[ "$output" == *"count=1"* ]] || { echo "$output"; return 1; }
+}
+
 @test "probe_project_artifact_hints reuses purge targets and excludes noisy names" {
     local root="$HOME/hints-root"
     mkdir -p "$root/proj/node_modules" "$root/proj/vendor" "$root/proj/bin"
@@ -108,7 +131,7 @@ EOT2B
 }
 
 @test "show_project_artifact_hint_notice reports skipped slow project artifact scans (#1053)" {
-    local root="$HOME/Library/CloudStorage"
+    local root="$HOME/SlowProjects"
     mkdir -p "$root"
     printf '%s\n' "$root" > "$HOME/.config/mole/purge_paths"
 

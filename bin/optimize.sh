@@ -249,7 +249,8 @@ run_optimize_json() {
         export MOLE_OPTIMIZE_SUDO_AVAILABLE="false"
         if [[ "${MOLE_DRY_RUN:-0}" == "1" ]]; then
             MOLE_OPTIMIZE_SUDO_AVAILABLE="true"
-        elif ensure_sudo_session "System optimization requires admin access"; then
+        elif optimize_selected_requires_sudo &&
+            ensure_sudo_session "System optimization requires admin access"; then
             MOLE_OPTIMIZE_SUDO_AVAILABLE="true"
         fi
 
@@ -444,6 +445,8 @@ main() {
     export MOLE_OPTIMIZE_SUDO_AVAILABLE="false"
     if [[ "${MOLE_DRY_RUN:-0}" == "1" ]]; then
         MOLE_OPTIMIZE_SUDO_AVAILABLE="true"
+    elif ! optimize_selected_requires_sudo; then
+        : # No task in this run needs admin: never touch the sudo session (F-117).
     elif ensure_sudo_session "System optimization requires admin access"; then
         MOLE_OPTIMIZE_SUDO_AVAILABLE="true"
     else

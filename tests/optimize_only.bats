@@ -107,3 +107,59 @@ catalog_ids() {
     [[ "$(shasum "$HOME/.config/mole/whitelist_optimize")" == "$before" ]] ||
         { echo "--only modified the persistent whitelist"; return 1; }
 }
+
+# F-117: the apply path asks for a sudo session only when a task that will run
+# needs admin. The shim records every sudo and osascript call; `sudo -n true`
+# answers yes so a run that does ask never reaches a tty or a password dialog.
+make_sudo_shim() {
+    SHIM_DIR="$HOME/shim"
+    SUDO_LOG="$HOME/sudo-calls.log"
+    mkdir -p "$SHIM_DIR"
+    : > "$SUDO_LOG"
+    printf '#!/bin/bash\necho "sudo $*" >> "%s"\nexit 0\n' "$SUDO_LOG" > "$SHIM_DIR/sudo"
+    printf '#!/bin/bash\necho "osascript $*" >> "%s"\nexit 1\n' "$SUDO_LOG" > "$SHIM_DIR/osascript"
+    chmod +x "$SHIM_DIR/sudo" "$SHIM_DIR/osascript"
+}
+
+@test "apply --only with no admin task never touches sudo (F-117)" {
+    catalog_ids > "$HOME/.config/mole/whitelist_optimize"
+    make_sudo_shim
+    run --separate-stderr env -u MOLE_TEST_NO_AUTH -u MOLE_TEST_MODE HOME="$HOME" PATH="$SHIM_DIR:$PATH" \
+        "$PROJECT_ROOT/mole" optimize --json --only cache_refresh,fix_broken_configs
+    [ "$status" -eq 0 ] || { echo "exit $status: $stderr"; return 1; }
+    [[ "$(jq -r '.mode' <<< "$output")" == "apply" ]] || return 1
+    [[ ! -s "$SUDO_LOG" ]] ||
+        { echo "a run of non-admin tasks must not call sudo or show a dialog; saw: $(cat "$SUDO_LOG")"; return 1; }
+}
+
+@test "apply --only with an admin task still asks for the sudo session (F-117)" {
+    catalog_ids > "$HOME/.config/mole/whitelist_optimize"
+    make_sudo_shim
+    run --separate-stderr env -u MOLE_TEST_NO_AUTH -u MOLE_TEST_MODE HOME="$HOME" PATH="$SHIM_DIR:$PATH" \
+        "$PROJECT_ROOT/mole" optimize --json --only fix_broken_configs,network_optimization
+    [ "$status" -eq 0 ] || { echo "exit $status: $stderr"; return 1; }
+    grep -q '^sudo ' "$SUDO_LOG" ||
+        { echo "a run that includes an admin task must still request sudo; log: $(cat "$SUDO_LOG")"; return 1; }
+}
+
+@test "human apply --only with no admin task never touches sudo (F-117)" {
+    catalog_ids > "$HOME/.config/mole/whitelist_optimize"
+    make_sudo_shim
+    run env -u MOLE_TEST_NO_AUTH -u MOLE_TEST_MODE HOME="$HOME" PATH="$SHIM_DIR:$PATH" \
+        "$PROJECT_ROOT/mole" optimize --only fix_broken_configs
+    [[ ! -s "$SUDO_LOG" ]] ||
+        { echo "saw: $(cat "$SUDO_LOG")"; return 1; }
+    [[ "$output" != *"Skipping sudo-required optimizations"* ]] || return 1
+}
+
+@test "optimize_selected_requires_sudo follows the selection" {
+    run env PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc -c '
+        source "$PROJECT_ROOT/lib/optimize/catalog.sh"
+        optimize_selected_requires_sudo && echo all-yes || echo all-no
+        MOLE_OPTIMIZE_ONLY_IDS=(cache_refresh)
+        optimize_selected_requires_sudo && echo one-yes || echo one-no
+        MOLE_OPTIMIZE_ONLY_IDS=(cache_refresh network_optimization)
+        optimize_selected_requires_sudo && echo mix-yes || echo mix-no'
+    [ "$status" -eq 0 ]
+    [[ "$output" == $'all-yes\none-no\nmix-yes' ]] || { echo "$output"; return 1; }
+}

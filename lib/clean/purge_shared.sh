@@ -125,6 +125,27 @@ mole_purge_is_cloud_synced_path() {
     return 1
 }
 
+# Like mole_purge_is_cloud_synced_path, but also catches a symlink that points
+# into a cloud-provider tree (for example ~/OneDrive -> ~/Library/CloudStorage/
+# OneDrive-Personal). Only the link target is resolved; nothing inside the
+# tree is listed, because listing a File Provider directory is what triggers
+# the macOS consent prompt and can park in opendir for minutes (F-105).
+mole_purge_path_enters_cloud_tree() {
+    local path="${1:-}"
+    [[ -n "$path" ]] || return 1
+    path="${path%/}"
+    mole_purge_is_cloud_synced_path "$path" && return 0
+    [[ -L "$path" ]] || return 1
+
+    local resolved
+    resolved=$(/usr/bin/readlink -f "$path" 2> /dev/null) || resolved=""
+    if [[ -z "$resolved" ]]; then
+        resolved=$(/usr/bin/readlink "$path" 2> /dev/null) || return 1
+        [[ "$resolved" == /* ]] || resolved="${path%/*}/$resolved"
+    fi
+    mole_purge_is_cloud_synced_path "$resolved"
+}
+
 mole_purge_is_project_root() {
     local dir="$1"
     local indicator

@@ -129,6 +129,8 @@ project_cache_has_indicators() {
     local max_depth="${2:-5}"
     local indicator_timeout="${MOLE_PROJECT_CACHE_DISCOVERY_TIMEOUT:-2}"
     [[ -d "$dir" ]] || return 1
+    # Never list a cloud-provider tree (F-105).
+    mole_purge_path_enters_cloud_tree "$dir" && return 1
 
     local -a find_args=("$dir" "-maxdepth" "$max_depth" "(")
     local first=true
@@ -153,12 +155,20 @@ discover_project_cache_roots() {
     local -a seen_identities=()
     local root
 
+    # The purge defaults list ~/Library/CloudStorage and a user's purge_paths
+    # may point into a cloud provider; the clean scan never enters those trees,
+    # since opening them raises the File Provider consent prompt and can hang
+    # in opendir (F-105).
     for root in "${MOLE_PURGE_DEFAULT_SEARCH_PATHS[@]}"; do
-        [[ -d "$root" ]] && roots+=("$root")
+        [[ -d "$root" ]] || continue
+        mole_purge_path_enters_cloud_tree "$root" && continue
+        roots+=("$root")
     done
 
     while IFS= read -r root; do
-        [[ -d "$root" ]] && roots+=("$root")
+        [[ -d "$root" ]] || continue
+        mole_purge_path_enters_cloud_tree "$root" && continue
+        roots+=("$root")
     done < <(mole_purge_read_paths_config "$HOME/.config/mole/purge_paths")
 
     local _indicator_tmp
@@ -178,6 +188,7 @@ discover_project_cache_roots() {
         [[ -d "$dir" ]] || continue
         dir="${dir%/}"
         base="${dir##*/}"
+        mole_purge_path_enters_cloud_tree "$dir" && continue
 
         case "$base" in
             .* | Library | Applications | Movies | Music | Pictures | Public)
@@ -248,6 +259,7 @@ scan_project_cache_root() {
     local output_file="$2"
     local scan_timeout="${MOLE_PROJECT_CACHE_SCAN_TIMEOUT:-6}"
     [[ -d "$root" ]] || return 0
+    mole_purge_path_enters_cloud_tree "$root" && return 0
 
     local -a find_args=(
         find -P "$root" -maxdepth 9 -mount
