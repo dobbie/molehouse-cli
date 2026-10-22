@@ -2667,12 +2667,38 @@ uninstall_apply_command() {
         return "$build_rc"
     fi
     if [[ $build_rc -ne 0 ]]; then
-        # A truncated re-discovery cannot verify anything. Refuse before any
-        # deletion rather than compare a digest against a partial scan.
-        uninstall_apply_refuse "$mole_version" "scan_failed" \
-            "leftover discovery did not complete; nothing was deleted"
-        rm -rf "$work_dir" 2> /dev/null || true # SAFE: tracked scratch dir this function created
-        return 1
+        # HON-T1a: this revises F104-M's "a still-incomplete root refuses apply".
+        # A root the plan already named as incomplete (the user saw that
+        # warning and chose to proceed) may stay incomplete: apply deletes only
+        # the plan's selected entries, so skipping that root cannot widen the
+        # deletion, and refusing would block removal for good whenever a root
+        # is permanently unreadable (a privacy-protected folder). The warning
+        # is carried into the apply result. Any root that was NOT incomplete at
+        # plan time, or an incomplete cause with no named root, still refuses:
+        # consent was given against a complete search of it.
+        local planned_incomplete="|" plan_warn_code plan_warn_scope
+        while IFS=$'\x1f' read -r plan_warn_code plan_warn_scope; do
+            [[ "$plan_warn_code" == "discovery_incomplete" && -n "$plan_warn_scope" ]] || continue
+            planned_incomplete+="$plan_warn_scope|"
+        done < <(plutil -extract warnings xml1 -o - "$plan_file" 2> /dev/null |
+            uninstall_apply_xml_records "code,scope" 2> /dev/null)
+
+        local new_incomplete=0 cur_warn_code cur_warn_scope saw_incomplete=0
+        while IFS=$'\x1f' read -r cur_warn_code cur_warn_scope; do
+            [[ "$cur_warn_code" == "discovery_incomplete" ]] || continue
+            saw_incomplete=1
+            if [[ -z "$cur_warn_scope" || "$planned_incomplete" != *"|$cur_warn_scope|"* ]]; then
+                new_incomplete=1
+            fi
+        done < "$warn_file"
+        if [[ $saw_incomplete -eq 0 || $new_incomplete -eq 1 ]]; then
+            # A truncated re-discovery cannot verify anything. Refuse before any
+            # deletion rather than compare a digest against a partial scan.
+            uninstall_apply_refuse "$mole_version" "scan_failed" \
+                "leftover discovery did not complete; nothing was deleted"
+            rm -rf "$work_dir" 2> /dev/null || true # SAFE: tracked scratch dir this function created
+            return 1
+        fi
     fi
 
     local current_digest
@@ -2831,7 +2857,7 @@ uninstall_apply_command() {
     done < "$normalized_file"
 
     local scan_status="complete"
-    [[ $any_failed -eq 1 || $interrupted -eq 1 ]] && scan_status="partial"
+    [[ $any_failed -eq 1 || $interrupted -eq 1 || $build_rc -ne 0 ]] && scan_status="partial"
 
     uninstall_apply_emit_json "$mole_version" "$results_file" "$submitted_digest" \
         "$result_mode" "$freed_bytes" "$scan_status" "$warn_file"

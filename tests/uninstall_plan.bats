@@ -1259,31 +1259,122 @@ assert home + "/Library/Logs/Example/Fixture" not in paths, paths
 PY
 }
 
-@test "F-104 apply refuses with scan_failed, deleting nothing, while the root still times out" {
+# HON-T1a revises F104-M: a root that was incomplete at plan time and is still
+# incomplete at apply time no longer refuses. Apply only removes the selected
+# entries, so skipping the root cannot widen the deletion, and a permanently
+# unreadable root would otherwise block removal forever. The warning is carried
+# into the apply result.
+assert_apply_carried_warning() {
+    # $1 apply.json  $2 root expected in the carried warning  $3 removed path
+    python3 - "$1" "$2" "$3" << 'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["scan_status"] == "partial", d["scan_status"]
+scopes = [w.get("scope") for w in d["warnings"] if w["code"] == "discovery_incomplete"]
+assert scopes == [sys.argv[2]], d["warnings"]
+done = [r["path"] for r in d["data"]["results"] if r["outcome"] == "trashed"]
+assert done == [sys.argv[3]], d["data"]["results"]
+PY
+}
+
+@test "F-104 apply proceeds and carries the warning while a timed-out root is still incomplete" {
     make_fixture_app
     make_vendor_nested_leftovers
     write_blocked_root_hook 124
     MOLE_TEST_HOOK="$SANDBOX/hook.sh" run_mole --plan Fixture --json
     [ "$status" -eq 0 ] || return 1
     printf '%s\n' "$output" > "$SANDBOX/plan.json"
-    add_selection "$SANDBOX/plan.json" "$SANDBOX/sel.json"
+    add_selection "$SANDBOX/plan.json" "$SANDBOX/sel.json" "$HOME/Library/Logs/Example/Fixture"
 
-    local before
-    before=$(find "$HOME" | LC_ALL=C sort)
     MOLE_TEST_HOOK="$SANDBOX/hook.sh" run_mole_stdin "$SANDBOX/sel.json" --apply-plan --json
-    [ "$status" -eq 1 ] || {
+    [ "$status" -eq 0 ] || {
         echo "status=$status $output"
         return 1
     }
     printf '%s\n' "$output" > "$SANDBOX/apply.json"
-    python3 - "$SANDBOX/apply.json" << 'PY'
+    assert_apply_carried_warning "$SANDBOX/apply.json" "$HOME/Library/Caches" "$HOME/Library/Logs/Example/Fixture"
+    [[ ! -e "$HOME/Library/Logs/Example/Fixture" ]] || return 1
+    [[ -e "$HOME/Library/Caches/com.example.fixture" ]] || return 1
+}
+
+@test "F-106 apply proceeds and carries the warning while a root is still unreadable (chmod 000)" {
+    [ "$(id -u)" -ne 0 ] || skip "root reads every directory"
+    make_fixture_app
+    make_vendor_nested_leftovers
+    mkdir -p "$HOME/Library/Caches/Locked"
+    chmod 000 "$HOME/Library/Caches/Locked"
+    run_mole --plan Fixture --json
+    [ "$status" -eq 0 ] || {
+        chmod 755 "$HOME/Library/Caches/Locked"
+        return 1
+    }
+    printf '%s\n' "$output" > "$SANDBOX/plan.json"
+    add_selection "$SANDBOX/plan.json" "$SANDBOX/sel.json" "$HOME/Library/Logs/Example/Fixture"
+
+    run_mole_stdin "$SANDBOX/sel.json" --apply-plan --json
+    chmod 755 "$HOME/Library/Caches/Locked"
+    [ "$status" -eq 0 ] || {
+        echo "status=$status $output"
+        return 1
+    }
+    printf '%s\n' "$output" > "$SANDBOX/apply.json"
+    assert_apply_carried_warning "$SANDBOX/apply.json" "$HOME/Library/Caches" "$HOME/Library/Logs/Example/Fixture"
+    [[ ! -e "$HOME/Library/Logs/Example/Fixture" ]] || return 1
+    [[ -e "$HOME/Library/Caches/com.example.fixture" ]] || return 1
+}
+
+@test "F-106 apply refuses as plan_stale when a root unreadable at plan time now holds a new leftover" {
+    [ "$(id -u)" -ne 0 ] || skip "root reads every directory"
+    make_fixture_app
+    make_vendor_nested_leftovers
+    mkdir -p "$HOME/Library/Logs/Locked"
+    chmod 000 "$HOME/Library/Logs/Locked"
+    run_mole --plan Fixture --json
+    chmod 755 "$HOME/Library/Logs/Locked"
+    [ "$status" -eq 0 ] || return 1
+    printf '%s\n' "$output" > "$SANDBOX/plan.json"
+    # The failed Logs find contributed nothing, so the plan never saw this one.
+    [[ "$output" != *"/Library/Logs/Example/Fixture"* ]] || return 1
+    add_selection "$SANDBOX/plan.json" "$SANDBOX/sel.json" "$HOME/Library/Caches/com.example.fixture"
+
+    local before
+    before=$(find "$HOME" | LC_ALL=C sort)
+    run_mole_stdin "$SANDBOX/sel.json" --apply-plan --json
+    [ "$status" -eq 4 ] || {
+        echo "status=$status $output"
+        return 1
+    }
+    [[ "$output" == *'"plan_stale"'* ]] || return 1
+    [ "$before" = "$(find "$HOME" | LC_ALL=C sort)" ] || return 1
+    [[ ! -d "$MOLE_TEST_TRASH_DIR" ]] || [ -z "$(ls -A "$MOLE_TEST_TRASH_DIR")" ]
+}
+
+@test "F-106 apply refuses with scan_failed when a root searched completely at plan time is unreadable at apply time" {
+    [ "$(id -u)" -ne 0 ] || skip "root reads every directory"
+    make_fixture_app
+    make_vendor_nested_leftovers
+    mkdir -p "$HOME/Library/Logs/Locked"
+    run_mole --plan Fixture --json
+    [ "$status" -eq 0 ] || return 1
+    printf '%s\n' "$output" > "$SANDBOX/plan.json"
+    python3 - "$SANDBOX/plan.json" << 'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))
-assert d["scan_status"] == "failed", d
-assert d["error"]["code"] == "scan_failed", d["error"]
-assert d["data"] is None
+assert d["scan_status"] == "complete" and d["warnings"] == [], d["warnings"]
 PY
-    [ "$before" = "$(find "$HOME" | LC_ALL=C sort)" ] || return 1
+    add_selection "$SANDBOX/plan.json" "$SANDBOX/sel.json" "$HOME/Library/Caches/com.example.fixture"
+
+    chmod 000 "$HOME/Library/Logs/Locked"
+    local before
+    before=$(find "$HOME" -not -path "$HOME/Library/Logs/Locked" | LC_ALL=C sort)
+    run_mole_stdin "$SANDBOX/sel.json" --apply-plan --json
+    chmod 755 "$HOME/Library/Logs/Locked"
+    [ "$status" -eq 1 ] || {
+        echo "status=$status $output"
+        return 1
+    }
+    [[ "$output" == *'"scan_failed"'* ]] || return 1
+    [ "$before" = "$(find "$HOME" -not -path "$HOME/Library/Logs/Locked" | LC_ALL=C sort)" ] || return 1
     [[ ! -d "$MOLE_TEST_TRASH_DIR" ]] || [ -z "$(ls -A "$MOLE_TEST_TRASH_DIR")" ]
 }
 
