@@ -738,15 +738,21 @@ _mole_uninstall_materialize_find0() {
         if [[ $scan_rc -eq 124 || $scan_rc -ge 128 ]]; then
             return "$scan_rc"
         fi
+        # F-106: any other failure (EPERM from a privacy "Don't Allow", an
+        # unreadable subdirectory) also discards this root's output above, so
+        # the root was not fully searched. Record it like a timeout.
+        _mole_uninstall_record_timed_out_root "${1:-}" 124 || true
         debug_log "Skipping incomplete uninstall discovery root: ${1:-unknown}"
         return 0
     fi
     return 0
 }
 
-# Record a timed-out discovery root for the caller's discovery_incomplete
+# Record an unsearched discovery root for the caller's discovery_incomplete
 # warning. Succeeds only for a timeout (124) when a caller opted in; anything
-# else, including a signal status, is left for the caller to propagate. A root
+# else, including a signal status, is left for the caller to propagate. The
+# F-106 path passes 124 for a non-timeout failure: the caller has already
+# decided that root was not searched. A root
 # containing control characters is recorded as an empty line so a newline in
 # an app name cannot forge a second record.
 _mole_uninstall_record_timed_out_root() {

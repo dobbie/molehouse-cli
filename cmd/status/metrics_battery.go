@@ -34,14 +34,8 @@ func collectBatteries() (batts []BatteryStatus, err error) {
 	}()
 
 	// macOS: pmset for real-time percentage/status.
-	if runtime.GOOS == "darwin" && commandExists("pmset") {
-		if out, err := runCmd(context.Background(), "pmset", "-g", "batt"); err == nil {
-			// Health/cycles/capacity from AppleSmartBattery and cached system_profiler.
-			health, cycles, capacity := getCachedPowerData()
-			if batts := parsePMSet(out, health, cycles, capacity); len(batts) > 0 {
-				return batts, nil
-			}
-		}
+	if runtime.GOOS == "darwin" {
+		return collectBatteriesDarwin()
 	}
 
 	// Linux: /sys/class/power_supply.
@@ -69,6 +63,31 @@ func collectBatteries() (batts []BatteryStatus, err error) {
 	}
 
 	return nil, errors.New("no battery data found")
+}
+
+// collectBatteriesDarwin separates a Mac with no battery from a query that
+// failed (F-080). pmset answering without any battery line is the genuine
+// absence (a desktop): nil slice, nil error, which the contract reads as
+// "not applicable". A missing or failing pmset, or a battery line that does
+// not parse, is an error so the caller reports collector_failed.
+func collectBatteriesDarwin() ([]BatteryStatus, error) {
+	if !commandExists("pmset") {
+		return nil, errors.New("pmset not found")
+	}
+	out, err := runCmd(context.Background(), "pmset", "-g", "batt")
+	if err != nil {
+		return nil, fmt.Errorf("pmset -g batt failed: %w", err)
+	}
+	if !strings.Contains(out, "%") {
+		return nil, nil
+	}
+	// Health/cycles/capacity from AppleSmartBattery and cached system_profiler.
+	health, cycles, capacity := getCachedPowerData()
+	batts := parsePMSet(out, health, cycles, capacity)
+	if len(batts) == 0 {
+		return nil, errors.New("pmset -g batt reported a battery line that could not be parsed")
+	}
+	return batts, nil
 }
 
 func parsePMSet(raw string, health string, cycles int, capacity int) []BatteryStatus {

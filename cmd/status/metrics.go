@@ -426,7 +426,7 @@ func (c *Collector) collectFast(includeProcesses bool) (MetricsSnapshot, error) 
 		// future error return on either wires straight into §2.4 without
 		// another silent-`_`-discard trap.
 		{"disk_io", func() error { collected.diskIO = c.collectDiskIO(now); return nil }},
-		{"network", func() error { collected.netStats = c.collectNetwork(now); return nil }},
+		{"network", func() (err error) { collected.netStats, err = c.collectNetwork(now); return }},
 	}
 	if includeProcesses {
 		tasks = append(tasks, namedTask{"top_processes", func() error { return collectProcessesInto(&collected) }})
@@ -480,7 +480,7 @@ func (c *Collector) collectFull() (MetricsSnapshot, error) {
 		{"disks", func() (err error) { collected.diskStats, err = collectDisks(); return }},
 		{"trash_size", func() error { collected.trashSize, collected.trashApprox = collectTrashSize(); return nil }},
 		{"disk_io", func() error { collected.diskIO = c.collectDiskIO(now); return nil }},
-		{"network", func() error { collected.netStats = c.collectNetwork(now); return nil }},
+		{"network", func() (err error) { collected.netStats, err = c.collectNetwork(now); return }},
 		{"proxy", func() error { collected.proxyStats = collectProxy(); return nil }},
 		{"batteries", func() (err error) { collected.batteryStats, err = collectBatteries(); return }},
 		{"thermal", func() error { collected.thermalStats = collectThermal(); return nil }},

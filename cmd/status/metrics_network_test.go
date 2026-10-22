@@ -114,7 +114,7 @@ func TestCollectNetworkFirstSampleReturnsZeroRateInterfaces(t *testing.T) {
 	t.Cleanup(func() { ioCountersFunc = original })
 
 	c := &Collector{}
-	got := c.collectNetwork(time.Now())
+	got, _ := c.collectNetwork(time.Now())
 	if len(got) != 1 {
 		t.Fatalf("expected first sample to render one interface, got %+v", got)
 	}
@@ -144,7 +144,7 @@ func TestCollectNetworkUsesPrimedCountersForInitialRates(t *testing.T) {
 	t.Cleanup(func() { ioCountersFunc = original })
 
 	c := NewCollector(ProcessWatchOptions{})
-	got := c.collectNetwork(c.lastNetAt.Add(time.Second))
+	got, _ := c.collectNetwork(c.lastNetAt.Add(time.Second))
 	if len(got) != 1 {
 		t.Fatalf("expected one interface, got %+v", got)
 	}
@@ -175,7 +175,7 @@ func TestCollectNetworkClampsCounterReset(t *testing.T) {
 		txHistoryBuf: NewRingBuffer(NetworkHistorySize),
 	}
 
-	got := c.collectNetwork(base.Add(time.Second))
+	got, _ := c.collectNetwork(base.Add(time.Second))
 	if len(got) != 1 {
 		t.Fatalf("expected one interface, got %+v", got)
 	}

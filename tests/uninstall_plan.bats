@@ -1152,6 +1152,58 @@ for expected in (
 PY
 }
 
+@test "F-106 uninstall --plan reports discovery_incomplete when one root's find fails with rc 1" {
+    make_fixture_app
+    make_vendor_nested_leftovers
+    write_blocked_root_hook 1
+
+    MOLE_TEST_HOOK="$SANDBOX/hook.sh" run_mole --plan Fixture --json
+    [ "$status" -eq 0 ] || {
+        echo "status=$status stdout=$output stderr=$stderr"
+        return 1
+    }
+    printf '%s\n' "$output" > "$SANDBOX/plan.json"
+    python3 - "$SANDBOX/plan.json" "$HOME" << 'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+home = sys.argv[2]
+assert d["scan_status"] == "partial", d["scan_status"]
+incomplete = [w for w in d["warnings"] if w["code"] == "discovery_incomplete"]
+assert len(incomplete) == 1, d["warnings"]
+assert incomplete[0].get("scope") == home + "/Library/Caches", d["warnings"]
+paths = {e["path"] for e in d["data"]["entries"]}
+for expected in (
+    home + "/Library/Application Support/Example/Fixture",
+    home + "/Library/Logs/Example/Fixture",
+):
+    assert expected in paths, (expected, sorted(paths))
+PY
+}
+
+@test "F-106 a real unreadable subdirectory under a searched root also reports discovery_incomplete" {
+    [ "$(id -u)" -ne 0 ] || skip "root reads every directory"
+    make_fixture_app
+    make_vendor_nested_leftovers
+    mkdir -p "$HOME/Library/Logs/Locked"
+    chmod 000 "$HOME/Library/Logs/Locked"
+
+    run_mole --plan Fixture --json
+    chmod 755 "$HOME/Library/Logs/Locked"
+    [ "$status" -eq 0 ] || {
+        echo "status=$status stdout=$output"
+        return 1
+    }
+    printf '%s\n' "$output" > "$SANDBOX/plan.json"
+    python3 - "$SANDBOX/plan.json" "$HOME" << 'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+home = sys.argv[2]
+assert d["scan_status"] == "partial", d["scan_status"]
+scopes = [w.get("scope") for w in d["warnings"] if w["code"] == "discovery_incomplete"]
+assert home + "/Library/Logs" in scopes, scopes
+PY
+}
+
 @test "F-104 a clean uninstall --plan still reports complete with no discovery_incomplete" {
     make_fixture_app
     make_vendor_nested_leftovers

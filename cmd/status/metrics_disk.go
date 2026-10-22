@@ -74,6 +74,8 @@ func collectDisksWithCorrections(useCorrections bool) ([]DiskStatus, error) {
 		disks      []DiskStatus
 		seenDevice = make(map[string]bool)
 		seenVolume = make(map[string]bool)
+		usageErrs  int
+		lastErr    error
 	)
 	for _, part := range partitions {
 		if shouldSkipDiskPartition(part) {
@@ -87,7 +89,12 @@ func collectDisksWithCorrections(useCorrections bool) ([]DiskStatus, error) {
 			continue
 		}
 		usage, err := diskUsageFunc(part.Mountpoint)
-		if err != nil || usage.Total == 0 {
+		if err != nil {
+			usageErrs++
+			lastErr = err
+			continue
+		}
+		if usage.Total == 0 {
 			continue
 		}
 		total := usage.Total
@@ -123,6 +130,12 @@ func collectDisksWithCorrections(useCorrections bool) ([]DiskStatus, error) {
 		})
 		seenDevice[baseDevice] = true
 		seenVolume[volKey] = true
+	}
+
+	// F-080: when every volume that was tried failed to report usage, that is
+	// "unknown", not "this Mac has no disks".
+	if len(disks) == 0 && usageErrs > 0 {
+		return nil, fmt.Errorf("could not read usage for %d volume(s): %w", usageErrs, lastErr)
 	}
 
 	if useCorrections {

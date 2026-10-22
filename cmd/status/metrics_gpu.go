@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -27,10 +28,13 @@ var (
 func (c *Collector) collectGPU(now time.Time) ([]GPUStatus, error) {
 	if runtime.GOOS == "darwin" {
 		// Static GPU info (cached 10 min).
+		var infoErr error
 		if len(c.cachedGPU) == 0 || c.lastGPUAt.IsZero() || now.Sub(c.lastGPUAt) >= macGPUInfoTTL {
 			if gpus, err := readMacGPUInfo(); err == nil && len(gpus) > 0 {
 				c.cachedGPU = gpus
 				c.lastGPUAt = now
+			} else if err != nil {
+				infoErr = err
 			}
 		}
 
@@ -44,6 +48,12 @@ func (c *Collector) collectGPU(now time.Time) ([]GPUStatus, error) {
 				result[0].Usage = usage
 			}
 			return result, nil
+		}
+		// F-080: with nothing cached, a failed system_profiler query must
+		// surface as collector_failed. Falling through to the nvidia-smi path
+		// would report a placeholder "No GPU metrics available" row instead.
+		if infoErr != nil {
+			return nil, fmt.Errorf("GPU query failed: %w", infoErr)
 		}
 	}
 

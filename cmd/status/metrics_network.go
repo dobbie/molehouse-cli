@@ -43,7 +43,10 @@ func (c *Collector) primeNetworkCounters(now time.Time) {
 	}
 }
 
-func (c *Collector) collectNetwork(now time.Time) []NetworkStatus {
+// collectNetwork returns a non-nil error when the OS counters cannot be read,
+// so the caller reports collector_failed (F-080). An empty result with a nil
+// error means the counters were read and no non-noise interface exists.
+func (c *Collector) collectNetwork(now time.Time) ([]NetworkStatus, error) {
 	if c.prevNet == nil {
 		c.prevNet = make(map[string]net.IOCountersStat)
 	}
@@ -60,7 +63,7 @@ func (c *Collector) collectNetwork(now time.Time) []NetworkStatus {
 		// Degrade gracefully to keep status output available.
 		c.rxHistoryBuf.Add(0)
 		c.txHistoryBuf.Add(0)
-		return nil
+		return nil, fmt.Errorf("network counters unavailable: %w", err)
 	}
 
 	// Map interface IPs.
@@ -119,7 +122,7 @@ func (c *Collector) collectNetwork(now time.Time) []NetworkStatus {
 	c.rxHistoryBuf.Add(totalRx)
 	c.txHistoryBuf.Add(totalTx)
 
-	return result
+	return result, nil
 }
 
 func (c *Collector) getInterfaceIPsCached(now time.Time) map[string]string {

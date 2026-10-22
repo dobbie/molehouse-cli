@@ -2142,7 +2142,7 @@ uninstall_plan_emit_warnings() {
                 ;;
             discovery_incomplete)
                 if [[ "$line" == *$'\x1f'* ]]; then
-                    message="Leftover discovery timed out in this folder; the plan may be missing entries from it."
+                    message="Leftover discovery could not fully search this folder (it timed out or was unreadable); the plan may be missing entries from it."
                 else
                     message="Leftover discovery did not complete; the plan may be missing entries."
                 fi
