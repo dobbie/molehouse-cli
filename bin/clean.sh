@@ -21,10 +21,14 @@ source "$SCRIPT_DIR/../lib/clean/hints.sh"
 source "$SCRIPT_DIR/../lib/clean/system.sh"
 source "$SCRIPT_DIR/../lib/clean/user.sh"
 source "$SCRIPT_DIR/../lib/clean/json_emit.sh"
+source "$SCRIPT_DIR/../lib/clean/apply_selection.sh"
 
 SYSTEM_CLEAN=false
 DRY_RUN=false
 JSON_OUTPUT=false
+APPLY_SELECTION=false
+# Only `--apply-selection` may arm the selection gate (lib/core/selection_gate.sh).
+unset MOLE_CLEAN_SELECTION_FILE MOLE_CLEAN_SELECTION_RESULTS_FILE
 # Sections that actually ran, in scan order (start_section hook below).
 # Only populated in --json mode; unused otherwise.
 declare -a JSON_SECTION_NAMES=()
@@ -2079,6 +2083,74 @@ run_cloud_and_office_cleanup() {
     clean_office_applications
 }
 
+# `mo clean --apply-selection [--json] < selection.json` — CONTRACT.md §5.5.
+# The normal scan runs for real, in Trash mode, with the selection gate armed:
+# every removal sink refuses a target that is not equal to, or inside, a
+# selected path. Validation failures happen before the scan and remove nothing.
+clean_apply_selection_main() {
+    local mole_version
+    mole_version=$(sed -n 's/^VERSION="\(.*\)"$/\1/p' "$SCRIPT_DIR/../mole" 2> /dev/null | head -1)
+    [[ -n "$mole_version" ]] || mole_version="unknown"
+
+    local doc_file selection_file results_file
+    doc_file=$(create_temp_file) || return 1
+    selection_file=$(create_temp_file) || return 1
+    results_file=$(create_temp_file) || return 1
+
+    if ! clean_selection_read "$doc_file" "$selection_file"; then
+        echo "mo clean --apply-selection: $CLEAN_SELECTION_ERROR" >&2
+        if [[ "$JSON_OUTPUT" == "true" ]]; then
+            clean_json_emit_apply_failed "$mole_version" "invalid_selection" \
+                "$CLEAN_SELECTION_ERROR; nothing was removed"
+        fi
+        return 2
+    fi
+
+    # Trash is the only mode this command has. Set here, unconditionally, so a
+    # caller's environment cannot make it permanent.
+    MOLE_DELETE_MODE=trash
+    export MOLE_DELETE_MODE
+    : > "$results_file"
+    MOLE_CLEAN_SELECTION_RESULTS_FILE="$results_file"
+    MOLE_CLEAN_SELECTION_FILE="$selection_file"
+    export MOLE_CLEAN_SELECTION_RESULTS_FILE MOLE_CLEAN_SELECTION_FILE
+
+    if [[ "$JSON_OUTPUT" != "true" ]]; then
+        # The selection came in on stdin. A person in Terminal gets the
+        # keyboard back for Mole's normal sudo prompt.
+        if [[ -t 1 ]]; then
+            { exec 0< /dev/tty; } 2> /dev/null || true
+        fi
+        start_cleanup
+        hide_cursor
+        local cleanup_rc=0
+        perform_cleanup || cleanup_rc=$?
+        show_cursor
+        clean_apply_print_human_summary "$results_file" "$selection_file"
+        return "$cleanup_rc"
+    fi
+
+    # --json: nothing may prompt, and nothing may read the consumed stdin.
+    exec 0< /dev/null
+    local start_rc=0
+    exec 4>&1 1> /dev/null
+    start_cleanup || start_rc=$?
+    hide_cursor
+    local cleanup_rc=0
+    if [[ $start_rc -eq 0 ]]; then
+        perform_cleanup || cleanup_rc=$?
+    else
+        cleanup_rc=$start_rc
+    fi
+    show_cursor
+    exec 1>&4 4>&-
+
+    clean_json_emit_apply "$cleanup_rc" "$start_rc" "$mole_version" \
+        "$results_file" "$selection_file"
+    [[ $start_rc -eq 0 ]] || return 1
+    return 0
+}
+
 main() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -2095,6 +2167,9 @@ main() {
                 ;;
             "--json")
                 JSON_OUTPUT=true
+                ;;
+            "--apply-selection")
+                APPLY_SELECTION=true
                 ;;
             "--external")
                 shift
@@ -2127,6 +2202,20 @@ main() {
         esac
         shift
     done
+
+    if [[ "$APPLY_SELECTION" == "true" ]]; then
+        if [[ "$DRY_RUN" == "true" ]]; then
+            echo "mo clean --apply-selection does not accept --dry-run; use 'mo clean --dry-run --json' for a preview." >&2
+            exit 2
+        fi
+        if [[ -n "$EXTERNAL_VOLUME_TARGET" ]]; then
+            echo "mo clean --apply-selection does not support --external." >&2
+            exit 2
+        fi
+        local apply_rc=0
+        clean_apply_selection_main || apply_rc=$?
+        exit "$apply_rc"
+    fi
 
     if [[ "$JSON_OUTPUT" == "true" && "$DRY_RUN" != "true" ]]; then
         echo "mo clean --json requires --dry-run (preview only)." >&2

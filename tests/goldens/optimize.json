@@ -9,6 +9,7 @@
       "unavailable": 0,
       "unchanged": 0
     },
+    "selection": null,
     "tasks": [
       {
         "detail": "Skipped (whitelisted): DNS & Spotlight Check",

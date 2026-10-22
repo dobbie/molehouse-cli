@@ -258,10 +258,11 @@ run_optimize_json() {
         local index action
         for ((index = 0; index < ${#MOLE_OPTIMIZE_ACTIONS[@]}; index++)); do
             action=${MOLE_OPTIMIZE_ACTIONS[$index]}
+            optimize_task_selected "$action" || continue
             execute_optimization "$action"
         done
 
-        if [[ "$(optimize_outcome_total)" -ne ${#MOLE_OPTIMIZE_ACTIONS[@]} ]]; then
+        if [[ "$(optimize_outcome_total)" -ne "$(optimize_selected_task_count)" ]]; then
             outcome_mismatch=1
         fi
     fi
@@ -292,7 +293,11 @@ main() {
     local health_json
     local JSON_OUTPUT=false
     local LIST_ONLY=false
-    for arg in "$@"; do
+    local only_requested=false
+    local only_value=""
+    local arg
+    while [[ $# -gt 0 ]]; do
+        arg="$1"
         case "$arg" in
             "--help" | "-h")
                 show_optimize_help
@@ -310,6 +315,20 @@ main() {
             "--list")
                 LIST_ONLY=true
                 ;;
+            "--only")
+                if [[ $# -lt 2 ]]; then
+                    echo "mo optimize --only needs a comma-separated list of task ids." >&2
+                    echo "List them with: mo optimize --list --json" >&2
+                    exit 2
+                fi
+                only_requested=true
+                only_value="$2"
+                shift
+                ;;
+            --only=*)
+                only_requested=true
+                only_value="${arg#--only=}"
+                ;;
             "--whitelist")
                 manage_whitelist "optimize"
                 exit 0
@@ -320,7 +339,16 @@ main() {
                 exit 1
                 ;;
         esac
+        shift
     done
+
+    if [[ "$only_requested" == "true" ]]; then
+        if [[ "$LIST_ONLY" == "true" ]]; then
+            echo "mo optimize --only does not apply to --list; --list always shows the whole catalog." >&2
+            exit 2
+        fi
+        optimize_parse_only "$only_value" || exit 2
+    fi
 
     # `--list --json`: read-only catalog metadata (CONTRACT.md §8.3/§8.4).
     # Runs no task and touches no session/trap/logging state — it only
@@ -427,12 +455,13 @@ main() {
     local index action health_name
     for ((index = 0; index < ${#MOLE_OPTIMIZE_ACTIONS[@]}; index++)); do
         action=${MOLE_OPTIMIZE_ACTIONS[$index]}
+        optimize_task_selected "$action" || continue
         health_name=${MOLE_OPTIMIZE_HEALTH_NAMES[$index]}
         announce_action "$health_name"
         execute_optimization "$action"
     done
 
-    if [[ "$(optimize_outcome_total)" -ne ${#MOLE_OPTIMIZE_ACTIONS[@]} ]]; then
+    if [[ "$(optimize_outcome_total)" -ne "$(optimize_selected_task_count)" ]]; then
         log_error "Optimize task outcomes are incomplete"
         return 1
     fi

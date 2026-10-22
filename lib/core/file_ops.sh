@@ -36,6 +36,10 @@ if [[ -z "${MOLE_TIMEOUTS_LOADED:-}" ]]; then
     # shellcheck source=lib/core/timeouts.sh
     source "$_MOLE_CORE_DIR/timeouts.sh"
 fi
+if [[ -z "${MOLE_SELECTION_GATE_LOADED:-}" ]]; then
+    # shellcheck source=lib/core/selection_gate.sh
+    source "$_MOLE_CORE_DIR/selection_gate.sh"
+fi
 
 # Bound production sudo commands while keeping shell-function mocks observable
 # in tests. Timeout behavior itself must use a PATH stub so it exercises the
@@ -917,6 +921,11 @@ safe_remove() {
     local expected_parent_id="${6:-}"
     local expected_target_id="${7:-}"
 
+    if _mole_selection_must_gate; then
+        _mole_selection_gated_call safe_remove "$path" "$precomputed_size_kb" "$@"
+        return $?
+    fi
+
     local pending_clean_cancel="${MOLE_CLEAN_CANCEL_STATUS:-0}"
     if [[ "${MOLE_CURRENT_COMMAND:-}" == "clean" &&
         ("$pending_clean_cancel" -eq 124 || "$pending_clean_cancel" -ge 128) ]]; then
@@ -1105,7 +1114,12 @@ safe_remove() {
     local error_msg
     local rm_exit=0
     local section_deadline_spent=0
-    if declare -F rm > /dev/null 2>&1; then
+    if mole_selection_active; then
+        # --apply-selection: recoverable Trash move only, never rm -rf.
+        error_msg=""
+        _mole_selection_move_to_trash "$path" false "$expected_parent" \
+            "$expected_parent_id" "$expected_target_id" || rm_exit=$?
+    elif declare -F rm > /dev/null 2>&1; then
         error_msg=$(rm -rf "$path" 2>&1) || rm_exit=$? # safe_remove
     else
         local rm_timeout=""
@@ -1170,6 +1184,11 @@ safe_remove_symlink() {
     local expected_parent_id="${4:-}"
     local expected_target_id="${5:-}"
 
+    if _mole_selection_must_gate; then
+        _mole_selection_gated_call safe_remove_symlink "$path" 0 "$@"
+        return $?
+    fi
+
     local pending_clean_cancel="${MOLE_CLEAN_CANCEL_STATUS:-0}"
     if [[ "${MOLE_CURRENT_COMMAND:-}" == "clean" &&
         ("$pending_clean_cancel" -eq 124 || "$pending_clean_cancel" -ge 128) ]]; then
@@ -1217,7 +1236,11 @@ safe_remove_symlink() {
     fi
 
     local rm_exit=0
-    if [[ "$use_sudo" == "true" ]]; then
+    if mole_selection_active; then
+        # --apply-selection: recoverable Trash move only.
+        _mole_selection_move_to_trash "$path" "$use_sudo" "$expected_parent" \
+            "$expected_parent_id" "$expected_target_id" || rm_exit=$?
+    elif [[ "$use_sudo" == "true" ]]; then
         if [[ "${MOLE_TEST_MODE:-0}" == "1" || "${MOLE_TEST_NO_AUTH:-0}" == "1" ]]; then
             log_operation "${MOLE_CURRENT_COMMAND:-clean}" "FAILED" "$path" "sudo blocked in test mode"
             return 1
@@ -1307,6 +1330,11 @@ safe_sudo_remove() {
     local expected_parent="${4:-}"
     local expected_parent_id="${5:-}"
     local expected_target_id="${6:-}"
+
+    if _mole_selection_must_gate; then
+        _mole_selection_gated_call safe_sudo_remove "$path" "$precomputed_size_kb" "$@"
+        return $?
+    fi
 
     local pending_clean_cancel="${MOLE_CLEAN_CANCEL_STATUS:-0}"
     if [[ "${MOLE_CURRENT_COMMAND:-}" == "clean" &&
@@ -1524,7 +1552,13 @@ safe_sudo_remove() {
     local section_deadline_spent=0
     remove_timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_DISK_VERIFY_SEC" \
         "$deadline_seconds") || ret=$?
-    if [[ $ret -eq 0 ]]; then
+    if [[ $ret -eq 0 ]] && mole_selection_active; then
+        # --apply-selection: privileged Trash move through the immutable
+        # staging directory, never sudo rm -rf.
+        output=""
+        _mole_selection_move_to_trash "$path" true "$expected_parent" \
+            "$expected_parent_id" "$expected_target_id" || ret=$?
+    elif [[ $ret -eq 0 ]]; then
         output=$(_mole_bounded_sudo "$remove_timeout" \
             -n rm -rf "$path" < /dev/null 2>&1) || ret=$? # safe_remove
     else
@@ -1609,6 +1643,17 @@ mole_delete() {
     local mode="${MOLE_DELETE_MODE:-permanent}"
 
     [[ -z "$path" ]] && return 1
+
+    if _mole_selection_must_gate; then
+        _mole_selection_gated_call mole_delete "$path" "" "$@"
+        return $?
+    fi
+    # A selection run is Trash-only. bin/clean.sh sets MOLE_DELETE_MODE=trash;
+    # refuse rather than trust that nothing changed it since.
+    if mole_selection_active && [[ "$mode" != "trash" ]]; then
+        _mole_delete_log "$mode" "unknown" "selection-requires-trash" "$path"
+        return 1
+    fi
 
     case "$mode" in
         permanent | trash) ;;
@@ -1741,9 +1786,15 @@ mole_delete() {
     # fail closed instead of silently switching to permanent removal.
     if [[ "$mode" == "trash" ]]; then
         local trash_rc=0
-        _mole_move_to_trash "$path" "$needs_sudo" \
-            "$expected_parent" "$expected_parent_id" \
-            "$expected_target_id" || trash_rc=$?
+        if mole_selection_active; then
+            _mole_selection_move_to_trash "$path" "$needs_sudo" \
+                "$expected_parent" "$expected_parent_id" \
+                "$expected_target_id" || trash_rc=$?
+        else
+            _mole_move_to_trash "$path" "$needs_sudo" \
+                "$expected_parent" "$expected_parent_id" \
+                "$expected_target_id" || trash_rc=$?
+        fi
         if [[ $trash_rc -eq 0 ]]; then
             _mole_delete_log "trash" "$size_kb" "ok" "$path"
             log_operation "${MOLE_CURRENT_COMMAND:-uninstall}" "TRASHED" "$path" "${size_kb}KB"
@@ -2342,6 +2393,11 @@ _mole_move_to_trash_batch() {
     local -a paths=("$@")
     [[ ${#paths[@]} -eq 0 ]] && return 0
     _MOLE_TRASH_BATCH_MOVED_PATHS=()
+    # Uninstall-only batch mover. It has no per-path selection gate, so it
+    # refuses outright if it is ever reached under clean --apply-selection.
+    if mole_selection_active; then
+        return 1
+    fi
 
     local use_bound_snapshots=false
     if [[ ${#_MOLE_TRASH_BATCH_SNAPSHOT_PATHS[@]} -eq ${#paths[@]} &&
@@ -2862,7 +2918,11 @@ safe_sudo_find_delete() {
         fi
         # -type f never emits symlinks; a path that is one now was swapped
         # after find saw it, and the single-file path refuses those.
-        if [[ "$type_filter" == "f" && "${MOLE_DRY_RUN:-0}" != "1" && ! -L "$match" ]]; then
+        # Under --apply-selection the batch is skipped: its privileged xargs rm
+        # is permanent and bypasses the selection gate, so every match takes
+        # the gated single-file safe_sudo_remove path below instead.
+        if [[ "$type_filter" == "f" && "${MOLE_DRY_RUN:-0}" != "1" && ! -L "$match" ]] &&
+            ! mole_selection_active; then
             local identity_timeout=""
             local match_identity=""
             local identity_rc=0

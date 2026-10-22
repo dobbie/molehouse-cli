@@ -24,6 +24,11 @@ clean_tool_cache() {
     fi
 
     if [[ "$DRY_RUN" != "true" ]]; then
+        # The owner command clears its whole cache, which no selection can
+        # narrow. Under --apply-selection it never runs.
+        if mole_selection_refuses "$description" "$cache_path"; then
+            return 0
+        fi
         local command_succeeded=false
         if [[ -t 1 ]]; then
             start_section_spinner "Cleaning $description..."
@@ -497,6 +502,11 @@ clean_dev_npm() {
                 note_activity
             fi
             bun_cache_cleaned=true
+        elif [[ "$bun_dry_run" != "true" ]] && mole_selection_refuses "bun cache" "$bun_cache_path"; then
+            # --apply-selection: `bun pm cache rm` clears the whole cache, so it
+            # does not run. Marked handled so the filesystem fallback below
+            # stays off too, exactly as in the preview this selection came from.
+            bun_cache_cleaned=true
         elif [[ "$bun_dry_run" != "true" ]]; then
             if [[ -t 1 ]]; then
                 start_section_spinner "Cleaning bun cache..."
@@ -888,6 +898,10 @@ _run_go_cache_clean_bound() {
     local -a command_args=(env "$cache_kind=$physical_root" go clean)
     if [[ "$owner_dry_run" == "true" ]]; then
         command_args+=(-n)
+    elif mole_selection_refuses "Go ${cache_kind}" "$physical_root"; then
+        # `go clean` resets the whole root; no selection can narrow it.
+        _MOLE_GO_CACHE_BOUND_REASON="not part of the selection"
+        return 1
     fi
     command_args+=("$clean_flag")
     run_with_timeout "$MOLE_TIMEOUT_PKG_CLEANUP_SEC" "${command_args[@]}" > /dev/null 2>&1
@@ -2868,6 +2882,20 @@ clean_dev_mobile() {
                     # Skip if no unavailable simulators
                     if ((unavailable_before == 0)); then
                         debug_log "Xcode unavailable simulators already clean"
+                    elif mole_selection_active; then
+                        # `simctl delete unavailable` removes every unavailable
+                        # device at once, permanently; no selection can narrow
+                        # it, so it does not run. Each device the preview listed
+                        # is reported as refused rather than as "not proposed".
+                        if [[ ${#unavailable_udids[@]} -gt 0 ]]; then
+                            local refused_udid
+                            for refused_udid in "${unavailable_udids[@]}"; do
+                                mole_selection_refuses "Xcode unavailable simulator" \
+                                    "$HOME/Library/Developer/CoreSimulator/Devices/$refused_udid" || true
+                            done
+                        else
+                            mole_selection_refuses "Xcode unavailable simulators" "" || true
+                        fi
                     else
                         start_section_spinner "Checking unavailable simulators..."
 

@@ -10,7 +10,7 @@
         "mode": { "enum": ["preview", "apply"] },
         "data": {
           "type": "object",
-          "required": ["counts", "tasks"],
+          "required": ["counts", "selection", "tasks"],
           "properties": {
             "counts": {
               "type": "object",
@@ -25,10 +25,16 @@
                 "failed": { "type": "integer", "minimum": 0 }
               }
             },
+            "selection": {
+              "description": "NEW (SEL-M): the task ids --only requested, or null when every catalog task ran.",
+              "type": ["array", "null"],
+              "minItems": 1,
+              "items": { "type": "string", "pattern": "^[a-z0-9_]+$" }
+            },
             "tasks": {
               "type": "array",
               "minItems": 1,
-              "description": "One record per catalog task, in catalog order.",
+              "description": "One record per task that ran, in catalog order: every catalog task without --only, only the selected ones with it.",
               "items": {
                 "type": "object",
                 "required": ["id", "label", "outcome"],

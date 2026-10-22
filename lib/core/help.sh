@@ -7,7 +7,12 @@ show_clean_help() {
     echo ""
     echo "Options:"
     echo "  --dry-run, -n     Preview cleanup without making changes"
-    echo "  --json            With --dry-run, print a structured JSON preview instead of text"
+    echo "  --json            With --dry-run, print a structured JSON preview instead of text;"
+    echo "                    with --apply-selection, print a structured JSON result"
+    echo "  --apply-selection Clean only the paths listed on stdin, moving them to the Trash:"
+    echo "                    {\"schema_version\":1,\"selected_paths\":[\"/abs/path\",...]}"
+    echo "                    Paths come from 'mo clean --dry-run --json'. Anything the scan"
+    echo "                    proposes that is not selected is left in place."
     echo "  --external PATH   Clean OS metadata from a mounted external volume"
     echo "  --whitelist       Manage protected paths"
     echo "  --debug           Show detailed operation logs"
@@ -36,6 +41,7 @@ show_optimize_help() {
     echo "  --debug           Show detailed operation logs"
     echo "  --list            List the task catalog as JSON (requires --json, runs nothing)"
     echo "  --json            Emit a structured JSON result instead of terminal output"
+    echo "  --only IDS        Run only these comma-separated task ids (see --list --json)"
     echo "  -h, --help        Show this help message"
 }
 
