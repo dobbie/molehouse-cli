@@ -1323,19 +1323,20 @@ PY
     [[ -e "$HOME/Library/Caches/com.example.fixture" ]] || return 1
 }
 
-@test "F-106 apply refuses as plan_stale when a root unreadable at plan time now holds a new leftover" {
+@test "F-106 apply refuses as plan_stale when an unreadable corner of a root now holds a new leftover" {
     [ "$(id -u)" -ne 0 ] || skip "root reads every directory"
     make_fixture_app
     make_vendor_nested_leftovers
-    mkdir -p "$HOME/Library/Logs/Locked"
-    chmod 000 "$HOME/Library/Logs/Locked"
+    # A vendor directory that cannot be read at plan time hides its Fixture child.
+    mkdir -p "$HOME/Library/Caches/Example/Fixture"
+    printf 'c\n' > "$HOME/Library/Caches/Example/Fixture/c.bin"
+    chmod 000 "$HOME/Library/Caches/Example"
     run_mole --plan Fixture --json
-    chmod 755 "$HOME/Library/Logs/Locked"
+    chmod 755 "$HOME/Library/Caches/Example"
     [ "$status" -eq 0 ] || return 1
     printf '%s\n' "$output" > "$SANDBOX/plan.json"
-    # The failed Logs find contributed nothing, so the plan never saw this one.
-    [[ "$output" != *"/Library/Logs/Example/Fixture"* ]] || return 1
-    add_selection "$SANDBOX/plan.json" "$SANDBOX/sel.json" "$HOME/Library/Caches/com.example.fixture"
+    [[ "$output" != *"/Library/Caches/Example/Fixture"* ]] || return 1
+    add_selection "$SANDBOX/plan.json" "$SANDBOX/sel.json" "$HOME/Library/Logs/Example/Fixture"
 
     local before
     before=$(find "$HOME" | LC_ALL=C sort)
@@ -1347,6 +1348,41 @@ PY
     [[ "$output" == *'"plan_stale"'* ]] || return 1
     [ "$before" = "$(find "$HOME" | LC_ALL=C sort)" ] || return 1
     [[ ! -d "$MOLE_TEST_TRASH_DIR" ]] || [ -z "$(ls -A "$MOLE_TEST_TRASH_DIR")" ]
+}
+
+@test "HON-T1b a root with an unreadable sibling keeps its readable leftover; apply proceeds and trashes it" {
+    [ "$(id -u)" -ne 0 ] || skip "root reads every directory"
+    make_fixture_app
+    make_vendor_nested_leftovers
+    mkdir -p "$HOME/Library/Logs/Locked"
+    chmod 000 "$HOME/Library/Logs/Locked"
+    run_mole --plan Fixture --json
+    [ "$status" -eq 0 ] || {
+        chmod 755 "$HOME/Library/Logs/Locked"
+        return 1
+    }
+    printf '%s\n' "$output" > "$SANDBOX/plan.json"
+    python3 - "$SANDBOX/plan.json" "$HOME" << 'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+home = sys.argv[2]
+assert d["scan_status"] == "partial", d["scan_status"]
+scopes = [w.get("scope") for w in d["warnings"] if w["code"] == "discovery_incomplete"]
+assert scopes == [home + "/Library/Logs"], d["warnings"]
+paths = {e["path"] for e in d["data"]["entries"]}
+assert home + "/Library/Logs/Example/Fixture" in paths, sorted(paths)
+PY
+    add_selection "$SANDBOX/plan.json" "$SANDBOX/sel.json" "$HOME/Library/Logs/Example/Fixture"
+
+    run_mole_stdin "$SANDBOX/sel.json" --apply-plan --json
+    chmod 755 "$HOME/Library/Logs/Locked"
+    [ "$status" -eq 0 ] || {
+        echo "status=$status $output"
+        return 1
+    }
+    printf '%s\n' "$output" > "$SANDBOX/apply.json"
+    assert_apply_carried_warning "$SANDBOX/apply.json" "$HOME/Library/Logs" "$HOME/Library/Logs/Example/Fixture"
+    [[ ! -e "$HOME/Library/Logs/Example/Fixture" ]] || return 1
 }
 
 @test "F-106 apply refuses with scan_failed when a root searched completely at plan time is unreadable at apply time" {

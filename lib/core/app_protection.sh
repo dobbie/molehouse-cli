@@ -699,11 +699,13 @@ _mole_uninstall_name_variant_matches() {
 
 # Materialize a completed, bounded find before any uninstall plan consumes it.
 # Process substitution hides the producer status and can expose a partial
-# prefix after timeout. A failed ordinary find therefore contributes no
-# candidates for that root, while timeout/signal cancellation still aborts the
-# whole plan (see F-104 below for the one opt-in exception). This keeps an unreadable best-effort leftovers root from blocking
-# removal of the exact app the user selected without ever consuming partial
-# discovery output.
+# prefix after timeout. A timed-out find therefore contributes no candidates
+# for that root, while timeout/signal cancellation still aborts the whole plan
+# (see F-104 below for the one opt-in exception). A find that exits with an
+# ordinary error status (1-123, 125-127) finished its walk, so its records are
+# whole and are kept (HON-T1b); the caller learns the root was incomplete from
+# the F-106 record, never from the output. This keeps an unreadable best-effort
+# leftovers root from blocking removal of the exact app the user selected.
 #
 # F-104: a caller that can report incomplete discovery (the JSON plan/apply
 # path) sets _MOLE_UNINSTALL_DISCOVERY_SKIP_FILE. A timeout of one root -- a
@@ -729,21 +731,25 @@ _mole_uninstall_materialize_find0() {
     run_with_timeout "$scan_timeout" find \
         "$@" < /dev/null > "$output_file" 2> /dev/null || scan_rc=$?
     if [[ $scan_rc -ne 0 ]]; then
+        # F-106 / HON-T1b: find exits 1 after COMPLETING its walk and reporting
+        # an error on some entries (an unreadable subdirectory, a privacy
+        # "Don't Allow"). Every record it printed is whole, so keep them and
+        # record the root as incomplete: one unreadable corner must not cost
+        # the readable leftovers beside it. Only a timeout (124) can end the
+        # -print0 stream mid-record, so that output is still discarded, and a
+        # signal status (>=128) still aborts.
+        if [[ $scan_rc -ne 124 && $scan_rc -lt 128 ]]; then
+            _mole_uninstall_record_timed_out_root "${1:-}" 124 || true
+            debug_log "Kept partial output from incomplete uninstall discovery root: ${1:-unknown}"
+            return 0
+        fi
         : > "$output_file" || true
         if [[ $scan_rc -eq 124 ]] &&
             _mole_uninstall_record_timed_out_root "${1:-}" "$scan_rc"; then
             debug_log "Skipping timed-out uninstall discovery root: ${1:-unknown}"
             return 0
         fi
-        if [[ $scan_rc -eq 124 || $scan_rc -ge 128 ]]; then
-            return "$scan_rc"
-        fi
-        # F-106: any other failure (EPERM from a privacy "Don't Allow", an
-        # unreadable subdirectory) also discards this root's output above, so
-        # the root was not fully searched. Record it like a timeout.
-        _mole_uninstall_record_timed_out_root "${1:-}" 124 || true
-        debug_log "Skipping incomplete uninstall discovery root: ${1:-unknown}"
-        return 0
+        return "$scan_rc"
     fi
     return 0
 }
@@ -752,7 +758,7 @@ _mole_uninstall_materialize_find0() {
 # warning. Succeeds only for a timeout (124) when a caller opted in; anything
 # else, including a signal status, is left for the caller to propagate. The
 # F-106 path passes 124 for a non-timeout failure: the caller has already
-# decided that root was not searched. A root
+# decided that root was not fully searched. A root
 # containing control characters is recorded as an empty line so a newline in
 # an app name cannot forge a second record.
 _mole_uninstall_record_timed_out_root() {
